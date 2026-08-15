@@ -2777,6 +2777,40 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     }
 }
 
+
+/* OpenClaw may append a transient runtime-context user message after a tool
+ * output, even though that carrier for the same user turn is already present
+ * in the live KV.  Treat only the protected, recognizable runtime carrier as
+ * replay metadata; an ordinary user message must remain a real continuation. */
+static bool chat_msg_is_openclaw_runtime_context(const chat_msg *m) {
+    if (!m || strcmp(m->role, "user") || !m->content || !m->content[0])
+        return false;
+
+    const char *text = m->content;
+    const char *legacy_header =
+        "OpenClaw runtime context for the immediately preceding user message.";
+    const char *active_header =
+        "OpenClaw runtime context for the active user request in this turn.";
+    const char *event_header =
+        "OpenClaw runtime event.";
+    const char *begin_marker =
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const char *end_marker =
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+    const bool known_header =
+        !strncmp(text, legacy_header, strlen(legacy_header)) ||
+        !strncmp(text, active_header, strlen(active_header)) ||
+        !strncmp(text, event_header, strlen(event_header));
+
+    const char *begin = strstr(text, begin_marker);
+    const char *end = strstr(text, end_marker);
+    const bool protected_block =
+        begin && end && begin < end;
+
+    return known_header && protected_block;
+}
+
 /* Validate Responses tool outputs before rendering.
  *
  * A tool output with a call_id is meaningful only if either:
@@ -2868,32 +2902,51 @@ static void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
-    int tail_start = msgs->len;
+    /* OpenClaw repeats the same-turn transient runtime carrier after tool
+     * output.  The original copy is already represented by the live KV.
+     * Ignore only this final protected carrier when locating the trailing
+     * tool-output run, otherwise call-id continuation is hidden behind a
+     * synthetic user message and falls back to visible replay. */
+    int tail_end = msgs->len;
+    while (tail_end > 0 &&
+           chat_msg_is_openclaw_runtime_context(&msgs->v[tail_end - 1])) {
+        tail_end--;
+    }
+
+    int tail_start = tail_end;
     while (tail_start > 0) {
         const chat_msg *m = &msgs->v[tail_start - 1];
         if (strcmp(m->role, "tool") && strcmp(m->role, "function")) break;
         tail_start--;
     }
-    if (tail_start == msgs->len) return;
+    if (tail_start == tail_end) return;
 
     stop_list_clear(&r->responses_live_call_ids);
     if (tail_start > 0) {
         const int anchor = tail_start - 1;
         const chat_msg *assistant = &msgs->v[anchor];
-        if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0) return;
+        if (strcmp(assistant->role, "assistant") || assistant->calls.len == 0)
+            return;
         for (int i = 0; i < assistant->calls.len; i++) {
-            id_list_push_unique(&r->responses_live_call_ids, assistant->calls.v[i].id);
+            id_list_push_unique(&r->responses_live_call_ids,
+                                assistant->calls.v[i].id);
         }
     } else {
-        for (int i = tail_start; i < msgs->len; i++) {
-            chat_msg_collect_tool_call_ids(&msgs->v[i], &r->responses_live_call_ids);
+        for (int i = tail_start; i < tail_end; i++) {
+            chat_msg_collect_tool_call_ids(&msgs->v[i],
+                                           &r->responses_live_call_ids);
         }
     }
     if (r->responses_live_call_ids.len == 0) return;
 
+    /* Render only through the tool-output run.  Do not append the duplicate
+     * OpenClaw runtime carrier: its same-turn state is already resident in KV. */
+    chat_msgs live_tail = *msgs;
+    live_tail.len = tail_end;
+
     free(r->responses_live_suffix_text);
     r->responses_live_suffix_text =
-        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+        render_live_tool_tail_for_syntax(r->model_syntax, &live_tail, tail_start,
                                          &r->tool_orders, r->think_mode);
 }
 
@@ -11506,24 +11559,31 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
-                                                      &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
-    if (cached > 0) {
-        responses_live_match = "visible-prefix";
-        if (responses_live_matches_request(s, slot,
-                                           &j->req.responses_live_call_ids,
-                                           old_pos))
-        {
-            responses_live_match_ids = j->req.responses_live_call_ids.len;
-        }
-    }
-    if (cached == 0) {
-        cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
+    /* A matching call_id is the strongest Responses continuation binding:
+     * prefer it over visible replay so OpenClaw's repeated same-turn runtime
+     * carrier is not appended a second time to an already-live KV frontier. */
+    int cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
-        cache_source = cached > 0 ? "responses-tool-output" : "none";
-        if (cached > 0) responses_live_match = "tool-output-ids";
+    const char *cache_source =
+        cached > 0 ? "responses-tool-output" : "none";
+    if (cached > 0) {
+        responses_live_match = "tool-output-ids";
+    }
+    if (cached == 0) {
+        cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
+                                                      &effective_prompt);
+        cache_source = cached > 0 ? "responses-visible" : "none";
+        if (cached > 0) {
+            responses_live_match = "visible-prefix";
+            if (responses_live_matches_request(s, slot,
+                                               &j->req.responses_live_call_ids,
+                                               old_pos))
+            {
+                responses_live_match_ids =
+                    j->req.responses_live_call_ids.len;
+            }
+        }
     }
     if (cached > 0) {
         responses_live_continuation = true;
@@ -16869,6 +16929,97 @@ static void test_responses_openclaw_runtime_tail_visible_checkpoint(void) {
     request_free(&r);
 }
 
+
+static void test_responses_openclaw_runtime_after_tool_output_uses_live_tail(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_openclaw_live");
+    tc.name = xstrdup("session_status");
+    tc.arguments = xstrdup("{\"sessionKey\":\"current\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_openclaw_live");
+    tool.content = xstrdup("status output");
+    chat_msgs_push(&msgs, tool);
+
+    chat_msg runtime = {0};
+    runtime.role = xstrdup("user");
+    runtime.content = xstrdup(
+        "OpenClaw runtime context for the immediately preceding user message.\n"
+        "This context is runtime-generated, not user-authored.\n"
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n"
+        "Conversation info: test\n"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>");
+    chat_msgs_push(&msgs, runtime);
+
+    responses_prepare_live_continuation(&r, &msgs);
+
+    TEST_ASSERT(r.responses_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0],
+                        "call_openclaw_live"));
+    TEST_ASSERT(r.responses_live_suffix_text != NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text,
+                       "<tool_result>status output</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text,
+                       "OpenClaw runtime context") == NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text,
+                       "BEGIN_OPENCLAW_INTERNAL_CONTEXT") == NULL);
+    TEST_ASSERT(strstr(r.responses_live_suffix_text,
+                       "<｜Assistant｜><think>") != NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+
+    /* Ordinary user text after a tool output is not transient metadata and
+     * must prevent the tool-output-only fast path. */
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    r.think_mode = DS4_THINK_HIGH;
+
+    memset(&msgs, 0, sizeof(msgs));
+
+    memset(&assistant, 0, sizeof(assistant));
+    assistant.role = xstrdup("assistant");
+    memset(&tc, 0, sizeof(tc));
+    tc.id = xstrdup("call_real_user");
+    tc.name = xstrdup("session_status");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    memset(&tool, 0, sizeof(tool));
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_real_user");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("this is a real user message");
+    chat_msgs_push(&msgs, user);
+
+    responses_prepare_live_continuation(&r, &msgs);
+
+    TEST_ASSERT(r.responses_live_call_ids.len == 0);
+    TEST_ASSERT(r.responses_live_suffix_text == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
 static void test_responses_tool_output_id_validation(void) {
     server s = {0};
     server_slot slot;
@@ -19021,6 +19172,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_openclaw_runtime_tail_visible_checkpoint();
+    test_responses_openclaw_runtime_after_tool_output_uses_live_tail();
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
