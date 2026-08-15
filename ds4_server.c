@@ -2837,17 +2837,15 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
                 ok = false;
                 break;
             }
-            if (!prior || live_known) {
-                /* Require live state when: (a) no prior in history (stateless replay
-                 * impossible), or (b) live state exists (bind to the slot with the
-                 * full KV context including hidden reasoning, even if history has
-                 * the call).  This prevents slot misassignment when the client
-                 * replays full history but the live frontier has richer state. */
+            if (!prior) {
+                /* A tool-output-only request has no stateless prefix to fall
+                 * back to, so matching live call-id state is a hard requirement.
+                 * Full-history replay with a prior call may still bind to the
+                 * live slot for fidelity, but it must be allowed to fall back
+                 * if that live state disappears before worker execution. */
                 if (requires_live_tool_state) *requires_live_tool_state = true;
             }
             if (!prior && needs_reasoning) {
-                /* When there's no prior in history, also check if reasoning is needed.
-                 * When live_known is true but prior exists, reasoning check below applies. */
                 if (requires_live_reasoning) *requires_live_reasoning = true;
             } else if (prior && needs_reasoning &&
                        (!prior->reasoning || !prior->reasoning[0])) {
@@ -12750,15 +12748,16 @@ static bool live_state_contains_all(const live_tool_state *state,
     return true;
 }
 
-/* Return the only slot eligible for an explicit live continuation, or -1 when
- * the request has no resident binding. A missing binding is intentionally not
- * treated as ineligible: generate_job() then emits the existing 409 response. */
+/* Return the resident slot that owns a matching live continuation, or -1
+ * when no binding is resident. Responses call ids are also a soft slot
+ * affinity for full-history replay: use the richer live KV when available,
+ * but only responses_requires_live_tool_state makes losing it fatal. */
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
-        if (r->responses_requires_live_tool_state &&
+        if (r->responses_live_call_ids.len > 0 &&
             live_state_contains_all(&slot->responses_live,
                                     &r->responses_live_call_ids)) {
             return i;
@@ -14030,7 +14029,15 @@ static void test_batched_live_continuation_slot_binding(void) {
     id_list_push_unique(&slots[1].responses_live.call_ids, "call-slot-1");
     TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
 
+    /* Full Responses replay keeps a soft call-id affinity to the live slot
+     * even when losing that live state is not fatal. */
     j.req.responses_requires_live_tool_state = false;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == 1);
+
+    slots[1].responses_live.valid = false;
+    TEST_ASSERT(job_required_slot_locked(&s, &j) == -1);
+    stop_list_clear(&j.req.responses_live_call_ids);
+
     j.req.anthropic_requires_live_tool_state = true;
     id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-slot-2");
     slots[2].anthropic_live.valid = true;
@@ -16812,9 +16819,9 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
-    /* When live state exists, require it even if history has the call.
-     * This binds the request to the slot with full KV context. */
-    TEST_ASSERT(needs_live_tool_state);
+    /* Live state is preferred by the scheduler, but a full replay with the
+     * prior call is not a hard live-state requirement. */
+    TEST_ASSERT(!needs_live_tool_state);
     TEST_ASSERT(needs_live_reasoning);
 
     free(msgs.v[0].reasoning);
@@ -16826,8 +16833,8 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
-    /* Live state still required; reasoning is now in history so doesn't need live. */
-    TEST_ASSERT(needs_live_tool_state);
+    /* Full replay remains valid; reasoning is now present in history too. */
+    TEST_ASSERT(!needs_live_tool_state);
     TEST_ASSERT(!needs_live_reasoning);
 
     free(msgs.v[0].reasoning);
@@ -16839,8 +16846,8 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
                                                 &needs_live_tool_state,
                                                 &needs_live_reasoning,
                                                 err, sizeof(err)));
-    /* Thinking disabled: no reasoning requirement, but live state still required. */
-    TEST_ASSERT(needs_live_tool_state);
+    /* Thinking disabled: neither reasoning nor live state is a hard requirement. */
+    TEST_ASSERT(!needs_live_tool_state);
     TEST_ASSERT(!needs_live_reasoning);
 
     chat_msgs_free(&msgs);
