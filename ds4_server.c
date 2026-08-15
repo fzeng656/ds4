@@ -10994,6 +10994,58 @@ static bool build_openclaw_replay_checkpoint_base(const request *r, buf *out) {
     return true;
 }
 
+
+/* Build the client-visible key for a live Responses frontier.
+ *
+ * During an OpenClaw tool turn, the current request may end with a transient
+ * runtime-context user carrier that OpenClaw removes from the next replay.
+ * The live KV may safely retain that same-turn runtime state, just like hidden
+ * reasoning, while the visible key must describe what the client will actually
+ * replay.  Strip the carrier only for completed tool calls; a plain final
+ * response must not make transient runtime context survive into a later user
+ * turn through an accidental visible-prefix continuation.
+ */
+static char *build_responses_live_visible_text(const request *r,
+                                               const char *content,
+                                               const char *reasoning,
+                                               const tool_calls *calls,
+                                               bool *openclaw_runtime_tail_out) {
+    if (openclaw_runtime_tail_out) *openclaw_runtime_tail_out = false;
+    if (!r || !r->prompt_text) return NULL;
+
+    buf visible = {0};
+    bool openclaw_runtime_tail = false;
+
+    if (calls && calls->len > 0) {
+        openclaw_runtime_tail =
+            build_openclaw_replay_checkpoint_base(r, &visible);
+    }
+
+    if (!openclaw_runtime_tail) {
+        buf_puts(&visible, r->prompt_text);
+    } else if (ds4_think_mode_enabled(r->think_mode) &&
+               r->reasoning_summary_emit) {
+        /* build_openclaw_replay_checkpoint_base() resumes at <Assistant>
+         * rather than <Assistant><think>.  When the Responses client replays
+         * a reasoning summary, restore the opening tag expected by the
+         * historical assistant renderer before appending the summary suffix. */
+        buf_puts(&visible, "<think>");
+    }
+
+    char *suffix =
+        build_responses_visible_assistant_suffix(r,
+                                                 content ? content : "",
+                                                 reasoning,
+                                                 calls);
+    buf_puts(&visible, suffix ? suffix : "");
+    free(suffix);
+
+    if (openclaw_runtime_tail_out) {
+        *openclaw_runtime_tail_out = openclaw_runtime_tail;
+    }
+    return buf_take(&visible);
+}
+
 static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
                                              const job *j, const char *ctx,
                                              uint64_t trace_id,
@@ -12495,24 +12547,34 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        /* Store the post-turn visible transcript plus the live token
-         * frontier.  The next Responses request may replay only this
-         * visible surface, while the real session also contains hidden
-         * reasoning and exact sampled tool-call bytes.
-         * Preserve even on streaming errors: the tool calls were generated
-         * successfully; the error was in response delivery. */
-        char *visible_suffix =
-            build_responses_visible_assistant_suffix(&j->req,
+        /* Store the post-turn client-visible transcript plus the live token
+         * frontier.  The real session may additionally contain hidden reasoning,
+         * exact sampled tool-call bytes, and -- during an OpenClaw tool loop --
+         * the transient current-turn runtime carrier that the next replay omits.
+         * Those bytes remain valid same-turn live state; the visible key must
+         * instead match the transcript the client will actually send back. */
+        bool openclaw_runtime_tail = false;
+        char *visible =
+            build_responses_live_visible_text(&j->req,
                 parsed_content ? parsed_content : "",
                 parsed_reasoning,
-                &parsed_calls);
-        buf visible = {0};
-        buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-        buf_puts(&visible, visible_suffix ? visible_suffix : "");
-        responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
+                &parsed_calls,
+                &openclaw_runtime_tail);
+
+        responses_live_remember(s, slot, visible ? visible : "",
                                 parsed_calls.len ? &parsed_calls : NULL);
-        buf_free(&visible);
-        free(visible_suffix);
+
+        if (openclaw_runtime_tail) {
+            const size_t visible_len = visible ? strlen(visible) : 0;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: responses live checkpoint normalized OpenClaw runtime tail ctx=%s live=%d visible=%zu",
+                       ctx_span, ds4_session_pos(slot->session), visible_len);
+            trace_event(s, trace_id,
+                        "responses live checkpoint normalized OpenClaw runtime tail: live=%d visible=%zu",
+                        ds4_session_pos(slot->session), visible_len);
+        }
+
+        free(visible);
     }
     if (j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len) {
@@ -12542,7 +12604,8 @@ decode_again:
          * path where we lack exact sampled DSML replay; when raw DSML is known,
          * replaying those bytes keeps future prompts aligned without rebuilding
          * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
+         * live call-id / visible-transcript binding can retain richer in-memory
+         * state without rewriting the sampled frontier. */
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -16740,6 +16803,72 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     request_free(&r);
 }
 
+
+static void test_responses_openclaw_runtime_tail_visible_checkpoint(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(
+        "<｜begin▁of▁sentence｜>"
+        "<｜User｜>do the task"
+        "<｜User｜>"
+        "OpenClaw runtime context for the active user request in this turn.\n"
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n"
+        "{\"channel\":\"discord\"}\n"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>"
+        "<｜Assistant｜><think>");
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_openclaw");
+    tc.name = xstrdup("session_status");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+
+    bool stripped = false;
+    char *visible =
+        build_responses_live_visible_text(&r, "", "hidden reasoning",
+                                          &calls, &stripped);
+
+    TEST_ASSERT(stripped);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(visible, "OpenClaw runtime context") == NULL);
+    TEST_ASSERT(strstr(visible, "BEGIN_OPENCLAW_INTERNAL_CONTEXT") == NULL);
+    TEST_ASSERT(strstr(visible,
+                       "<｜User｜>do the task<｜Assistant｜></think>") != NULL);
+    TEST_ASSERT(strstr(visible, "<｜DSML｜tool_calls>") != NULL);
+    TEST_ASSERT(strstr(visible, "session_status") != NULL);
+    free(visible);
+
+    /* If the client opted into reasoning summaries, the normalized base ends
+     * at <Assistant>, so the visible builder must restore the <think> opener. */
+    r.reasoning_summary_emit = true;
+    stripped = false;
+    visible =
+        build_responses_live_visible_text(&r, "", "tool reasoning",
+                                          &calls, &stripped);
+    TEST_ASSERT(stripped);
+    TEST_ASSERT(strstr(visible,
+                       "<｜Assistant｜><think>tool reasoning</think>") != NULL);
+    free(visible);
+
+    /* A normal completed response is a cross-turn boundary.  Do not hide the
+     * transient user carrier behind a live visible key in that case. */
+    r.reasoning_summary_emit = false;
+    stripped = true;
+    visible =
+        build_responses_live_visible_text(&r, "done", "hidden reasoning",
+                                          NULL, &stripped);
+    TEST_ASSERT(!stripped);
+    TEST_ASSERT(strstr(visible, "OpenClaw runtime context") != NULL);
+    free(visible);
+
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
 static void test_responses_tool_output_id_validation(void) {
     server s = {0};
     server_slot slot;
@@ -18891,6 +19020,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_tool_use_parses_before_role();
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
+    test_responses_openclaw_runtime_tail_visible_checkpoint();
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
