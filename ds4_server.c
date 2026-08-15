@@ -10672,6 +10672,7 @@ static bool should_remember_tool_context_checkpoint(const request *r,
                                                     const thinking_state *thinking,
                                                     const char *finish) {
     if (!r || r->kind != REQ_CHAT || r->api == API_RESPONSES) return false;
+    if (!r->prompt_preserves_reasoning) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -10997,8 +10998,17 @@ static void remember_tool_visible_checkpoint(server *s, server_slot *slot,
         return;
     }
     buf visible = {0};
-    const bool openclaw_runtime_tail =
-        build_openclaw_replay_checkpoint_base(&j->req, &visible);
+    bool openclaw_runtime_tail = false;
+
+    /* Only tool-call checkpoints may strip OpenClaw's transient runtime carrier.
+     * The tool-call path canonicalizes/rebuilds live KV to the same transcript.
+     * A plain finish=stop path does not rewrite live KV, so a stripped visible
+     * key would describe different history than the resident KV contains. */
+    if (calls && calls->len > 0) {
+        openclaw_runtime_tail =
+            build_openclaw_replay_checkpoint_base(&j->req, &visible);
+    }
+
     const char *checkpoint_reasoning = openclaw_runtime_tail ? NULL : reasoning;
     char *suffix =
         build_tool_checkpoint_suffix(&j->req, content, checkpoint_reasoning, calls);
