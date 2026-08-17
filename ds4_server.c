@@ -635,6 +635,22 @@ typedef struct {
     size_t max_len;
 } stop_list;
 
+#define OPENCLAW_COMPACTION_TAIL_BLOCKS 8
+#define OPENCLAW_COMPACTION_TURN_RING 128
+
+typedef struct {
+    char sha[OPENCLAW_COMPACTION_TAIL_BLOCKS][41];
+    int len;
+} openclaw_compaction_tail;
+
+typedef struct {
+    bool valid;
+    openclaw_compaction_tail tail;
+    int live_tokens;
+    char token_sha[41];
+    uint64_t stamp;
+} openclaw_turn_boundary;
+
 static void stop_list_clear(stop_list *stops);
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
@@ -699,6 +715,16 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+
+    /* OpenClaw compaction compatibility.  OpenClaw reserializes conversation
+     * history under a dedicated summarizer prompt, so the ordinary token prefix
+     * no longer matches the resident agent KV.  Keep a visible-only tail
+     * fingerprint for normal Responses requests and recognize the fixed
+     * compaction envelope without changing the OpenClaw client. */
+    bool openclaw_compaction;
+    bool openclaw_compaction_split_turn;
+    char *openclaw_compaction_suffix;
+    openclaw_compaction_tail openclaw_tail;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -840,8 +866,204 @@ static void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    free(r->openclaw_compaction_suffix);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
+}
+
+
+static void openclaw_tail_push(openclaw_compaction_tail *tail,
+                               char kind, const char *text) {
+    if (!tail || !text || !text[0]) return;
+    buf b = {0};
+    buf_putc(&b, kind);
+    buf_putc(&b, ':');
+    buf_puts(&b, text);
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(b.ptr ? b.ptr : "", b.len, sha);
+    buf_free(&b);
+
+    if (tail->len < OPENCLAW_COMPACTION_TAIL_BLOCKS) {
+        memcpy(tail->sha[tail->len++], sha, sizeof(sha));
+        return;
+    }
+    memmove(tail->sha[0], tail->sha[1],
+            (OPENCLAW_COMPACTION_TAIL_BLOCKS - 1) * sizeof(tail->sha[0]));
+    memcpy(tail->sha[OPENCLAW_COMPACTION_TAIL_BLOCKS - 1], sha, sizeof(sha));
+}
+
+static bool openclaw_user_is_internal_status_probe(const char *text) {
+    if (!text) return false;
+    return !strncmp(text,
+        "必须调用 session_status 工具查询当前 session 状态，然后根据工具结果告诉我 context 使用情况。不要直接回答。",
+        strlen("必须调用 session_status 工具查询当前 session 状态，然后根据工具结果告诉我 context 使用情况。不要直接回答。"));
+}
+
+/* Strip only OpenClaw-owned transport envelopes.  Real user text remains byte
+ * exact so a compaction request cannot bind to an unrelated resident session
+ * merely because the contents are semantically similar. */
+static char *openclaw_normalize_user_text(const char *text) {
+    if (!text) return NULL;
+    const char *p = text;
+
+    if (p[0] == '[') {
+        const char *close = strstr(p, "] ");
+        if (close && close - p < 96) {
+            const char *candidate = close + 2;
+            if (!strncmp(candidate, "Conversation info: ⟦openclaw:ctx⟧",
+                         strlen("Conversation info: ⟦openclaw:ctx⟧")) ||
+                !strcmp(candidate, "Continue the OpenClaw runtime event.")) {
+                p = candidate;
+            }
+        }
+    }
+
+    const char *ctx = "Conversation info: ⟦openclaw:ctx⟧";
+    if (!strncmp(p, ctx, strlen(ctx))) {
+        const char *fence_end = strstr(p + strlen(ctx), "\n```\n\n");
+        if (fence_end) p = fence_end + strlen("\n```\n\n");
+    }
+
+    if (openclaw_user_is_internal_status_probe(p)) return NULL;
+    if (!strncmp(p,
+            "OpenClaw runtime context for the immediately preceding user message.",
+            strlen("OpenClaw runtime context for the immediately preceding user message.")) ||
+        !strncmp(p,
+            "OpenClaw runtime context for the active user request in this turn.",
+            strlen("OpenClaw runtime context for the active user request in this turn."))) {
+        return NULL;
+    }
+    return xstrdup(p);
+}
+
+static void openclaw_tail_from_messages(openclaw_compaction_tail *tail,
+                                        const chat_msgs *msgs) {
+    if (!tail) return;
+    memset(tail, 0, sizeof(*tail));
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role) continue;
+        if (!strcmp(m->role, "user")) {
+            char *normalized = openclaw_normalize_user_text(m->content);
+            if (normalized) {
+                openclaw_tail_push(tail, 'U', normalized);
+                free(normalized);
+            }
+        } else if (!strcmp(m->role, "assistant")) {
+            /* Intentionally ignore thinking and tool-call serialization here.
+             * OpenClaw may keep thinking in its session tree while omitting it
+             * from the normal Responses replay.  Visible assistant text is the
+             * stable cross-representation identity. */
+            if (m->content && m->content[0])
+                openclaw_tail_push(tail, 'A', m->content);
+        }
+    }
+}
+
+static bool openclaw_serialized_label(const char *p, char *kind,
+                                      size_t *label_len) {
+    static const struct { const char *label; char kind; } labels[] = {
+        { "[User]: ", 'U' },
+        { "[Assistant thinking]: ", 'X' },
+        { "[Assistant]: ", 'A' },
+        { "[Assistant tool calls]: ", 'X' },
+        { "[Tool result]: ", 'X' },
+    };
+    if (!p) return false;
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        size_t n = strlen(labels[i].label);
+        if (!strncmp(p, labels[i].label, n)) {
+            if (kind) *kind = labels[i].kind;
+            if (label_len) *label_len = n;
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *openclaw_next_serialized_label(const char *p) {
+    const char *scan = p;
+    while (scan && (scan = strstr(scan, "\n\n[")) != NULL) {
+        char kind = 0;
+        size_t label_len = 0;
+        if (openclaw_serialized_label(scan + 2, &kind, &label_len)) return scan;
+        scan += 3;
+    }
+    return NULL;
+}
+
+static void openclaw_tail_from_serialized(openclaw_compaction_tail *tail,
+                                          const char *conversation) {
+    if (!tail) return;
+    memset(tail, 0, sizeof(*tail));
+    if (!conversation) return;
+
+    const char *p = conversation;
+    while (*p) {
+        char kind = 0;
+        size_t label_len = 0;
+        if (!openclaw_serialized_label(p, &kind, &label_len)) break;
+        const char *content = p + label_len;
+        const char *next = openclaw_next_serialized_label(content);
+        const char *end = next ? next : content + strlen(content);
+        char *block = xstrndup(content, (size_t)(end - content));
+
+        if (kind == 'U') {
+            char *normalized = openclaw_normalize_user_text(block);
+            if (normalized) {
+                openclaw_tail_push(tail, 'U', normalized);
+                free(normalized);
+            }
+        } else if (kind == 'A' && block[0]) {
+            openclaw_tail_push(tail, 'A', block);
+        }
+        free(block);
+        if (!next) break;
+        p = next + 2;
+    }
+}
+
+static bool openclaw_tail_equal(const openclaw_compaction_tail *a,
+                                const openclaw_compaction_tail *b) {
+    if (!a || !b || a->len != b->len || a->len <= 0) return false;
+    for (int i = 0; i < a->len; i++) {
+        if (memcmp(a->sha[i], b->sha[i], sizeof(a->sha[i])) != 0) return false;
+    }
+    return true;
+}
+
+static bool openclaw_prepare_compaction_request(request *r,
+                                                const chat_msgs *msgs) {
+    if (!r || !msgs || r->api != API_RESPONSES) return false;
+    const char *system = NULL;
+    const char *user = NULL;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!m->role) continue;
+        if (!system && (!strcmp(m->role, "system") || !strcmp(m->role, "developer"))) system = m->content;
+        if (!user && !strcmp(m->role, "user")) user = m->content;
+    }
+    const char *summary_system = "You are a context summarization assistant.";
+    const char *conversation_open = "<conversation>\n";
+    const char *conversation_close = "\n</conversation>";
+    if (!system || strncmp(system, summary_system, strlen(summary_system)) != 0 ||
+        !user || strncmp(user, conversation_open, strlen(conversation_open)) != 0) {
+        return false;
+    }
+
+    const char *body = user + strlen(conversation_open);
+    const char *close = strstr(body, conversation_close);
+    if (!close) return false;
+    char *conversation = xstrndup(body, (size_t)(close - body));
+    openclaw_tail_from_serialized(&r->openclaw_tail, conversation);
+    free(conversation);
+
+    r->openclaw_compaction = true;
+    const char *suffix = close + strlen(conversation_close);
+    r->openclaw_compaction_suffix = xstrdup(suffix);
+    r->openclaw_compaction_split_turn =
+        strstr(suffix, "This is the PREFIX of a turn that was too large to keep.") != NULL;
+    return true;
 }
 
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
@@ -3706,7 +3928,11 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "encrypted_content")) {
-                if (!json_string_replace(p, &encrypted_content)) {
+                json_ws(p);
+                if (json_lit(p, "null")) {
+                    free(encrypted_content);
+                    encrypted_content = NULL;
+                } else if (!json_string_replace(p, &encrypted_content)) {
                     free(key);
                     goto item_fail;
                 }
@@ -4424,6 +4650,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
+    if (!openclaw_prepare_compaction_request(r, &msgs))
+        openclaw_tail_from_messages(&r->openclaw_tail, &msgs);
     /* Responses API always preserves reasoning in the prompt so the model
      * sees its previous thinking and can continue from it. Without this the
      * prompt would differ from the live KV and cause a token-mismatch
@@ -5493,6 +5721,61 @@ static void append_json_object_string(buf *b, const char *json) {
     buf tmp = {0};
     append_json_object_or_empty(&tmp, json);
     json_escape(b, tmp.ptr ? tmp.ptr : "{}");
+    buf_free(&tmp);
+}
+
+/* OpenClaw's streaming JSON repair layer protects Windows paths by treating a
+ * trailing single-letter-colon prefix (for example `C:`) as a drive letter.
+ * That heuristic also matches ordinary source such as `except ... as e:` and
+ * turns the following JSON `\n` escape into a literal backslash+n.
+ *
+ * Responses function-call arguments are themselves JSON serialized inside a
+ * JSON string, so use the equivalent Unicode control escapes in that inner JSON
+ * only.  This preserves exact argument bytes after JSON parsing while avoiding
+ * the ambiguous short escapes.  Keep literal escaped backslashes untouched:
+ * raw JSON `\\n` means the two characters backslash+n and must stay that way. */
+static char *json_control_escapes_to_unicode(const char *json) {
+    buf out = {0};
+    bool in_string = false;
+    for (size_t i = 0; json && json[i]; i++) {
+        char c = json[i];
+        if (!in_string) {
+            buf_putc(&out, c);
+            if (c == '"') in_string = true;
+            continue;
+        }
+        if (c == '"') {
+            buf_putc(&out, c);
+            in_string = false;
+            continue;
+        }
+        if (c != '\\' || !json[i + 1]) {
+            buf_putc(&out, c);
+            continue;
+        }
+
+        char next = json[++i];
+        switch (next) {
+        case 'b': buf_puts(&out, "\\u0008"); break;
+        case 'f': buf_puts(&out, "\\u000c"); break;
+        case 'n': buf_puts(&out, "\\u000a"); break;
+        case 'r': buf_puts(&out, "\\u000d"); break;
+        case 't': buf_puts(&out, "\\u0009"); break;
+        default:
+            buf_putc(&out, '\\');
+            buf_putc(&out, next);
+            break;
+        }
+    }
+    return buf_take(&out);
+}
+
+static void append_responses_json_object_string(buf *b, const char *json) {
+    buf tmp = {0};
+    append_json_object_or_empty(&tmp, json);
+    char *safe = json_control_escapes_to_unicode(tmp.ptr ? tmp.ptr : "{}");
+    json_escape(b, safe ? safe : "{}");
+    free(safe);
     buf_free(&tmp);
 }
 
@@ -7157,7 +7440,7 @@ static void responses_append_function_call_item(buf *b, const tool_call *tc,
     } else if (item->is_custom) {
         json_escape(b, tc->arguments ? tc->arguments : "");
     } else {
-        append_json_object_string(b, tc->arguments);
+        append_responses_json_object_string(b, tc->arguments);
     }
     buf_putc(b, '}');
 }
@@ -7196,7 +7479,7 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
     const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
     if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
     buf args = {0};
-    append_json_object_string(&args, tc->arguments);
+    append_responses_json_object_string(&args, tc->arguments);
     buf b = {0};
     buf_printf(&b,
         "{\"type\":\"response.function_call_arguments.delta\","
@@ -8546,6 +8829,13 @@ typedef struct {
      * Anthropic currently uses only the call-id side of the state. */
     char *visible_text;
     size_t visible_len;
+    /* Optional alternate replay spelling for the same live frontier.
+     * Responses clients may request reasoning.summary but still choose not to
+     * replay that summary on the next full-history request (OpenClaw does this).
+     * Keep both visible forms so either replay can bind to the exact same hidden
+     * KV frontier without forcing a disk fallback. */
+    char *visible_text_alt;
+    size_t visible_len_alt;
     /* Tool-call ids generated at the same live frontier. A following tool
      * result for these ids is a direct protocol continuation and should not
      * trigger prompt-prefix matching or checkpoint canonicalization. */
@@ -8574,6 +8864,10 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    openclaw_turn_boundary openclaw_turns[OPENCLAW_COMPACTION_TURN_RING];
+    int openclaw_turn_next;
+    uint64_t openclaw_turn_clock;
+    bool openclaw_compaction_ephemeral;
 
     job *assigned;
     job *running;
@@ -8640,6 +8934,78 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+
+static void openclaw_turn_boundaries_clear(server_slot *slot) {
+    if (!slot) return;
+    memset(slot->openclaw_turns, 0, sizeof(slot->openclaw_turns));
+    slot->openclaw_turn_next = 0;
+    slot->openclaw_turn_clock = 0;
+}
+
+static void openclaw_turn_boundary_remember_locked(server_slot *slot,
+                                                   const openclaw_compaction_tail *tail,
+                                                   int live_tokens,
+                                                   const ds4_tokens *tokens) {
+    if (!slot || !tail || tail->len < 2 || live_tokens <= 0) return;
+    for (int i = 0; i < OPENCLAW_COMPACTION_TURN_RING; i++) {
+        openclaw_turn_boundary *e = &slot->openclaw_turns[i];
+        if (e->valid && e->live_tokens == live_tokens &&
+            openclaw_tail_equal(&e->tail, tail)) return;
+    }
+    int idx = slot->openclaw_turn_next++ % OPENCLAW_COMPACTION_TURN_RING;
+    openclaw_turn_boundary *e = &slot->openclaw_turns[idx];
+    memset(e, 0, sizeof(*e));
+    e->valid = true;
+    e->tail = *tail;
+    e->live_tokens = live_tokens;
+    if (tokens && tokens->v && tokens->len >= live_tokens) {
+        ds4_kvstore_sha1_bytes_hex(tokens->v,
+            (size_t)live_tokens * sizeof(tokens->v[0]), e->token_sha);
+    }
+    e->stamp = ++slot->openclaw_turn_clock;
+}
+
+/* Return a unique resident source slot for a full-turn OpenClaw compaction.
+ * Split-turn summaries intentionally fall back to the native OpenClaw prompt:
+ * their cut can land after a tool result, where inventing a new user turn would
+ * change chat semantics. */
+static int openclaw_compaction_source_slot_locked(server *s, const request *r,
+                                                  int *boundary_tokens) {
+    if (boundary_tokens) *boundary_tokens = 0;
+    if (!s || !r || !r->openclaw_compaction ||
+        r->openclaw_compaction_split_turn ||
+        r->openclaw_tail.len < OPENCLAW_COMPACTION_TAIL_BLOCKS) return -1;
+
+    int found_slot = -1;
+    int found_tokens = 0;
+    uint64_t found_stamp = 0;
+    for (int i = 0; i < s->slot_count; i++) {
+        server_slot *slot = &s->slots[i];
+        if (slot->busy || slot->assigned || slot->running) continue;
+        for (int j = 0; j < OPENCLAW_COMPACTION_TURN_RING; j++) {
+            openclaw_turn_boundary *e = &slot->openclaw_turns[j];
+            if (!e->valid || !openclaw_tail_equal(&e->tail, &r->openclaw_tail))
+                continue;
+            if (slot->session && e->token_sha[0]) {
+                const ds4_tokens *live = ds4_session_tokens(slot->session);
+                if (!live || live->len < e->live_tokens) continue;
+                char current_sha[41];
+                ds4_kvstore_sha1_bytes_hex(live->v,
+                    (size_t)e->live_tokens * sizeof(live->v[0]), current_sha);
+                if (strcmp(current_sha, e->token_sha) != 0) continue;
+            }
+            if (found_slot >= 0 && found_slot != i) return -1;
+            if (e->stamp >= found_stamp) {
+                found_slot = i;
+                found_tokens = e->live_tokens;
+                found_stamp = e->stamp;
+            }
+        }
+    }
+    if (boundary_tokens) *boundary_tokens = found_tokens;
+    return found_slot;
+}
 
 static bool job_cancelled(void *ud) {
     job *j = ud;
@@ -8869,6 +9235,9 @@ static void live_tool_state_clear_locked(live_tool_state *st) {
     free(st->visible_text);
     st->visible_text = NULL;
     st->visible_len = 0;
+    free(st->visible_text_alt);
+    st->visible_text_alt = NULL;
+    st->visible_len_alt = 0;
     st->valid = false;
     st->live_tokens = 0;
 }
@@ -8919,12 +9288,19 @@ static void thinking_live_remember(server *s, server_slot *slot,
 
 static void responses_live_remember(server *s, server_slot *slot,
                                     const char *visible_text,
+                                    const char *visible_text_alt,
                                     const tool_calls *calls) {
     if (!s || !slot || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->responses_live);
     slot->responses_live.visible_text = xstrdup(visible_text);
     slot->responses_live.visible_len = strlen(visible_text);
+    if (visible_text_alt && visible_text_alt[0] &&
+        strcmp(visible_text_alt, visible_text) != 0)
+    {
+        slot->responses_live.visible_text_alt = xstrdup(visible_text_alt);
+        slot->responses_live.visible_len_alt = strlen(visible_text_alt);
+    }
     if (calls) {
         for (int i = 0; i < calls->len; i++) {
             id_list_push_unique(&slot->responses_live.call_ids, calls->v[i].id);
@@ -9781,7 +10157,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
 }
 
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
-    if (!s || !slot) return;
+    if (!s || !slot || slot->openclaw_compaction_ephemeral) return;
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -9934,6 +10310,26 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
  * If this check fails, DS4 has no special Responses state to trust.  The caller
  * then uses normal token/text/disk matching, which is the correct fallback for
  * cold starts, edits, restarts, or cross-client replays. */
+static size_t responses_live_visible_prefix_len(const live_tool_state *st,
+                                                int live_pos,
+                                                const char *prompt_text,
+                                                size_t prompt_len) {
+    if (!st || !st->valid || st->live_tokens != live_pos || !prompt_text) return 0;
+    if (st->visible_text && st->visible_len < prompt_len &&
+        byte_prefix_match(prompt_text, prompt_len,
+                          st->visible_text, st->visible_len))
+    {
+        return st->visible_len;
+    }
+    if (st->visible_text_alt && st->visible_len_alt < prompt_len &&
+        byte_prefix_match(prompt_text, prompt_len,
+                          st->visible_text_alt, st->visible_len_alt))
+    {
+        return st->visible_len_alt;
+    }
+    return 0;
+}
+
 static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
                                                 const request *req,
                                                 int live_pos,
@@ -9942,18 +10338,12 @@ static int responses_live_visible_prefix_prompt(server *s, server_slot *slot,
     if (req->api != API_RESPONSES) return 0;
 
     const size_t prompt_len = strlen(req->prompt_text);
-    size_t visible_len = 0;
     pthread_mutex_lock(&s->tool_mu);
-    bool ok = slot->responses_live.valid &&
-              slot->responses_live.live_tokens == live_pos &&
-              slot->responses_live.visible_text &&
-              slot->responses_live.visible_len < prompt_len &&
-              byte_prefix_match(req->prompt_text, prompt_len,
-                                slot->responses_live.visible_text,
-                                slot->responses_live.visible_len);
-    if (ok) visible_len = slot->responses_live.visible_len;
+    size_t visible_len =
+        responses_live_visible_prefix_len(&slot->responses_live, live_pos,
+                                          req->prompt_text, prompt_len);
     pthread_mutex_unlock(&s->tool_mu);
-    if (!ok) return 0;
+    if (visible_len == 0) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
@@ -10005,6 +10395,340 @@ static int thinking_live_visible_prefix_prompt(server *s, server_slot *slot,
         s->engine, live_tokens, req->prompt_text + visible_len,
         effective_prompt);
     return live_tokens->len;
+}
+
+
+
+static char *render_token_range_text(ds4_engine *engine, const ds4_tokens *tokens,
+                                     int start, int end) {
+    if (!engine || !tokens) return NULL;
+    if (start < 0) start = 0;
+    if (end > tokens->len) end = tokens->len;
+    if (end < start) end = start;
+    buf b = {0};
+    for (int i = start; i < end; i++) {
+        size_t len = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &len);
+        buf_append(&b, piece, len);
+        free(piece);
+    }
+    return buf_take(&b);
+}
+
+static void openclaw_tail_push_user_segment(openclaw_compaction_tail *tail,
+                                            char *segment) {
+    if (!tail || !segment || !segment[0]) return;
+    if (!strncmp(segment, "<tool_result>", strlen("<tool_result>"))) return;
+    char *normalized = openclaw_normalize_user_text(segment);
+    if (normalized) {
+        openclaw_tail_push(tail, 'U', normalized);
+        free(normalized);
+    }
+}
+
+static void openclaw_tail_push_assistant_segment(openclaw_compaction_tail *tail,
+                                                 char *segment) {
+    if (!tail || !segment || !segment[0]) return;
+    const char *visible = strstr(segment, "</think>");
+    if (visible) visible += strlen("</think>");
+    else visible = segment;
+
+    const char *tool = strstr(visible, "<｜DSML｜tool_calls>");
+    size_t len = tool ? (size_t)(tool - visible) : strlen(visible);
+    if (tool) {
+        /* append_dsml_tool_calls_text adds two separator newlines that are not
+         * part of the assistant's visible text returned to OpenClaw. */
+        while (len > 0 && visible[len - 1] == '\n') len--;
+    }
+    if (len == 0) return;
+    char *content = xstrndup(visible, len);
+    openclaw_tail_push(tail, 'A', content);
+    free(content);
+}
+
+/* Recover historical full-turn token boundaries directly from an exact
+ * resident DeepSeek token stream.  This makes compaction reuse work immediately
+ * after a server restart, before the in-memory turn ring has had time to learn
+ * the older boundary.  Chat segmentation uses the model's special role/EOS
+ * token ids; message contents are still fingerprinted byte-exactly after only
+ * the same OpenClaw-owned envelope normalization used by the live ring. */
+static int openclaw_compaction_boundary_from_tokens(
+        ds4_engine *engine, const ds4_tokens *tokens,
+        const openclaw_compaction_tail *wanted, int *boundary_out) {
+    if (boundary_out) *boundary_out = 0;
+    if (!engine || !tokens || !wanted ||
+        wanted->len < OPENCLAW_COMPACTION_TAIL_BLOCKS) return 0;
+
+    const int user_id = ds4_token_user(engine);
+    const int assistant_id = ds4_token_assistant(engine);
+    const int eos_id = ds4_token_eos(engine);
+    if (user_id < 0 || assistant_id < 0 || eos_id < 0) return 0;
+
+    enum { SEG_NONE, SEG_USER, SEG_ASSISTANT } role = SEG_NONE;
+    int segment_start = 0;
+    openclaw_compaction_tail tail = {0};
+    int found = 0;
+    int found_boundary = 0;
+
+    for (int i = 0; i < tokens->len; i++) {
+        const int tok = tokens->v[i];
+        if (tok == user_id || tok == assistant_id) {
+            if (role == SEG_USER && i > segment_start) {
+                char *segment = render_token_range_text(engine, tokens,
+                                                        segment_start, i);
+                openclaw_tail_push_user_segment(&tail, segment);
+                free(segment);
+            }
+            role = tok == user_id ? SEG_USER : SEG_ASSISTANT;
+            segment_start = i + 1;
+            continue;
+        }
+        if (tok == eos_id && role == SEG_ASSISTANT) {
+            char *segment = render_token_range_text(engine, tokens,
+                                                    segment_start, i);
+            openclaw_tail_push_assistant_segment(&tail, segment);
+            free(segment);
+            if (openclaw_tail_equal(&tail, wanted)) {
+                found++;
+                found_boundary = i + 1;
+            }
+            role = SEG_NONE;
+            segment_start = i + 1;
+        }
+    }
+
+    if (found != 1) return found > 1 ? -1 : 0;
+    if (boundary_out) *boundary_out = found_boundary;
+    return 1;
+}
+
+static int openclaw_compaction_dynamic_source(server *s, const request *r,
+                                              int target_id,
+                                              int *boundary_out) {
+    if (boundary_out) *boundary_out = 0;
+    if (!s || !r || !r->openclaw_compaction ||
+        r->openclaw_compaction_split_turn ||
+        r->openclaw_tail.len < OPENCLAW_COMPACTION_TAIL_BLOCKS) return -1;
+
+    int found_slot = -1;
+    int found_boundary = 0;
+    for (int i = 0; i < s->slot_count; i++) {
+        if (i == target_id) continue;
+        ds4_tokens snapshot = {0};
+
+        pthread_mutex_lock(&s->mu);
+        server_slot *slot = &s->slots[i];
+        if (slot->busy || slot->assigned || slot->running) {
+            pthread_mutex_unlock(&s->mu);
+            continue;
+        }
+        pthread_mutex_lock(&s->inference_mu);
+        const ds4_tokens *live = ds4_session_tokens(slot->session);
+        if (live && live->len > 0) ds4_tokens_copy(&snapshot, live);
+        pthread_mutex_unlock(&s->inference_mu);
+        pthread_mutex_unlock(&s->mu);
+        if (snapshot.len == 0) {
+            ds4_tokens_free(&snapshot);
+            continue;
+        }
+
+        int boundary = 0;
+        int match = openclaw_compaction_boundary_from_tokens(
+            s->engine, &snapshot, &r->openclaw_tail, &boundary);
+        ds4_tokens_free(&snapshot);
+        if (match < 0) return -1;
+        if (match == 0) continue;
+        if (found_slot >= 0) return -1;
+        found_slot = i;
+        found_boundary = boundary;
+    }
+    if (boundary_out) *boundary_out = found_boundary;
+    return found_slot;
+}
+
+static bool token_prefix_equal(const ds4_tokens *a, const ds4_tokens *b, int n) {
+    if (!a || !b || n < 0 || a->len < n || b->len < n) return false;
+    return n == 0 || memcmp(a->v, b->v, (size_t)n * sizeof(a->v[0])) == 0;
+}
+
+static char *openclaw_compaction_branch_suffix(const request *r) {
+    if (!r || !r->openclaw_compaction || r->openclaw_compaction_split_turn)
+        return NULL;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK) return NULL;
+
+    buf b = {0};
+    buf_puts(&b, "<｜User｜>");
+    buf_puts(&b,
+        "[OpenClaw internal context compaction]\n"
+        "This is an internal context-maintenance request, not a new user task. "
+        "Summarize the conversation history that appears before this message. "
+        "Do NOT continue that conversation and do NOT answer any request from it. "
+        "Ignore the agent system prompt and tool schemas as subject matter; preserve "
+        "only conversation facts, decisions, state, identifiers, paths, errors, and "
+        "other context needed to continue later. ONLY output the requested summary.\n\n"
+        "Apply the following OpenClaw compaction instructions exactly:");
+    buf_puts(&b, r->openclaw_compaction_suffix ? r->openclaw_compaction_suffix : "");
+    buf_puts(&b, "<｜Assistant｜>");
+    buf_puts(&b, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+    return buf_take(&b);
+}
+
+/* Build an ephemeral compaction prompt from the exact token history of the
+ * resident OpenClaw session instead of the reserialized summarizer transcript.
+ *
+ * Safety properties:
+ *   - source resident session is never mutated;
+ *   - source identity is a normalized visible-tail fingerprint + token-prefix SHA;
+ *   - target restores a complete disk checkpoint and verifies every loaded token
+ *     against the source before advancing;
+ *   - split-turn compaction is deliberately not optimized;
+ *   - any ambiguity/mismatch falls back to the native OpenClaw prompt.
+ */
+static int openclaw_compaction_branch_prompt(server *s, server_slot *target,
+                                             const request *r,
+                                             ds4_tokens *branch_prompt,
+                                             int *source_slot_out,
+                                             int *boundary_out,
+                                             char **disk_path_out,
+                                             uint8_t *disk_ext_flags_out) {
+    if (source_slot_out) *source_slot_out = -1;
+    if (boundary_out) *boundary_out = 0;
+    if (disk_path_out) *disk_path_out = NULL;
+    if (disk_ext_flags_out) *disk_ext_flags_out = 0;
+    if (!s || !target || !r || !branch_prompt || !s->kv.enabled ||
+        !r->openclaw_compaction || r->openclaw_compaction_split_turn ||
+        r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK) return 0;
+
+    int boundary = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    int source_id = openclaw_compaction_source_slot_locked(s, r, &boundary);
+    pthread_mutex_unlock(&s->tool_mu);
+    if (source_id < 0) {
+        source_id = openclaw_compaction_dynamic_source(s, r, target->id, &boundary);
+        if (source_id >= 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: OpenClaw compaction source recovered from resident token history source=%d boundary=%d",
+                       source_id, boundary);
+        }
+    }
+    if (source_id < 0 || source_id >= s->slot_count || source_id == target->id ||
+        boundary <= 0) return 0;
+
+    server_slot *source = &s->slots[source_id];
+    ds4_tokens source_prefix = {0};
+
+    /* Keep dispatch from assigning the source while its exact token prefix is
+     * copied.  The global inference lock protects the session checkpoint array. */
+    pthread_mutex_lock(&s->mu);
+    if (source->busy || source->assigned || source->running) {
+        pthread_mutex_unlock(&s->mu);
+        return 0;
+    }
+    pthread_mutex_lock(&s->inference_mu);
+    const ds4_tokens *source_live = ds4_session_tokens(source->session);
+    if (!source_live || source_live->len < boundary) {
+        pthread_mutex_unlock(&s->inference_mu);
+        pthread_mutex_unlock(&s->mu);
+        return 0;
+    }
+    tokens_copy_prefix(&source_prefix, source_live, boundary);
+    pthread_mutex_unlock(&s->inference_mu);
+    pthread_mutex_unlock(&s->mu);
+
+    size_t source_text_len = 0;
+    char *source_text = render_tokens_text(s->engine, &source_prefix,
+                                           &source_text_len);
+    if (!source_text || source_text_len == 0) {
+        free(source_text);
+        ds4_tokens_free(&source_prefix);
+        return 0;
+    }
+
+    /* The target is an auxiliary branch.  Do not write its prior resident state
+     * here: the KV disk is deliberately kept for reusable session checkpoints,
+     * and a one-shot compaction must not evict the source anchor just before
+     * loading it.  Normal clients can replay a displaced target session. */
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_invalidate(target->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    request_live_state_clear(s, target);
+    openclaw_turn_boundaries_clear(target);
+    target->continued_last_store_tokens = 0;
+
+    ds4_tokens ignored_effective = {0};
+    char *loaded_path = NULL;
+    uint8_t loaded_ext = 0;
+    int loaded = kv_cache_try_load_text(s, target, source_text,
+                                        &ignored_effective, &loaded_path,
+                                        &loaded_ext, false);
+    ds4_tokens_free(&ignored_effective);
+    free(source_text);
+    if (loaded <= 0 || loaded > boundary) {
+        free(loaded_path);
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(target->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        ds4_tokens_free(&source_prefix);
+        return 0;
+    }
+
+    pthread_mutex_lock(&s->inference_mu);
+    const ds4_tokens *loaded_tokens = ds4_session_tokens(target->session);
+    bool exact = token_prefix_equal(loaded_tokens, &source_prefix, loaded);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!exact) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: OpenClaw compaction checkpoint token verification failed source=%d boundary=%d loaded=%d",
+                   source_id, boundary, loaded);
+        free(loaded_path);
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(target->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        ds4_tokens_free(&source_prefix);
+        return 0;
+    }
+
+    char *suffix = openclaw_compaction_branch_suffix(r);
+    if (!suffix) {
+        free(loaded_path);
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(target->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        ds4_tokens_free(&source_prefix);
+        return 0;
+    }
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, &source_prefix,
+                                                   suffix, branch_prompt);
+    free(suffix);
+    ds4_tokens_free(&source_prefix);
+
+    if (branch_prompt->len <= boundary || branch_prompt->len > s->ctx_size) {
+        ds4_tokens_free(branch_prompt);
+        free(loaded_path);
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(target->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        return 0;
+    }
+
+    target->openclaw_compaction_ephemeral = true;
+    if (source_slot_out) *source_slot_out = source_id;
+    if (boundary_out) *boundary_out = boundary;
+    if (disk_path_out) *disk_path_out = loaded_path;
+    else free(loaded_path);
+    if (disk_ext_flags_out) *disk_ext_flags_out = loaded_ext;
+    return loaded;
+}
+
+static void openclaw_compaction_ephemeral_reset(server *s, server_slot *slot) {
+    if (!s || !slot || !slot->openclaw_compaction_ephemeral) return;
+    request_live_state_clear(s, slot);
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_invalidate(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    openclaw_turn_boundaries_clear(slot);
+    slot->continued_last_store_tokens = 0;
+    slot->openclaw_compaction_ephemeral = false;
 }
 
 /* =========================================================================
@@ -11075,7 +11799,26 @@ static char *build_responses_live_visible_text(const request *r,
     }
 
     if (!openclaw_runtime_tail) {
-        buf_puts(&visible, r->prompt_text);
+        /* When the client does not replay reasoning summaries, historical
+         * assistant turns are rendered as <Assistant></think>content rather
+         * than <Assistant><think></think>content.  The current prompt_text
+         * ends in <think> because generation is about to begin, so drop that
+         * opener from the visible replay key before appending the closing tag
+         * in build_responses_visible_assistant_suffix(). */
+        const char *prompt = r->prompt_text;
+        size_t prompt_len = strlen(prompt);
+        const char *think_tag = "<think>";
+        const size_t think_tag_len = strlen(think_tag);
+        if (ds4_think_mode_enabled(r->think_mode) &&
+            !r->reasoning_summary_emit &&
+            prompt_len >= think_tag_len &&
+            memcmp(prompt + prompt_len - think_tag_len,
+                   think_tag, think_tag_len) == 0)
+        {
+            buf_append(&visible, prompt, prompt_len - think_tag_len);
+        } else {
+            buf_puts(&visible, prompt);
+        }
     } else if (ds4_think_mode_enabled(r->think_mode) &&
                r->reasoning_summary_emit) {
         /* build_openclaw_replay_checkpoint_base() resumes at <Assistant>
@@ -11562,13 +12305,28 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* A matching call_id is the strongest Responses continuation binding:
      * prefer it over visible replay so OpenClaw's repeated same-turn runtime
      * carrier is not appended a second time to an already-live KV frontier. */
-    int cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
+    int openclaw_source_slot = -1;
+    int openclaw_boundary = 0;
+    char *openclaw_disk_path = NULL;
+    uint8_t openclaw_disk_ext_flags = 0;
+    int cached = openclaw_compaction_branch_prompt(
+        s, slot, &j->req, &effective_prompt,
+        &openclaw_source_slot, &openclaw_boundary,
+        &openclaw_disk_path, &openclaw_disk_ext_flags);
+    const char *cache_source =
+        cached > 0 ? "openclaw-compaction-branch" : "none";
+    if (cached > 0) {
+        prompt_for_sync = &effective_prompt;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: OpenClaw compaction branch source=%d boundary=%d checkpoint=%d target=%d prompt=%d",
+                   openclaw_source_slot, openclaw_boundary, cached, slot->id,
+                   effective_prompt.len);
+    } else {
+        cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
-    const char *cache_source =
-        cached > 0 ? "responses-tool-output" : "none";
-    if (cached > 0) {
-        responses_live_match = "tool-output-ids";
+        cache_source = cached > 0 ? "responses-tool-output" : "none";
+        if (cached > 0) responses_live_match = "tool-output-ids";
     }
     if (cached == 0) {
         cached = responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
@@ -11649,9 +12407,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    int disk_cached = 0;
-    char *disk_cache_path = NULL;
-    uint8_t disk_cache_ext_flags = 0;
+    int disk_cached = cached > 0 && !strcmp(cache_source, "openclaw-compaction-branch")
+        ? cached : 0;
+    char *disk_cache_path = openclaw_disk_path;
+    uint8_t disk_cache_ext_flags = openclaw_disk_ext_flags;
     if (cached == 0) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
@@ -11840,6 +12599,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     int cold_store_len = 0;
     if (cached == 0 &&
+        !slot->openclaw_compaction_ephemeral &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -12606,7 +13366,7 @@ decode_again:
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
-    if (j->req.api == API_RESPONSES) {
+    if (j->req.api == API_RESPONSES && !slot->openclaw_compaction_ephemeral) {
         /* Store the post-turn client-visible transcript plus the live token
          * frontier.  The real session may additionally contain hidden reasoning,
          * exact sampled tool-call bytes, and -- during an OpenClaw tool loop --
@@ -12614,15 +13374,51 @@ decode_again:
          * Those bytes remain valid same-turn live state; the visible key must
          * instead match the transcript the client will actually send back. */
         bool openclaw_runtime_tail = false;
+        request replay_req = j->req;
+        /* reasoning.summary asks DS4 to emit a summary in this response. It does
+         * not guarantee that the client will replay that summary next turn.
+         * OpenClaw requests summary=auto but replays only visible assistant
+         * content, while clients such as Zed may replay the summary. Store both
+         * spellings against the same live frontier. */
+        replay_req.reasoning_summary_emit = false;
         char *visible =
-            build_responses_live_visible_text(&j->req,
+            build_responses_live_visible_text(&replay_req,
                 parsed_content ? parsed_content : "",
                 parsed_reasoning,
                 &parsed_calls,
                 &openclaw_runtime_tail);
 
-        responses_live_remember(s, slot, visible ? visible : "",
+        char *visible_alt = NULL;
+        if (j->req.reasoning_summary_emit) {
+            bool alt_runtime_tail = false;
+            replay_req.reasoning_summary_emit = true;
+            visible_alt =
+                build_responses_live_visible_text(&replay_req,
+                    parsed_content ? parsed_content : "",
+                    parsed_reasoning,
+                    &parsed_calls,
+                    &alt_runtime_tail);
+            openclaw_runtime_tail = openclaw_runtime_tail || alt_runtime_tail;
+        }
+
+        responses_live_remember(s, slot, visible ? visible : "", visible_alt,
                                 parsed_calls.len ? &parsed_calls : NULL);
+
+        if (!j->req.openclaw_compaction && parsed_calls.len == 0 &&
+            strcmp(final_finish, "error") != 0 &&
+            strcmp(final_finish, "length") != 0)
+        {
+            openclaw_compaction_tail tail = j->req.openclaw_tail;
+            if (parsed_content && parsed_content[0])
+                openclaw_tail_push(&tail, 'A', parsed_content);
+            if (tail.len >= 2) {
+                pthread_mutex_lock(&s->tool_mu);
+                openclaw_turn_boundary_remember_locked(
+                    slot, &tail, ds4_session_pos(slot->session),
+                    ds4_session_tokens(slot->session));
+                pthread_mutex_unlock(&s->tool_mu);
+            }
+        }
 
         if (openclaw_runtime_tail) {
             const size_t visible_len = visible ? strlen(visible) : 0;
@@ -12634,6 +13430,7 @@ decode_again:
                         ds4_session_pos(slot->session), visible_len);
         }
 
+        free(visible_alt);
         free(visible);
     }
     if (j->req.api == API_ANTHROPIC) {
@@ -12855,6 +13652,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    openclaw_compaction_ephemeral_reset(s, slot);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -12894,11 +13692,50 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+static bool resident_prefix_affinity_meaningful(int common, int live,
+                                                int prompt_len) {
+    enum {
+        RESIDENT_AFFINITY_MIN_COMMON = 32,
+        RESIDENT_AFFINITY_FORK_MIN_COMMON = 2048,
+        RESIDENT_AFFINITY_FORK_RATIO = 8,
+    };
+
+    if (common < RESIDENT_AFFINITY_MIN_COMMON || live <= 0 || prompt_len <= 0)
+        return false;
+
+    /* Exact continuation of the complete live frontier is strong evidence even
+     * for a short conversation. */
+    if (common == live && prompt_len >= live) return true;
+
+    /* For a rewritten/forked history, require a substantial absolute prefix
+     * and at least 1/8 of both histories. OpenClaw sessions share a generated
+     * system/tool prefix, so a few hundred identical tokens can otherwise make
+     * an unrelated request steal a resident slot while empty slots exist. */
+    if (common < RESIDENT_AFFINITY_FORK_MIN_COMMON) return false;
+    return (int64_t)common * RESIDENT_AFFINITY_FORK_RATIO >= live &&
+           (int64_t)common * RESIDENT_AFFINITY_FORK_RATIO >= prompt_len;
+}
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
+
+    if (j->req.openclaw_compaction && !j->req.openclaw_compaction_split_turn) {
+        int boundary = 0;
+        int source_slot = openclaw_compaction_source_slot_locked(s, &j->req, &boundary);
+        (void)boundary;
+        if (source_slot == slot->id) return INT_MIN;
+        if ((slot->responses_live.valid && slot->responses_live.call_ids.len > 0) ||
+            (slot->anthropic_live.valid && slot->anthropic_live.call_ids.len > 0)) {
+            /* A free slot can still own a protocol continuation that the next
+             * tool-result request cannot reconstruct statelessly. Prefer any
+             * ordinary/auxiliary slot for the ephemeral compaction branch. */
+            int live = ds4_session_pos(slot->session);
+            return -1000000000 - (live > 0 ? live : 0);
+        }
+    }
 
     const int common =
         ds4_session_common_prefix(slot->session, &j->req.prompt);
@@ -12906,17 +13743,14 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
 
     /* Resident-slot affinity:
      *
-     * A tiny accidental prefix (often just BOS, common=1) must not beat an
-     * empty/short slot. OpenClaw interleaves very small status/runtime requests
-     * with a long main-agent conversation; the old score returned `common`
-     * directly, so common=1 on a 70k resident session beat common=0 on an empty
-     * slot and destroyed the valuable long KV frontier.
+     * OpenClaw requests from different sessions can share the same generated
+     * system/tool prefix. A raw common-prefix score therefore overvalues weak
+     * cross-session matches and can choose a populated slot over an empty one.
      *
-     * Meaningful prefix reuse still wins normally. When there is no meaningful
-     * affinity, prefer the shortest resident context so unrelated auxiliary
+     * Preserve exact live continuations and substantial compaction/fork reuse.
+     * Otherwise prefer the shortest resident context so unrelated auxiliary
      * requests evict the cheapest slot. */
-    enum { RESIDENT_AFFINITY_MIN_COMMON = 32 };
-    if (common < RESIDENT_AFFINITY_MIN_COMMON) {
+    if (!resident_prefix_affinity_meaningful(common, live, j->req.prompt.len)) {
         if (live > INT_MAX / 2) return INT_MIN + 1;
         return -live;
     }
@@ -14139,6 +14973,21 @@ static void test_mixed_prefill_quantum_option(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
 }
 
+static void test_batched_resident_prefix_affinity_rejects_shared_system_prefix(void) {
+    /* Real OpenClaw traces. The first tuple came from an unrelated
+     * skill-workshop review slot and must not beat an empty resident slot. */
+    TEST_ASSERT(!resident_prefix_affinity_meaningful(261, 28506, 176229));
+
+    /* Mid-history compaction still has a substantial reusable prefix. */
+    TEST_ASSERT(resident_prefix_affinity_meaningful(84554, 138716, 124154));
+
+    /* Exact live continuation remains a strong binding. */
+    TEST_ASSERT(resident_prefix_affinity_meaningful(102400, 102400, 176294));
+
+    /* Tiny framework-only overlap remains weak. */
+    TEST_ASSERT(!resident_prefix_affinity_meaningful(1, 70000, 90000));
+}
+
 static void test_batched_live_continuation_slot_binding(void) {
     server s = {0};
     server_slot slots[3] = {0};
@@ -14231,6 +15080,32 @@ static void test_tool_schema_order_from_responses_tool_search(void) {
     TEST_ASSERT(order && !strcmp(order->prop[1], "limit"));
     free(schemas);
     tool_schema_orders_free(&orders);
+}
+
+static void test_responses_function_arguments_avoid_ambiguous_control_escapes(void) {
+    const char *args =
+        "{\"command\":\"except Exception as e:\\n    print(e)\\nC:\\\\new\\\\file\"}";
+    buf outer = {0};
+    append_responses_json_object_string(&outer, args);
+
+    const char *p = outer.ptr;
+    char *inner = NULL;
+    TEST_ASSERT(json_string(&p, &inner));
+    TEST_ASSERT(inner != NULL);
+    TEST_ASSERT(strstr(inner, "e:\\u000a    print(e)") != NULL);
+    TEST_ASSERT(strstr(inner, "print(e)\\u000aC:") != NULL);
+    TEST_ASSERT(strstr(inner, "C:\\\\new\\\\file") != NULL);
+
+    json_args parsed = {0};
+    TEST_ASSERT(json_args_parse(inner, &parsed));
+    int command_index = json_args_find_unused(&parsed, "command");
+    TEST_ASSERT(command_index >= 0);
+    TEST_ASSERT(strstr(parsed.v[command_index].value,
+                       "except Exception as e:\n    print(e)\nC:\\new\\file") != NULL);
+
+    json_args_free(&parsed);
+    free(inner);
+    buf_free(&outer);
 }
 
 static void test_responses_function_named_tool_search_stays_function_call(void) {
@@ -15684,6 +16559,37 @@ static void test_responses_encrypted_reasoning_preserved(void) {
     free(prompt);
 
     chat_msgs_free(&msgs);
+
+    /* Codex stateless replay legitimately emits null encrypted_content and
+     * null content when only a reasoning summary is available. */
+    const char *codex_null_input =
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":"
+        "[{\"type\":\"input_text\",\"text\":\"hi\"}]},"
+        "{\"type\":\"reasoning\",\"id\":\"rs_codex_null\","
+        "\"summary\":[{\"type\":\"summary_text\","
+        "\"text\":\"brief reasoning\"}],"
+        "\"content\":null,\"encrypted_content\":null},"
+        "{\"type\":\"message\",\"role\":\"assistant\","
+        "\"content\":[{\"type\":\"output_text\","
+        "\"text\":\"hello\"}]}]";
+
+    p = codex_null_input;
+    memset(&msgs, 0, sizeof(msgs));
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+
+    assistant = NULL;
+    for (int i = 0; i < msgs.len; i++) {
+        if (!strcmp(msgs.v[i].role, "assistant")) {
+            assistant = &msgs.v[i];
+            break;
+        }
+    }
+    TEST_ASSERT(assistant != NULL);
+    TEST_ASSERT(assistant->encrypted_content == NULL);
+    TEST_ASSERT(assistant->reasoning != NULL);
+    TEST_ASSERT(strstr(assistant->reasoning, "brief reasoning") != NULL);
+
+    chat_msgs_free(&msgs);
 }
 
 static void test_render_chat_prompt_text_renders_tools_before_system(void) {
@@ -16923,6 +17829,8 @@ static void test_responses_openclaw_runtime_tail_visible_checkpoint(void) {
                                           NULL, &stripped);
     TEST_ASSERT(!stripped);
     TEST_ASSERT(strstr(visible, "OpenClaw runtime context") != NULL);
+    TEST_ASSERT(strstr(visible, "<｜Assistant｜></think>done") != NULL);
+    TEST_ASSERT(strstr(visible, "<｜Assistant｜><think></think>done") == NULL);
     free(visible);
 
     tool_calls_free(&calls);
@@ -17166,6 +18074,34 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
 
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+static void test_responses_live_visible_prefix_accepts_summary_or_plain_replay(void) {
+    live_tool_state st = {0};
+    st.valid = true;
+    st.live_tokens = 28446;
+    st.visible_text = xstrdup(
+        "base<｜Assistant｜></think>C<｜end▁of▁sentence｜>");
+    st.visible_len = strlen(st.visible_text);
+    st.visible_text_alt = xstrdup(
+        "base<｜Assistant｜><think>summary</think>C<｜end▁of▁sentence｜>");
+    st.visible_len_alt = strlen(st.visible_text_alt);
+
+    const char *plain =
+        "base<｜Assistant｜></think>C<｜end▁of▁sentence｜><｜User｜>D";
+    const char *summary =
+        "base<｜Assistant｜><think>summary</think>C<｜end▁of▁sentence｜><｜User｜>D";
+    const char *other =
+        "base<｜Assistant｜></think>X<｜end▁of▁sentence｜><｜User｜>D";
+
+    TEST_ASSERT(responses_live_visible_prefix_len(&st, 28446, plain, strlen(plain)) ==
+                st.visible_len);
+    TEST_ASSERT(responses_live_visible_prefix_len(&st, 28446, summary, strlen(summary)) ==
+                st.visible_len_alt);
+    TEST_ASSERT(responses_live_visible_prefix_len(&st, 28445, plain, strlen(plain)) == 0);
+    TEST_ASSERT(responses_live_visible_prefix_len(&st, 28446, other, strlen(other)) == 0);
+
+    live_tool_state_free(&st);
 }
 
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
@@ -18763,6 +19699,110 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     TEST_ASSERT(f_on == 1.0 * (double)fresh.tokens / (double)fresh.file_size);
 }
 
+
+static void test_kv_cache_eviction_keeps_stair_step_compaction_anchors(void) {
+    /*
+     * Regression for a real OpenClaw compaction shape:
+     *
+     *   live   = 138716
+     *   common = 84554
+     *
+     * A checkpoint around 81920 must survive eviction pressure even though it
+     * is far more than the old 16384-token adjacent-anchor window behind live.
+     *
+     * Normalize file_size == tokens so every entry has a baseline score of 1.
+     * The resulting score therefore directly exposes the stair-step multiplier.
+     */
+    const uint64_t now = (uint64_t)time(NULL);
+
+    ds4_tokens live = {0};
+    live.len = 138716;
+
+    const char *incoming_text = "ab";
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 393216,
+        .reject_different_quant = false,
+    };
+
+    char prefix_sha[41];
+    sha1_bytes_hex("a", 1, prefix_sha);
+
+    kv_entry near = {
+        .reason = KV_REASON_CONTINUED,
+        .model_id = 0,
+        .quant_bits = 2,
+        .tokens = 126976,
+        .ctx_size = 393216,
+        .text_bytes = 1,
+        .file_size = 126976,
+        .created_at = now,
+        .last_used = now,
+    };
+
+    kv_entry anchor_16k = {
+        .reason = KV_REASON_CONTINUED,
+        .model_id = 0,
+        .quant_bits = 2,
+        .tokens = 81920,
+        .ctx_size = 393216,
+        .text_bytes = 1,
+        .file_size = 81920,
+        .created_at = now,
+        .last_used = now,
+    };
+
+    kv_entry unaligned = {
+        .reason = KV_REASON_CONTINUED,
+        .model_id = 0,
+        .quant_bits = 2,
+        .tokens = 77824,
+        .ctx_size = 393216,
+        .text_bytes = 1,
+        .file_size = 77824,
+        .created_at = now,
+        .last_used = now,
+    };
+
+    kv_entry anchor_32k = {
+        .reason = KV_REASON_CONTINUED,
+        .model_id = 0,
+        .quant_bits = 2,
+        .tokens = 65536,
+        .ctx_size = 393216,
+        .text_bytes = 1,
+        .file_size = 65536,
+        .created_at = now,
+        .last_used = now,
+    };
+
+    memcpy(near.sha, prefix_sha, sizeof(prefix_sha));
+    memcpy(anchor_16k.sha, prefix_sha, sizeof(prefix_sha));
+    memcpy(unaligned.sha, prefix_sha, sizeof(prefix_sha));
+    memcpy(anchor_32k.sha, prefix_sha, sizeof(prefix_sha));
+
+    double s_near =
+        kv_entry_eviction_score(&near, &live, now, &incoming);
+    double s_16k =
+        kv_entry_eviction_score(&anchor_16k, &live, now, &incoming);
+    double s_unaligned =
+        kv_entry_eviction_score(&unaligned, &live, now, &incoming);
+    double s_32k =
+        kv_entry_eviction_score(&anchor_32k, &live, now, &incoming);
+
+    TEST_ASSERT(s_near == 8.0);
+    TEST_ASSERT(s_16k == 6.0);
+    TEST_ASSERT(s_32k == 4.0);
+
+    /* 77824 is inside the 64k distance tier but is not 16k-aligned, so it
+     * remains a normal superseded continued victim. */
+    TEST_ASSERT(s_unaligned < s_32k);
+    TEST_ASSERT(s_unaligned < s_16k);
+}
+
 static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     char tmpl[] = "/tmp/ds4-kv-stale-hit-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -19100,9 +20140,152 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+
+static void test_openclaw_compaction_tail_normalizes_visible_history(void) {
+    chat_msgs msgs = {0};
+
+    chat_msg probe = {0};
+    probe.role = xstrdup("user");
+    probe.content = xstrdup(
+        "必须调用 session_status 工具查询当前 session 状态，然后根据工具结果告诉我 context 使用情况。不要直接回答。");
+    chat_msgs_push(&msgs, probe);
+
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup(
+        "[Sat 2026-08-15 12:54 GMT+9] Conversation info: ⟦openclaw:ctx⟧\n"
+        "```json\n{\"sender\":{\"id\":\"1\"}}\n```\n\n"
+        "怎么样了");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("收到");
+    chat_msgs_push(&msgs, assistant);
+
+    openclaw_compaction_tail normal = {0};
+    openclaw_tail_from_messages(&normal, &msgs);
+
+    openclaw_compaction_tail compact = {0};
+    openclaw_tail_from_serialized(
+        &compact,
+        "[User]: 怎么样了\n\n"
+        "[Assistant thinking]: hidden chain\n\n"
+        "[Assistant]: 收到");
+
+    TEST_ASSERT(normal.len == 2);
+    TEST_ASSERT(openclaw_tail_equal(&normal, &compact));
+    chat_msgs_free(&msgs);
+}
+
+static void test_openclaw_compaction_tail_normalizes_runtime_event(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup(
+        "[Sat 2026-08-15 12:54 GMT+9] Continue the OpenClaw runtime event.");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("NO_REPLY");
+    chat_msgs_push(&msgs, assistant);
+
+    openclaw_compaction_tail normal = {0};
+    openclaw_tail_from_messages(&normal, &msgs);
+    openclaw_compaction_tail compact = {0};
+    openclaw_tail_from_serialized(
+        &compact,
+        "[User]: Continue the OpenClaw runtime event.\n\n"
+        "[Assistant]: NO_REPLY");
+    TEST_ASSERT(openclaw_tail_equal(&normal, &compact));
+    chat_msgs_free(&msgs);
+}
+
+static void test_openclaw_compaction_request_detection(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 8192);
+    r.api = API_RESPONSES;
+
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup(
+        "You are a context summarization assistant. Your task is to read a conversation.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup(
+        "<conversation>\n"
+        "[User]: hello\n\n[Assistant thinking]: hidden\n\n[Assistant]: world\n"
+        "</conversation>\n\nThe messages above are a conversation to summarize.");
+    chat_msgs_push(&msgs, user);
+
+    TEST_ASSERT(openclaw_prepare_compaction_request(&r, &msgs));
+    TEST_ASSERT(r.openclaw_compaction);
+    TEST_ASSERT(!r.openclaw_compaction_split_turn);
+    TEST_ASSERT(r.openclaw_tail.len == 2);
+    TEST_ASSERT(r.openclaw_compaction_suffix != NULL);
+    TEST_ASSERT(strstr(r.openclaw_compaction_suffix,
+                       "The messages above are a conversation to summarize.") != NULL);
+
+    free(r.openclaw_compaction_suffix);
+    r.openclaw_compaction_suffix = NULL;
+    r.openclaw_compaction = false;
+    r.openclaw_compaction_split_turn = false;
+    memset(&r.openclaw_tail, 0, sizeof(r.openclaw_tail));
+    free(msgs.v[1].content);
+    msgs.v[1].content = xstrdup(
+        "<conversation>\n[User]: hello\n\n[Assistant]: world\n</conversation>\n\n"
+        "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.");
+    TEST_ASSERT(openclaw_prepare_compaction_request(&r, &msgs));
+    TEST_ASSERT(r.openclaw_compaction_split_turn);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_openclaw_compaction_source_requires_unique_slot(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+
+    request r;
+    request_init(&r, REQ_CHAT, 8192);
+    r.api = API_RESPONSES;
+    r.openclaw_compaction = true;
+    openclaw_tail_push(&r.openclaw_tail, 'U', "u1");
+    openclaw_tail_push(&r.openclaw_tail, 'A', "a1");
+    openclaw_tail_push(&r.openclaw_tail, 'U', "u2");
+    openclaw_tail_push(&r.openclaw_tail, 'A', "a2");
+    openclaw_tail_push(&r.openclaw_tail, 'U', "u3");
+    openclaw_tail_push(&r.openclaw_tail, 'A', "a3");
+    openclaw_tail_push(&r.openclaw_tail, 'U', "u4");
+    openclaw_tail_push(&r.openclaw_tail, 'A', "a4");
+
+    openclaw_turn_boundary_remember_locked(&slots[0], &r.openclaw_tail, 40960, NULL);
+    int boundary = 0;
+    TEST_ASSERT(openclaw_compaction_source_slot_locked(&s, &r, &boundary) == 0);
+    TEST_ASSERT(boundary == 40960);
+
+    openclaw_turn_boundary_remember_locked(&slots[1], &r.openclaw_tail, 45056, NULL);
+    boundary = 0;
+    TEST_ASSERT(openclaw_compaction_source_slot_locked(&s, &r, &boundary) == -1);
+    TEST_ASSERT(boundary == 0);
+
+    r.openclaw_compaction_split_turn = true;
+    TEST_ASSERT(openclaw_compaction_source_slot_locked(&s, &r, &boundary) == -1);
+    request_free(&r);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_openclaw_compaction_tail_normalizes_visible_history();
+    test_openclaw_compaction_tail_normalizes_runtime_event();
+    test_openclaw_compaction_request_detection();
+    test_openclaw_compaction_source_requires_unique_slot();
     test_batched_prefill_round_robin();
     test_mixed_prefill_quantum_option();
+    test_batched_resident_prefix_affinity_rejects_shared_system_prefix();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
@@ -19121,6 +20304,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
+    test_responses_function_arguments_avoid_ambiguous_control_escapes();
     test_responses_function_named_tool_search_stays_function_call();
     test_responses_namespace_tool_schemas_restore_wire_namespace();
     test_responses_input_tool_search_output_loads_tools();
@@ -19176,6 +20360,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
+    test_responses_live_visible_prefix_accepts_summary_or_plain_replay();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
@@ -19228,6 +20413,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_eviction_keeps_stair_step_compaction_anchors();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
 }

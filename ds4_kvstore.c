@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -549,22 +550,45 @@ double ds4_kvstore_entry_eviction_score(
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
     if (kv_cache_incoming_supersedes_continued(e, incoming)) {
-        /* Keep the immediately previous continued waypoint as a rebuild
-         * anchor. With the default 10k interval aligned to 2048, adjacent
-         * waypoints are 10240 tokens apart. OpenClaw can rewrite a several-k
-         * token tail after tool/runtime-context normalization; retaining one
-         * prior waypoint prevents a canonical rebuild from falling back to
-         * token zero.
+        /*
+         * Keep rebuild anchors at progressively sparser intervals as they get
+         * farther behind the live frontier.
          *
-         * Older superseded waypoints keep the original cheap-victim policy.
-         * 16384 intentionally covers one default/aligned interval, but not two
-         * (20480), so disk growth remains bounded by the normal eviction pass. */
-        const bool adjacent_rebuild_anchor =
-            live && live->len > (int)e->tokens &&
-            live->len - (int)e->tokens <= 16384;
+         * A purely forward-growing conversation makes old continued
+         * checkpoints look superseded, but OpenClaw compaction can later
+         * rewrite history tens of thousands of tokens behind the live
+         * frontier. If every older waypoint has already been discounted and
+         * evicted, such a rewrite falls all the way back to token zero.
+         *
+         * Tier policy:
+         *   <= 16k behind live: keep every waypoint strongly.
+         *   <= 64k:            keep 16k-aligned sparse anchors.
+         *   <= 128k:           keep 32k-aligned sparse anchors.
+         *   >  128k:           keep 64k-aligned sparse anchors.
+         */
+        int distance = INT_MAX;
+        if (live && live->len > (int)e->tokens)
+            distance = live->len - (int)e->tokens;
 
-        if (adjacent_rebuild_anchor) {
-            score *= 8.0;
+        bool rebuild_anchor = false;
+        double rebuild_anchor_factor = 1.0;
+
+        if (distance <= 16384) {
+            rebuild_anchor = true;
+            rebuild_anchor_factor = 8.0;
+        } else if (distance <= 65536 && (e->tokens % 16384u) == 0u) {
+            rebuild_anchor = true;
+            rebuild_anchor_factor = 6.0;
+        } else if (distance <= 131072 && (e->tokens % 32768u) == 0u) {
+            rebuild_anchor = true;
+            rebuild_anchor_factor = 4.0;
+        } else if ((e->tokens % 65536u) == 0u) {
+            rebuild_anchor = true;
+            rebuild_anchor_factor = 2.0;
+        }
+
+        if (rebuild_anchor) {
+            score *= rebuild_anchor_factor;
         } else {
             double h = effective_hits > 0.0 ?
                 effective_hits / (effective_hits + 1.0) : 0.0;
