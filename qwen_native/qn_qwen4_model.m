@@ -67,6 +67,11 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
     float next[10240];
     for(uint32_t i=0;i<48;i++){
         if(i==1){if(qn_qwen4_model_ensure_ple(m,e,n))return -1;float po[10240];qn_ple_input pi={0};pi.hyper_state=h;pi.token_history[0]=m->ple_token_history[0];pi.token_history[1]=m->ple_token_history[1];pi.token_history[2]=(int64_t)token;pi.conv_state=m->ple_conv;qn_ple_output py={0};py.ple_output=po;if(qn_ple_layer_forward(m->ple,&pi,&py,e,n))return -1;for(uint32_t j=0;j<10240;j++)h[j]+=po[j];}
+        if(i>=4 && (i%4)==0){
+            if(qn_qwen4_model_ensure_layer(m,i,e,n)||qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n))return -1;
+            if(qn_gdn_group_forward3(m->gdn[i],m->gdn[i+1],m->gdn[i+2],h,next,e,n))return -1;
+            memcpy(h,next,10240*4); i+=2; continue;
+        }
         if(qn_qwen4_model_ensure_layer(m,i,e,n))return -1;
         if(is_qsa(i)){
             if(ensure_qsa_cache(m,i,(size_t)m->position+1,e,n))return -1;
