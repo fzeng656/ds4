@@ -92,5 +92,23 @@ int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_
     if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
 }
 
+int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
+    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}
+    double t0=msnow(); float emb[2560],h[10240];
+    for(size_t t=0;t<count;t++){
+        uint32_t token=tokens[t]; if(token>=248320){E(e,n,"prefill token out of range");return -1;}
+        if(qn_model_io_embed(m->io,token,emb,e,n))return -1;
+        for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));
+        if(run_trunk(m,token,h,e,n))return -1;
+        m->ple_token_history[0]=m->ple_token_history[1];
+        m->ple_token_history[1]=(int64_t)token;
+        m->position++;
+    }
+    double t1=msnow(); uint32_t nt=0; double lm=0;
+    if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;
+    out->next_token=nt; out->prompt_tokens=(uint32_t)count; out->prefill_ms=t1-t0; out->logits_ms=lm; out->total_ms=msnow()-t0;
+    return 0;
+}
+
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *s){if(!m||!s)return;memset(s,0,sizeof(*s));s->num_layers=48;s->qsa_layers=12;s->gdn_layers=36;s->gdn_conv_state_bytes=(uint64_t)36*10240*4*4;s->gdn_recurrent_state_bytes=(uint64_t)36*48*128*128*4;s->ple_state_bytes=(uint64_t)10240*9*4+2*8;s->opened_qsa_layers=m->opened_qsa;s->opened_gdn_layers=m->opened_gdn;s->ple_opened=m->ple!=0;s->qsa_cache_capacity=m->qsa_initial_capacity;s->qsa_cache_bytes=m->qsa_cache_bytes;s->position=m->position;}
 void qn_qwen4_model_close(qn_qwen4_model *m){if(!m)return;for(uint32_t i=0;i<48;i++){if(m->qsa[i])qn_qwen4_layer_close(m->qsa[i]);if(m->gdn[i])qn_gdn_layer_close(m->gdn[i]);free(m->qsa_index[i]);free(m->qsa_key[i]);free(m->qsa_value[i]);}if(m->ple)qn_ple_layer_close(m->ple);if(m->io)qn_model_io_close(m->io);free(m->ple_conv);free(m);}
