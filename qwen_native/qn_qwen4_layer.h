@@ -32,6 +32,12 @@ typedef struct {
 int qn_qwen4_layer_open(qn_qwen4_layer **out,
                         const qn_qwen4_layer_config *config,
                         char *err, size_t errlen);
+int qn_qwen4_layer_forward_attention(qn_qwen4_layer *layer,
+                                     const qn_qwen4_decode_input *input,
+                                     float *hyper_output,
+                                     double *elapsed_ms,
+                                     char *err, size_t errlen);
+
 int qn_qwen4_layer_forward_moe(qn_qwen4_layer *layer,
                                const float *hidden, float *output,
                                uint32_t selected_ids[10],
