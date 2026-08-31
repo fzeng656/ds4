@@ -66,3 +66,21 @@ Pass criteria for the first memory PoC:
 - pages become resident on execution;
 - idle physical footprint drops materially without closing the logical model;
 - rerun faults pages back and produces identical output.
+
+## Phase 1A result (2026-08-31)
+
+The first real Qwen weight path is validated without materializing the model in
+MLX. `layers.11.self_attn.q_proj` is an 8-bit affine non-expert projection
+(group size 64), despite the model-wide expert default being 4-bit. Its
+safetensors payload is mapped with `MAP_SHARED`, exposed to Metal with
+`newBufferWithBytesNoCopy`, and consumed directly by a correctness-first
+Metal matrix-vector kernel.
+
+Reference: MLX `quantized_matmul(... bits=8, group_size=64, mode="affine")`.
+For a deterministic BF16 input vector, the native mmap path reached cosine
+0.99999859 with FP32 accumulation. This validates the storage offsets, packed
+U32 byte order, BF16 scales/biases, and direct file-backed Metal access.
+
+Phase 1B should separate the mmap/file-backing primitives from the probe and
+implement an optimized Q8 affine matmul path, then measure page residency and
+reclaim behavior under repeated map/run/release cycles.
