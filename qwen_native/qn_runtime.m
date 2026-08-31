@@ -30,3 +30,13 @@ int qn_affine_make_view(id<MTLDevice> dev,const qn_file_map *m,const qn_affine_d
     out->biases=[dev newBufferWithBytesNoCopy:(uint8_t*)m->base+d->biases_offset length:(NSUInteger)sb options:MTLResourceStorageModeShared deallocator:nil];
     if(!out->weight||!out->scales||!out->biases){qn_err(err,errlen,"Metal no-copy view failed");return -1;} return 0;
 }
+
+int qn_bf16_make_view(id<MTLDevice> dev,const qn_file_map *m,uint64_t file_offset,uint64_t elements,qn_bf16_metal_view *out,char *err,size_t errlen){
+    if(!dev||!m||!m->base||!out||elements==0){qn_err(err,errlen,"invalid bf16 view argument");return -1;}
+    uint64_t bytes=elements*2;
+    if(file_offset+bytes>m->bytes){qn_err(err,errlen,"bf16 tensor range outside shard");return -1;}
+    out->buffer=[dev newBufferWithBytesNoCopy:(uint8_t*)m->base+file_offset length:(NSUInteger)bytes options:MTLResourceStorageModeShared deallocator:nil];
+    out->elements=elements;
+    if(!out->buffer){qn_err(err,errlen,"Metal bf16 no-copy view failed");return -1;}
+    return 0;
+}

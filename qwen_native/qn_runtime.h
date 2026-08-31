@@ -35,9 +35,18 @@ typedef struct {
     __strong id<MTLBuffer> biases;
 } qn_affine_metal_view;
 
+typedef struct {
+    __strong id<MTLBuffer> buffer;
+    uint64_t elements;
+} qn_bf16_metal_view;
+
 int qn_affine_make_view(id<MTLDevice> dev, const qn_file_map *m,
                         const qn_affine_desc *d,
                         qn_affine_metal_view *out,
                         char *err, size_t errlen);
+int qn_bf16_make_view(id<MTLDevice> dev, const qn_file_map *m,
+                      uint64_t file_offset, uint64_t elements,
+                      qn_bf16_metal_view *out,
+                      char *err, size_t errlen);
 #endif
 #endif
