@@ -8,5 +8,6 @@ typedef struct { const float *hyper_state; int64_t token_history[3]; float *conv
 typedef struct { float *ple_output; int64_t ngram_ids[16]; double elapsed_ms; } qn_ple_output;
 int qn_ple_layer_open(qn_ple_layer **out,const qn_ple_config *cfg,char *err,size_t errlen);
 int qn_ple_layer_forward(qn_ple_layer *l,const qn_ple_input *in,qn_ple_output *out,char *err,size_t errlen);
+int qn_ple_layer_forward_batch(qn_ple_layer *l,const float *hyper_states,const int64_t *token_ids,uint32_t tokens,int64_t token_history[2],float *conv_state,float *ple_outputs,char *err,size_t errlen);
 void qn_ple_layer_close(qn_ple_layer *l);
 #endif
