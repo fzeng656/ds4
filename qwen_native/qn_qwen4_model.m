@@ -94,20 +94,39 @@ int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_
 
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
     if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}
-    double t0=msnow(); float emb[2560],h[10240];
-    for(size_t t=0;t<count;t++){
-        uint32_t token=tokens[t]; if(token>=248320){E(e,n,"prefill token out of range");return -1;}
-        if(qn_model_io_embed(m->io,token,emb,e,n))return -1;
-        for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));
-        if(run_trunk(m,token,h,e,n))return -1;
-        m->ple_token_history[0]=m->ple_token_history[1];
-        m->ple_token_history[1]=(int64_t)token;
-        m->position++;
+    if(count==1){
+        double t0=msnow();float emb[2560],h[10240];uint32_t token=tokens[0];if(token>=248320){E(e,n,"prefill token out of range");return -1;}if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->prompt_tokens=1;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
     }
-    double t1=msnow(); uint32_t nt=0; double lm=0;
-    if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;
-    out->next_token=nt; out->prompt_tokens=(uint32_t)count; out->prefill_ms=t1-t0; out->logits_ms=lm; out->total_ms=msnow()-t0;
-    return 0;
+    if(count>UINT32_MAX){E(e,n,"prefill token count too large");return -1;}
+    uint32_t T=(uint32_t)count,base=m->position;
+    for(size_t t=0;t<count;t++)if(tokens[t]>=248320){E(e,n,"prefill token out of range");return -1;}
+    size_t elems=count*10240;float *a=malloc(elems*sizeof(float)),*b=malloc(elems*sizeof(float));if(!a||!b){free(a);free(b);E(e,n,"prefill stream allocation failed");return -1;}
+    double t0=msnow();
+    for(uint32_t t=0;t<T;t++){float emb[2560];if(qn_model_io_embed(m->io,tokens[t],emb,e,n)){free(a);free(b);return -1;}for(int g=0;g<4;g++)memcpy(a+(size_t)t*10240+g*2560,emb,2560*sizeof(float));}
+    int64_t ple_hist[2]={m->ple_token_history[0],m->ple_token_history[1]};
+    for(uint32_t i=0;i<48;i++){
+        if(i==1){
+            if(qn_qwen4_model_ensure_ple(m,e,n)){free(a);free(b);return -1;}
+            float *po=malloc(elems*sizeof(float));int64_t *ids64=malloc((size_t)T*sizeof(int64_t));if(!po||!ids64){free(po);free(ids64);free(a);free(b);E(e,n,"PLE prefill allocation failed");return -1;}for(uint32_t t=0;t<T;t++)ids64[t]=(int64_t)tokens[t];
+            if(qn_ple_layer_forward_batch(m->ple,a,ids64,T,ple_hist,m->ple_conv,po,e,n)){free(po);free(ids64);free(a);free(b);return -1;}
+            for(size_t z=0;z<elems;z++)a[z]+=po[z];free(po);free(ids64);
+        }
+        if(qn_qwen4_model_ensure_layer(m,i,e,n)){free(a);free(b);return -1;}
+        if(is_qsa(i)){
+            if(ensure_qsa_cache(m,i,(size_t)base+T,e,n)){free(a);free(b);return -1;}
+            for(uint32_t t=0;t<T;t++){
+                uint32_t pos=base+t;float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={a+(size_t)t*10240,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],pos};qn_qwen4_decode_output o={0};o.hyper_state=b+(size_t)t*10240;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
+                if(qn_qwen4_layer_forward_decode(m->qsa[i],&in,&o,e,n)){free(a);free(b);return -1;}
+                memcpy(m->qsa_index[i]+(size_t)pos*128,ci,128*sizeof(float));memcpy(m->qsa_key[i]+(size_t)pos*512,ck,512*sizeof(float));memcpy(m->qsa_value[i]+(size_t)pos*512,cv,512*sizeof(float));
+            }
+        }else{
+            if(qn_gdn_layer_forward_full_batch(m->gdn[i],a,T,b,e,n)){free(a);free(b);return -1;}
+        }
+        float *tmp=a;a=b;b=tmp;
+    }
+    double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,a+(size_t)(T-1)*10240,logits,&nt,&lm,e,n)){free(a);free(b);return -1;}
+    m->ple_token_history[0]=ple_hist[0];m->ple_token_history[1]=ple_hist[1];m->position=base+T;
+    out->next_token=nt;out->prompt_tokens=T;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;free(a);free(b);return 0;
 }
 
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *s){if(!m||!s)return;memset(s,0,sizeof(*s));s->num_layers=48;s->qsa_layers=12;s->gdn_layers=36;s->gdn_conv_state_bytes=(uint64_t)36*10240*4*4;s->gdn_recurrent_state_bytes=(uint64_t)36*48*128*128*4;s->ple_state_bytes=(uint64_t)10240*9*4+2*8;s->opened_qsa_layers=m->opened_qsa;s->opened_gdn_layers=m->opened_gdn;s->ple_opened=m->ple!=0;s->qsa_cache_capacity=m->qsa_initial_capacity;s->qsa_cache_bytes=m->qsa_cache_bytes;s->position=m->position;}
