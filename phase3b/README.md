@@ -8,6 +8,7 @@
 - Real q8 projections, A_log/dt/beta gates, RMSNormGated, out projection, and attention Hyper-Connection validated.
 - Manifest-backed per-tensor shard resolver supports GDN tensors split across shard boundaries (notably layer 20).
 - All 36 linear-attention layers pass attention-half E2E with conv/recurrent cache updates.
+- All 36 linear-attention layers also pass complete decoder-layer E2E: GDN + both Hyper-Connections + routed/shared MoE.
 
 ## Architecture
 
@@ -28,4 +29,6 @@ Special topology cases:
 - L1 includes PLE tensors; GDN attention was validated on the post-PLE residual-state boundary.
 - L20 GDN tensors span two shards; per-tensor resolver correctly maps them.
 
-Next: combine GDN attention-half with MLP Hyper-Connection + MoE for complete linear-attention decoder layers, then handle L1 PLE separately.
+Complete GDN decoder-layer sweep: router top-10 mismatch=0 for all 36 layers; final cosine=1.0 for all. Worst final max abs error ~1.97e-6 (L46).
+
+Next: handle L1 PLE separately, then assemble the 48-layer trunk and model-level embedding/final mixer/lm-head path.
