@@ -109,3 +109,11 @@ MLX median reference on the same tensors/inputs:
 
 The remaining gap is small enough to proceed; next test is scheduling/fusion before
 replacing the scalar-per-row correctness kernel with a DS4-style tiled matmul.
+
+### Phase 1C-2 SIMD scheduling
+
+A 32-lane SIMD-group-per-output-row kernel plus one command buffer for Q/K/V
+reduced native L11 QKV wall latency from ~0.675 ms to ~0.451 ms while preserving
+correctness (max absolute error <= 3.54e-8). This closes most of the gap to MLX
+and confirms that scheduling + row-parallel reduction is the right first
+optimization before adopting a larger DS4-style tile kernel.
