@@ -47,7 +47,7 @@ inline float sigm(float x){return 1.0f/(1.0f+exp(-x));}
 
 kernel void q8_mv(device const uint*w[[buffer(0)]],device const ushort*sc[[buffer(1)]],device const ushort*bi[[buffer(2)]],device const float*x[[buffer(3)]],device float*y[[buffer(4)]],constant uint&O[[buffer(5)]],constant uint&I[[buffer(6)]],uint tid[[thread_position_in_grid]],uint lane[[thread_index_in_simdgroup]]){
  uint r=tid/32;if(r>=O)return;uint G=I/64,W=I/4;float a=0;
- for(uint g=0;g<G;g++){float s=bf16f(sc[r*G+g]),b=bf16f(bi[r*G+g]);for(uint j=lane;j<16;j+=32){uint p=w[r*W+g*16+j],k=g*64+j*4;float4 q=float4(p&255u,(p>>8)&255u,(p>>16)&255u,(p>>24)&255u);a+=dot(float4(x[k],x[k+1],x[k+2],x[k+3]),q*s+b);}}
+ for(uint g=0;g<G;g++){float s=bf16f(sc[r*G+g]),b=bf16f(bi[r*G+g]);uint j=lane>>1,t=(lane&1u)*2u,p=w[r*W+g*16+j],k=g*64+j*4+t;float2 q=float2((p>>(8*t))&255u,(p>>(8*(t+1)))&255u);a+=dot(float2(x[k],x[k+1]),q*s+b);}
  a=simd_sum(a);if(lane==0)y[r]=a;
 }
 kernel void q4_mv(device const uint*w[[buffer(0)]],device const ushort*sc[[buffer(1)]],device const ushort*bi[[buffer(2)]],device const float*x[[buffer(3)]],device float*y[[buffer(4)]],constant uint&O[[buffer(5)]],constant uint&I[[buffer(6)]],uint tid[[thread_position_in_grid]],uint lane[[thread_index_in_simdgroup]]){
