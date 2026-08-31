@@ -22,6 +22,9 @@ typedef struct {
 
 typedef struct {
     float *hyper_state;               /* 4 x 2560 output */
+    float *indexer_raw_key;           /* optional 128-float cache append */
+    float *key_cache;                 /* optional 2 x 256 cache append */
+    float *value_cache;               /* optional 2 x 256 cache append */
     uint32_t selected_expert_ids[10];
     float selected_expert_weights[10];
     double attention_ms;
