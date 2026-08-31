@@ -84,3 +84,28 @@ U32 byte order, BF16 scales/biases, and direct file-backed Metal access.
 Phase 1B should separate the mmap/file-backing primitives from the probe and
 implement an optimized Q8 affine matmul path, then measure page residency and
 reclaim behavior under repeated map/run/release cycles.
+
+## Phase 1C checkpoint
+
+The mmap-backed runtime primitive now owns shard mappings and strong Metal no-copy
+views. L11 q/k/v/o affine-8 projections all execute directly from the existing
+safetensors payload without MLX array materialization.
+
+Correctness against MLX 0.32.1 `quantized_matmul` on fixed inputs:
+- q/k/v/o cosine: 1.000000000000
+- max absolute error: 5.96e-8 to 1.49e-7
+
+Correctness-first native steady wall latency (one command buffer per projection):
+- q: ~0.56 ms
+- k: ~0.44 ms
+- v: ~0.44 ms
+- o: ~0.49 ms
+
+MLX median reference on the same tensors/inputs:
+- q: ~0.42 ms
+- k: ~0.25 ms
+- v: ~0.26 ms
+- o: ~0.28 ms
+
+The remaining gap is small enough to proceed; next test is scheduling/fusion before
+replacing the scalar-per-row correctness kernel with a DS4-style tiled matmul.
