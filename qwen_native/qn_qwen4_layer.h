@@ -50,6 +50,13 @@ int qn_qwen4_layer_forward_moe(qn_qwen4_layer *layer,
                                double *elapsed_ms,
                                char *err, size_t errlen);
 
+int qn_qwen4_layer_forward_prefill_batch(qn_qwen4_layer *layer,
+                                           const float *hyper_states,
+                                           uint32_t base_position, uint32_t tokens,
+                                           float *index_history, float *key_history, float *value_history,
+                                           float *hyper_outputs, double *elapsed_ms,
+                                           char *err, size_t errlen);
+
 int qn_qwen4_layer_forward_decode(qn_qwen4_layer *layer,
                                   const qn_qwen4_decode_input *input,
                                   qn_qwen4_decode_output *output,

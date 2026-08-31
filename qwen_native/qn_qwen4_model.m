@@ -119,10 +119,14 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
         }
         if(is_qsa(i)){
             if(ensure_qsa_cache(m,i,(size_t)base+T,e,n)){free(a);free(b);return -1;}
-            for(uint32_t t=0;t<T;t++){
-                uint32_t pos=base+t;float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={a+(size_t)t*10240,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],pos};qn_qwen4_decode_output o={0};o.hyper_state=b+(size_t)t*10240;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
-                if(qn_qwen4_layer_forward_decode(m->qsa[i],&in,&o,e,n)){free(a);free(b);return -1;}
-                memcpy(m->qsa_index[i]+(size_t)pos*128,ci,128*sizeof(float));memcpy(m->qsa_key[i]+(size_t)pos*512,ck,512*sizeof(float));memcpy(m->qsa_value[i]+(size_t)pos*512,cv,512*sizeof(float));
+            if((uint64_t)base+T<=4096){
+                double qms=0;if(qn_qwen4_layer_forward_prefill_batch(m->qsa[i],a,base,T,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],b,&qms,e,n)){free(a);free(b);return -1;}
+            }else{
+                for(uint32_t t=0;t<T;t++){
+                    uint32_t pos=base+t;float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={a+(size_t)t*10240,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],pos};qn_qwen4_decode_output o={0};o.hyper_state=b+(size_t)t*10240;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
+                    if(qn_qwen4_layer_forward_decode(m->qsa[i],&in,&o,e,n)){free(a);free(b);return -1;}
+                    memcpy(m->qsa_index[i]+(size_t)pos*128,ci,128*sizeof(float));memcpy(m->qsa_key[i]+(size_t)pos*512,ck,512*sizeof(float));memcpy(m->qsa_value[i]+(size_t)pos*512,cv,512*sizeof(float));
+                }
             }
         }else{
             if(qn_gdn_layer_forward_full_batch(m->gdn[i],a,T,b,e,n)){free(a);free(b);return -1;}
