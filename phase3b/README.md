@@ -32,3 +32,12 @@ Special topology cases:
 Complete GDN decoder-layer sweep: router top-10 mismatch=0 for all 36 layers; final cosine=1.0 for all. Worst final max abs error ~1.97e-6 (L46).
 
 Next: handle L1 PLE separately, then assemble the 48-layer trunk and model-level embedding/final mixer/lm-head path.
+
+## L1 PLE special case
+
+- `ple_layer_ids=[2]` maps to zero-based decoder layer 1 only.
+- 16 hashed n-gram heads are resolved directly from the mmap-backed `ngram_table.bin`; lookup is bit-exact against the MLX oracle.
+- Decode PLE state is two prior token ids plus a 10240 x 9 dilated-conv state.
+- key/value projection, grouped RMSNorm, signed-sqrt gate, normalized dilated conv, and residual PLE output are validated.
+- PLE block output max abs error observed: ~4.47e-8 on the L1 composition input.
+- With this special case validated, all 48 decoder-layer structures are covered by native math.
