@@ -21,8 +21,8 @@ int qn_file_map_invalidate(qn_file_map *m){ if(!m||!m->base)return -1; return ms
 
 int qn_affine_make_view(id<MTLDevice> dev,const qn_file_map *m,const qn_affine_desc *d,qn_affine_metal_view *out,char *err,size_t errlen){
     if(!dev||!m||!m->base||!d||!out){qn_err(err,errlen,"invalid argument");return -1;}
-    if(d->bits!=8 || d->group_size==0 || d->in_dim%d->group_size){qn_err(err,errlen,"unsupported affine layout");return -1;}
-    uint64_t wcols=(uint64_t)d->in_dim/4, groups=(uint64_t)d->in_dim/d->group_size;
+    if((d->bits!=4 && d->bits!=8) || d->group_size==0 || d->in_dim%d->group_size || (d->in_dim*d->bits)%32){qn_err(err,errlen,"unsupported affine layout");return -1;}
+    uint64_t wcols=(uint64_t)d->in_dim*d->bits/32, groups=(uint64_t)d->in_dim/d->group_size;
     uint64_t wb=(uint64_t)d->out_dim*wcols*4, sb=(uint64_t)d->out_dim*groups*2;
     if(d->weight_offset+wb>m->bytes||d->scales_offset+sb>m->bytes||d->biases_offset+sb>m->bytes){qn_err(err,errlen,"tensor range outside shard");return -1;}
     out->weight=[dev newBufferWithBytesNoCopy:(uint8_t*)m->base+d->weight_offset length:(NSUInteger)wb options:MTLResourceStorageModeShared deallocator:nil];
