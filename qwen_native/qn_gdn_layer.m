@@ -158,10 +158,63 @@ int qn_gdn_layer_forward_mlp_batch(qn_gdn_layer*l,const float*hyper_states,uint3
  return 0;
 }
 
+static int qn_gdn_encode_attention_batch(qn_gdn_layer*l,id<MTLComputeCommandEncoder>ce,id<MTLBuffer>input,id<MTLBuffer>output,uint32_t T,char*e,size_t n){
+ NSError*x=nil;id qr=pp(l,@"q8_rows4",&x),gr=pp(l,@"group_rms4_rows",&x),sd=pp(l,@"silu_div4_rows",&x),si=pp(l,@"sigmoid_ip",&x),mx=pp(l,@"mix4_rows",&x),ij=pp(l,@"inject4_rows",&x),cvp=pp(l,@"conv_seq",&x),gbp=pp(l,@"make_gb_rows",&x),gdp=pp(l,@"gdn_seq",&x),ngp=pp(l,@"norm_gate_rows",&x),rp=pp(l,@"residual_rows",&x);
+ if(!qr||!gr||!sd||!si||!mx||!ij||!cvp||!gbp||!gdp||!ngp||!rp){E(e,n,x.description.UTF8String);return -1;}
+#define XB(name,count) id<MTLBuffer> name=batchbuf(l,[NSString stringWithFormat:@"bx_a_%s",#name],(NSUInteger)(count)*sizeof(float));if(!name){E(e,n,"fused batch attention allocation failed");return -1;}
+ XB(xn,(size_t)T*10240);XB(lo,(size_t)T*320);XB(mw,(size_t)T*10240);XB(mixed,(size_t)T*2560);XB(inj,(size_t)T*4);XB(qkvb,(size_t)T*10240);XB(zb,(size_t)T*6144);XB(ab,(size_t)T*48);XB(bb,(size_t)T*48);XB(cv,(size_t)T*10240);XB(gb,(size_t)T*48);XB(bet,(size_t)T*48);XB(core,(size_t)T*6144);XB(ng,(size_t)T*6144);XB(att,(size_t)T*2560);
+#undef XB
+ uint32_t N=T*10240,N320=T*320;
+ [ce setComputePipelineState:gr];[ce setBuffer:input offset:0 atIndex:0];[ce setBuffer:l->hcn.buffer offset:0 atIndex:1];[ce setBuffer:xn offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*4*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ enc_rows4(ce,qr,&l->hdown,xn,lo,320,10240,T);[ce setComputePipelineState:sd];[ce setBuffer:lo offset:0 atIndex:0];[ce setBytes:&N320 length:4 atIndex:1];[ce dispatchThreads:MTLSizeMake(N320,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ enc_rows4(ce,qr,&l->hup,lo,mw,10240,320,T);[ce setComputePipelineState:si];[ce setBuffer:mw offset:0 atIndex:0];[ce setBytes:&N length:4 atIndex:1];[ce dispatchThreads:MTLSizeMake(N,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:mx];[ce setBuffer:xn offset:0 atIndex:0];[ce setBuffer:mw offset:0 atIndex:1];[ce setBuffer:mixed offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:ij];[ce setBuffer:l->iw.buffer offset:0 atIndex:0];[ce setBuffer:xn offset:0 atIndex:1];[ce setBuffer:inj offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*4*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ enc_rows4(ce,qr,&l->qkv,mixed,qkvb,10240,2560,T);enc_rows4(ce,qr,&l->z,mixed,zb,6144,2560,T);enc_rows4(ce,qr,&l->a,mixed,ab,48,2560,T);enc_rows4(ce,qr,&l->b,mixed,bb,48,2560,T);
+ [ce setComputePipelineState:cvp];[ce setBuffer:qkvb offset:0 atIndex:0];[ce setBuffer:l->cw.buffer offset:0 atIndex:1];[ce setBuffer:l->convb offset:0 atIndex:2];[ce setBuffer:cv offset:0 atIndex:3];[ce setBytes:&T length:4 atIndex:4];[ce dispatchThreads:MTLSizeMake(10240,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:gbp];[ce setBuffer:ab offset:0 atIndex:0];[ce setBuffer:bb offset:0 atIndex:1];[ce setBuffer:l->Aw.buffer offset:0 atIndex:2];[ce setBuffer:l->dtw.buffer offset:0 atIndex:3];[ce setBuffer:gb offset:0 atIndex:4];[ce setBuffer:bet offset:0 atIndex:5];[ce setBytes:&T length:4 atIndex:6];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*48,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ [ce setComputePipelineState:gdp];[ce setBuffer:cv offset:0 atIndex:0];[ce setBuffer:gb offset:0 atIndex:1];[ce setBuffer:bet offset:0 atIndex:2];[ce setBuffer:l->sb offset:0 atIndex:3];[ce setBuffer:core offset:0 atIndex:4];[ce setBytes:&T length:4 atIndex:5];[ce dispatchThreadgroups:MTLSizeMake(48,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:ngp];[ce setBuffer:core offset:0 atIndex:0];[ce setBuffer:zb offset:0 atIndex:1];[ce setBuffer:l->nw.buffer offset:0 atIndex:2];[ce setBuffer:ng offset:0 atIndex:3];[ce setBytes:&T length:4 atIndex:4];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*48*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ enc_rows4(ce,qr,&l->out,ng,att,2560,6144,T);[ce setComputePipelineState:rp];[ce setBuffer:input offset:0 atIndex:0];[ce setBuffer:att offset:0 atIndex:1];[ce setBuffer:inj offset:0 atIndex:2];[ce setBuffer:output offset:0 atIndex:3];[ce setBytes:&T length:4 atIndex:4];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*10240,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ return 0;
+}
+
+static int qn_gdn_encode_mlp_batch(qn_gdn_layer*l,id<MTLComputeCommandEncoder>ce,id<MTLBuffer>input,id<MTLBuffer>output,uint32_t T,char*e,size_t n){
+ NSError*x=nil;id qr=pp(l,@"q8_rows4",&x),gr=pp(l,@"group_rms4_rows",&x),sd=pp(l,@"silu_div4_rows",&x),si=pp(l,@"sigmoid_ip",&x),mx=pp(l,@"mix4_rows",&x),ij=pp(l,@"inject4_rows",&x),rt=pp(l,@"router_top10_norm_rows",&x),mtg=pp(l,@"q4_topk_gateup_swiglu_rows",&x),mtd=pp(l,@"q4_topk_down_reduce_rows",&x),sm=pp(l,@"silu_mul",&x),bd=pp(l,@"bf16_dot_sigmoid_rows",&x),ms=pp(l,@"mul_scalar_rows",&x),ad=pp(l,@"add_rows",&x),rp=pp(l,@"residual_rows",&x);
+ if(!qr||!gr||!sd||!si||!mx||!ij||!rt||!mtg||!mtd||!sm||!bd||!ms||!ad||!rp){E(e,n,x.description.UTF8String);return -1;}
+#define XM(name,count) id<MTLBuffer> name=batchbuf(l,[NSString stringWithFormat:@"bx_m_%s",#name],(NSUInteger)(count)*sizeof(float));if(!name){E(e,n,"fused batch MLP allocation failed");return -1;}
+ XM(xn,(size_t)T*10240);XM(lo,(size_t)T*320);XM(mw,(size_t)T*10240);XM(mixed,(size_t)T*2560);XM(inj,(size_t)T*4);XM(router,(size_t)T*512);XM(topws,(size_t)T*10);XM(ehid,(size_t)T*10*640);XM(routed,(size_t)T*2560);XM(egate,(size_t)T*640);XM(eup,(size_t)T*640);XM(shid,(size_t)T*640);XM(shared,(size_t)T*2560);XM(sgate,(size_t)T);
+#undef XM
+ id<MTLBuffer> topids=batchbuf(l,@"bx_m_topids",(NSUInteger)T*10*sizeof(uint32_t));if(!topids){E(e,n,"fused batch MLP topids allocation failed");return -1;}
+ uint32_t N=T*10240,N320=T*320,N640=T*640,N2560=T*2560;
+ [ce setComputePipelineState:gr];[ce setBuffer:input offset:0 atIndex:0];[ce setBuffer:l->mhcn.buffer offset:0 atIndex:1];[ce setBuffer:xn offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*4*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ enc_rows4(ce,qr,&l->mhdown,xn,lo,320,10240,T);[ce setComputePipelineState:sd];[ce setBuffer:lo offset:0 atIndex:0];[ce setBytes:&N320 length:4 atIndex:1];[ce dispatchThreads:MTLSizeMake(N320,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ enc_rows4(ce,qr,&l->mhup,lo,mw,10240,320,T);[ce setComputePipelineState:si];[ce setBuffer:mw offset:0 atIndex:0];[ce setBytes:&N length:4 atIndex:1];[ce dispatchThreads:MTLSizeMake(N,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:mx];[ce setBuffer:xn offset:0 atIndex:0];[ce setBuffer:mw offset:0 atIndex:1];[ce setBuffer:mixed offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:ij];[ce setBuffer:l->miw.buffer offset:0 atIndex:0];[ce setBuffer:xn offset:0 atIndex:1];[ce setBuffer:inj offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*4*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ enc_rows4(ce,qr,&l->router,mixed,router,512,2560,T);[ce setComputePipelineState:rt];[ce setBuffer:router offset:0 atIndex:0];[ce setBuffer:topids offset:0 atIndex:1];[ce setBuffer:topws offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreadgroups:MTLSizeMake(T,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ [ce setComputePipelineState:mtg];[ce setBuffer:l->expert_gate_bank_w offset:0 atIndex:0];[ce setBuffer:l->expert_gate_bank_s offset:0 atIndex:1];[ce setBuffer:l->expert_gate_bank_b offset:0 atIndex:2];[ce setBuffer:l->expert_up_bank_w offset:0 atIndex:3];[ce setBuffer:l->expert_up_bank_s offset:0 atIndex:4];[ce setBuffer:l->expert_up_bank_b offset:0 atIndex:5];[ce setBuffer:mixed offset:0 atIndex:6];[ce setBuffer:topids offset:0 atIndex:7];[ce setBuffer:ehid offset:0 atIndex:8];[ce setBytes:&T length:4 atIndex:9];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*10*640*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ [ce setComputePipelineState:mtd];[ce setBuffer:l->expert_down_bank_w offset:0 atIndex:0];[ce setBuffer:l->expert_down_bank_s offset:0 atIndex:1];[ce setBuffer:l->expert_down_bank_b offset:0 atIndex:2];[ce setBuffer:ehid offset:0 atIndex:3];[ce setBuffer:topids offset:0 atIndex:4];[ce setBuffer:topws offset:0 atIndex:5];[ce setBuffer:routed offset:0 atIndex:6];[ce setBytes:&T length:4 atIndex:7];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*2560*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ enc_rows4(ce,qr,&l->shared_gate_proj,mixed,egate,640,2560,T);enc_rows4(ce,qr,&l->shared_up_proj,mixed,eup,640,2560,T);[ce setComputePipelineState:sm];[ce setBuffer:egate offset:0 atIndex:0];[ce setBuffer:eup offset:0 atIndex:1];[ce setBuffer:shid offset:0 atIndex:2];[ce setBytes:&N640 length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake(N640,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ enc_rows4(ce,qr,&l->shared_down_proj,shid,shared,2560,640,T);[ce setComputePipelineState:bd];[ce setBuffer:l->shared_gate_weight.buffer offset:0 atIndex:0];[ce setBuffer:mixed offset:0 atIndex:1];[ce setBuffer:sgate offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ [ce setComputePipelineState:ms];[ce setBuffer:shared offset:0 atIndex:0];[ce setBuffer:sgate offset:0 atIndex:1];[ce setBytes:&T length:4 atIndex:2];[ce dispatchThreads:MTLSizeMake(N2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[ce setComputePipelineState:ad];[ce setBuffer:shared offset:0 atIndex:0];[ce setBuffer:routed offset:0 atIndex:1];[ce setBytes:&N2560 length:4 atIndex:2];[ce dispatchThreads:MTLSizeMake(N2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ [ce setComputePipelineState:rp];[ce setBuffer:input offset:0 atIndex:0];[ce setBuffer:routed offset:0 atIndex:1];[ce setBuffer:inj offset:0 atIndex:2];[ce setBuffer:output offset:0 atIndex:3];[ce setBytes:&T length:4 atIndex:4];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*10240,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ return 0;
+}
+
+static int qn_gdn_encode_full_batch(qn_gdn_layer*l,id<MTLComputeCommandEncoder>ce,id<MTLBuffer>input,id<MTLBuffer>output,uint32_t T,char*e,size_t n){
+ id<MTLBuffer> mid=batchbuf(l,@"bx_full_mid",(NSUInteger)T*10240*sizeof(float));if(!mid){E(e,n,"fused full batch midpoint allocation failed");return -1;}
+ if(qn_gdn_encode_attention_batch(l,ce,input,mid,T,e,n))return -1;
+ return qn_gdn_encode_mlp_batch(l,ce,mid,output,T,e,n);
+}
+
 int qn_gdn_layer_forward_full_batch(qn_gdn_layer*l,const float*hyper_states,uint32_t T,float*hyper_outputs,char*e,size_t n){
  if(!l||!hyper_states||!hyper_outputs||T==0){E(e,n,"invalid full batch args");return -1;}
- float*mid=malloc((size_t)T*10240*sizeof(float));if(!mid){E(e,n,"full batch midpoint allocation failed");return -1;}
- int rc=qn_gdn_layer_forward_attention_batch(l,hyper_states,T,mid,e,n);if(!rc)rc=qn_gdn_layer_forward_mlp_batch(l,mid,T,hyper_outputs,e,n);free(mid);return rc;
+ @autoreleasepool{
+  NSUInteger bytes=(NSUInteger)T*10240*sizeof(float);id<MTLBuffer> input=batchbuf(l,@"bx_full_input",bytes),output=batchbuf(l,@"bx_full_output",bytes);if(!input||!output){E(e,n,"full batch IO allocation failed");return -1;}memcpy(input.contents,hyper_states,bytes);
+  id<MTLCommandBuffer>cb=[l->queue commandBuffer];id<MTLComputeCommandEncoder>ce=[cb computeCommandEncoder];if(qn_gdn_encode_full_batch(l,ce,input,output,T,e,n)){[ce endEncoding];return -1;}[ce endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status==MTLCommandBufferStatusError){E(e,n,cb.error.description.UTF8String);return -1;}memcpy(hyper_outputs,output.contents,bytes);
+ }
+ return 0;
 }
 
 typedef struct{float p;uint32_t i;} qn_rp; static int qn_rcmp(const void*a,const void*b){float x=((const qn_rp*)a)->p,y=((const qn_rp*)b)->p;return x<y?1:x>y?-1:0;}
@@ -194,6 +247,18 @@ static int qn_gdn_encode_full(qn_gdn_layer*l,id<MTLComputeCommandEncoder>ce,id<M
  enc(ce,q8,&l->shared_down_proj,l->ehid,l->shared,2560,640);[ce setComputePipelineState:bd];[ce setBuffer:l->shared_gate_weight.buffer offset:0 atIndex:0];[ce setBuffer:l->mhmixed offset:0 atIndex:1];[ce setBuffer:l->sgate offset:0 atIndex:2];[ce dispatchThreads:MTLSizeMake(32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
  [ce setComputePipelineState:ms];[ce setBuffer:l->shared offset:0 atIndex:0];[ce setBuffer:l->sgate offset:0 atIndex:1];[ce setBytes:&N2560 length:4 atIndex:2];[ce dispatchThreads:MTLSizeMake(2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];float one=1;[ce setComputePipelineState:sa];[ce setBuffer:l->shared offset:0 atIndex:0];[ce setBuffer:l->routed offset:0 atIndex:1];[ce setBytes:&one length:4 atIndex:2];[ce setBytes:&N2560 length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake(2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
  [ce setComputePipelineState:rp];[ce setBuffer:l->fin offset:0 atIndex:0];[ce setBuffer:l->routed offset:0 atIndex:1];[ce setBuffer:l->mhinj offset:0 atIndex:2];[ce setBuffer:output offset:0 atIndex:3];[ce dispatchThreads:MTLSizeMake(10240,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+ return 0;
+}
+
+int qn_gdn_group_forward3_batch(qn_gdn_layer*a,qn_gdn_layer*b,qn_gdn_layer*c,const float*hyper_in,uint32_t T,float*hyper_out,char*e,size_t n){
+ if(!a||!b||!c||!hyper_in||!hyper_out||!T){E(e,n,"invalid group3 batch args");return -1;}
+ if(a->device.registryID!=b->device.registryID||a->device.registryID!=c->device.registryID){E(e,n,"group3 batch device mismatch");return -1;}
+ @autoreleasepool{
+  NSUInteger bytes=(NSUInteger)T*10240*sizeof(float);id<MTLBuffer> x0=batchbuf(a,@"bg3_input",bytes),x1=batchbuf(a,@"bg3_mid1",bytes),x2=batchbuf(a,@"bg3_mid2",bytes),x3=batchbuf(a,@"bg3_output",bytes);if(!x0||!x1||!x2||!x3){E(e,n,"group3 batch IO allocation failed");return -1;}memcpy(x0.contents,hyper_in,bytes);
+  id<MTLCommandBuffer>cb=[a->queue commandBuffer];id<MTLComputeCommandEncoder>ce=[cb computeCommandEncoder];
+  if(qn_gdn_encode_full_batch(a,ce,x0,x1,T,e,n)||qn_gdn_encode_full_batch(b,ce,x1,x2,T,e,n)||qn_gdn_encode_full_batch(c,ce,x2,x3,T,e,n)){[ce endEncoding];return -1;}
+  [ce endEncoding];[cb commit];[cb waitUntilCompleted];if(cb.status==MTLCommandBufferStatusError){E(e,n,cb.error.description.UTF8String);return -1;}memcpy(hyper_out,x3.contents,bytes);
+ }
  return 0;
 }
 

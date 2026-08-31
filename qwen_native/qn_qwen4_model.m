@@ -112,6 +112,11 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
             for(size_t z=0;z<elems;z++)a[z]+=po[z];free(po);free(ids64);
         }
         if(qn_qwen4_model_ensure_layer(m,i,e,n)){free(a);free(b);return -1;}
+        if(i>=4&&!is_qsa(i)&&i+2<48&&!is_qsa(i+1)&&!is_qsa(i+2)){
+            if(qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n)){free(a);free(b);return -1;}
+            if(qn_gdn_group_forward3_batch(m->gdn[i],m->gdn[i+1],m->gdn[i+2],a,T,b,e,n)){free(a);free(b);return -1;}
+            float *tmp=a;a=b;b=tmp;i+=2;continue;
+        }
         if(is_qsa(i)){
             if(ensure_qsa_cache(m,i,(size_t)base+T,e,n)){free(a);free(b);return -1;}
             for(uint32_t t=0;t<T;t++){
