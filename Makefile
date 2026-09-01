@@ -65,7 +65,7 @@ endif
 .PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut qwen-native-production qwen-native-qsa-context-test
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut qwen-native-production qwen-native-qsa-context-test qwen-native-prefix-reuse-test
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -79,6 +79,7 @@ help:
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make qwen-native-production  Build the stable native Qwen production bundle"
 	@echo "  make qwen-native-qsa-context-test QWEN4_TEST_MODEL=... QWEN4_TEST_MANIFEST=...  Verify QSA >4K/8K selector boundaries"
+	@echo "  make qwen-native-prefix-reuse-test QWEN4_TEST_MODEL=... QWEN4_TEST_MANIFEST=...  Verify persistent prefix reuse"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
@@ -140,6 +141,14 @@ qwen-native-qsa-context-test:
 		-framework Foundation -framework Metal -framework MetalPerformanceShaders
 	QWEN4_TEST_MODEL="$(QWEN4_TEST_MODEL)" QWEN4_TEST_MANIFEST="$(QWEN4_TEST_MANIFEST)" \
 		env -u QN_RUNTIME_MODE -u QN_PREFILL_MPS -u QN_MOE_METALLIB /tmp/qn_qwen4_qsa_context
+
+qwen-native-prefix-reuse-test: qwen-native-production
+	@if [ -z "$(QWEN4_TEST_MODEL)" ] || [ -z "$(QWEN4_TEST_MANIFEST)" ]; then \
+		echo "set QWEN4_TEST_MODEL and QWEN4_TEST_MANIFEST"; exit 2; \
+	fi
+	python3 qwen_native/tests/test_prefix_reuse.py \
+		--worker build/qwen-native/bin/qn_worker \
+		--model "$(QWEN4_TEST_MODEL)" --manifest "$(QWEN4_TEST_MANIFEST)"
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<

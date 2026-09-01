@@ -40,6 +40,8 @@ class NativeWorker:
         self.state_lock = threading.Lock()
         self.busy = False
         self.fatal = None
+        self.cached_tokens = 0
+        self.last_reused_tokens = 0
         ready = self.proc.stdout.readline().strip()
         if not ready.startswith("READY stable "):
             err = self.proc.stderr.read().strip() if self.proc.poll() is not None else ""
@@ -59,7 +61,8 @@ class NativeWorker:
 
     def status(self):
         with self.state_lock:
-            return {"healthy": self.healthy(), "busy": self.busy, "fatal": self.fatal, "ready": self.ready_line}
+            return {"healthy": self.healthy(), "busy": self.busy, "fatal": self.fatal, "ready": self.ready_line,
+                    "cached_tokens": self.cached_tokens, "last_reused_tokens": self.last_reused_tokens}
 
     def iter_generate(self, prompt_ids, max_tokens, stop_ids):
         if not self.healthy():
@@ -68,7 +71,7 @@ class NativeWorker:
             raise ValueError(f"prompt token count must be 1..{MAX_PROMPT_TOKENS}")
         if not 1 <= max_tokens <= MAX_OUTPUT_TOKENS:
             raise ValueError(f"max_tokens must be 1..{MAX_OUTPUT_TOKENS}")
-        if len(prompt_ids) + max_tokens - 1 > MAX_PROMPT_TOKENS:
+        if len(prompt_ids) + max_tokens > MAX_PROMPT_TOKENS:
             raise ValueError(f"prompt + generation exceeds {MAX_PROMPT_TOKENS}-token production context")
         stop_ids = list(dict.fromkeys(int(x) for x in stop_ids))[:32]
         fields = ["GEN", str(max_tokens), str(len(stop_ids))]
@@ -96,12 +99,18 @@ class NativeWorker:
                     parts = line.split()
                     if not parts:
                         continue
-                    if parts[0] == "BEGIN" and len(parts) == 3:
-                        yield {"type": "begin", "prompt_tokens": int(parts[1]), "prefill_ms": float(parts[2])}
+                    if parts[0] == "BEGIN" and len(parts) in (3, 4):
+                        reused = int(parts[3]) if len(parts) == 4 else 0
+                        with self.state_lock:
+                            self.last_reused_tokens = reused
+                        yield {"type": "begin", "prompt_tokens": int(parts[1]), "prefill_ms": float(parts[2]), "reused_tokens": reused}
                     elif parts[0] == "TOK" and len(parts) == 3:
                         yield {"type": "token", "id": int(parts[1]), "decode_ms": float(parts[2])}
                     elif parts[0] == "END" and len(parts) == 4:
-                        yield {"type": "end", "finish_reason": parts[1], "completion_tokens": int(parts[2]), "decode_ms": float(parts[3])}
+                        completion = int(parts[2])
+                        with self.state_lock:
+                            self.cached_tokens = min(MAX_PROMPT_TOKENS, len(prompt_ids) + completion)
+                        yield {"type": "end", "finish_reason": parts[1], "completion_tokens": completion, "decode_ms": float(parts[3])}
                         break
                     else:
                         raise WorkerError(f"invalid worker response: {line}")
@@ -168,7 +177,7 @@ class App:
     def encode_chat(self, messages, tools=None):
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty array")
-        kwargs = dict(tokenize=True, add_generation_prompt=True)
+        kwargs = dict(tokenize=True, add_generation_prompt=True, enable_thinking=False)
         if tools is not None:
             kwargs["tools"] = tools
         ids = self.tokenizer.apply_chat_template(messages, **kwargs)
@@ -318,11 +327,11 @@ class Handler(BaseHTTPRequestHandler):
         if kind == "chat":
             obj = {"id": cid, "object": "chat.completion", "created": int(time.time()), "model": self.app.model_id,
                    "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": end["finish_reason"]}], "usage": usage,
-                   "native_timing": {"prefill_ms": begin["prefill_ms"], "decode_ms": end["decode_ms"]}}
+                   "native_timing": {"prefill_ms": begin["prefill_ms"], "decode_ms": end["decode_ms"], "reused_tokens": begin.get("reused_tokens", 0)}}
         else:
             obj = {"id": cid, "object": "text_completion", "created": int(time.time()), "model": self.app.model_id,
                    "choices": [{"index": 0, "text": text, "finish_reason": end["finish_reason"], "logprobs": None}], "usage": usage,
-                   "native_timing": {"prefill_ms": begin["prefill_ms"], "decode_ms": end["decode_ms"]}}
+                   "native_timing": {"prefill_ms": begin["prefill_ms"], "decode_ms": end["decode_ms"], "reused_tokens": begin.get("reused_tokens", 0)}}
         return self._send_json(HTTPStatus.OK, obj)
 
     def _sse(self, obj):

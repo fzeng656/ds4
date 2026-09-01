@@ -1723,8 +1723,15 @@ Production safety rules in the current phase:
   the model slot is released, preventing the next request from consuming stale
   token lines;
 - SIGINT/SIGTERM shuts down the HTTP listener and its native worker together;
+- the worker keeps one exact processed-token prefix across requests. A new
+  prompt reuses it only when the prompt fully extends that prefix; any divergence
+  resets session state and performs a cold prefill. `native_timing.reused_tokens`
+  and `/health` expose the reuse state;
+- production chat templates use `enable_thinking=False`, so OpenAI
+  `assistant.content` contains visible answer text rather than Qwen reasoning
+  tokens, and multi-turn template tokenization remains prefix-reusable;
 - the stable worker enforces an 8192-token total context budget
-  (`prompt_tokens + max_tokens - 1 <= 8192`) and caps output at 2048 tokens;
+  (`prompt_tokens + max_tokens <= 8192`) and caps output at 2048 tokens;
 - generation is greedy only. Requests that explicitly set a non-zero
   `temperature` are rejected instead of silently changing sampling semantics.
 
