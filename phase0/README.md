@@ -128,10 +128,12 @@ about 11.6 GiB in addition to the quantized model mappings.
 
 After opening the model, call `qn_qwen4_model_prepare_prefill64()` once before
 serving requests. It opens all layers, warms the 64-token QSA fused-attention and
-MPS GEMM dispatch shapes using caller-owned temporary QSA caches, and warms the
-GDN MPS GEMMs without advancing GDN recurrent state. Without
-`QN_PREFILL_MPS=1`, the same prepare call retains the custom-Metal fallback and
-only performs the safe prefill warmup.
+MPS GEMM dispatch shapes using caller-owned temporary QSA caches, and executes one
+full dummy GDN batch per layer to fault the expert banks and full prefill path
+resident. GDN conv/recurrent state is reset immediately afterward, so the first
+real request still starts from a clean session. Without `QN_PREFILL_MPS=1`, the
+same prepare call retains the custom-Metal projection fallback while still doing
+the safe full-path residency warmup.
 
 The accelerated path is currently selected only for batch widths >= 64. Decode
 and shorter prefill keep the quantized custom-Metal kernels.

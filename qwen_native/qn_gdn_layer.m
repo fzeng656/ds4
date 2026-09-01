@@ -411,4 +411,6 @@ int qn_gdn_layer_forward_full(qn_gdn_layer*l,const qn_gdn_decode_input*in,qn_gdn
  return 0;
 }
 
+int qn_gdn_layer_reset_state(qn_gdn_layer*l){if(!l)return -1;memset(l->convb.contents,0,163840);memset(l->sb.contents,0,48*16384*4);return 0;}
+
 void qn_gdn_layer_close(qn_gdn_layer*l){if(!l)return;@autoreleasepool{l->batch_buffers=nil;l->pipes=nil;l->lib=nil;l->queue=nil;l->device=nil;}for(uint32_t i=0;i<l->map_count;i++)qn_file_map_close(&l->maps[i]);qn_manifest_close(l->manifest);free(l);}

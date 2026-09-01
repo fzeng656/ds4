@@ -69,7 +69,13 @@ int qn_qwen4_model_prepare_prefill64(qn_qwen4_model *m,char *e,size_t n){
                warms FA256 + MPS GEMM dispatch shapes using caller-owned scratch caches. */
             memset(idx,0,I*sizeof(float));memset(key,0,K*sizeof(float));memset(val,0,K*sizeof(float));double warm_ms=0;
             if(qn_qwen4_layer_forward_prefill_batch(m->qsa[i],hin,0,T,idx,key,val,hout,&warm_ms,e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
-        }else if(qn_gdn_layer_warm_mps64(m->gdn[i],e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
+        }else{
+            if(qn_gdn_layer_warm_mps64(m->gdn[i],e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
+            /* Full dummy prefill faults expert banks and batch kernels resident.
+               GDN owns recurrent state, so restore it to the clean session state. */
+            if(qn_gdn_layer_forward_full_batch(m->gdn[i],hin,T,hout,e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
+            if(qn_gdn_layer_reset_state(m->gdn[i])){free(hin);free(hout);free(idx);free(key);free(val);E(e,n,"GDN warm reset failed");return -1;}
+        }
     }
     free(hin);free(hout);free(idx);free(key);free(val);return qn_qwen4_model_ensure_ple(m,e,n);
 }
