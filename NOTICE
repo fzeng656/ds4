@@ -44,3 +44,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+MLX Metal 4 / NAX quantized gather-QMM
+Copyright © Apple Inc. and MLX contributors.
+Licensed under the Apache License, Version 2.0.
+See LICENSE-APACHE-2.0.
+
+Used by qwen_native/kernels/qn_gather_bm32.metal and the compiled
+qwen_native/kernels/qn_gather_bm32.metallib. The checked-in wrapper
+instantiates MLX's affine_gather_qmm_rhs_nax for BF16, affine 4-bit,
+group-size 64, BM32/BN64/BK64. This specialization is used only by the
+optional M5 Metal-4 sorted-MoE prefill path; the native runtime does not
+require MLX at runtime. MLX headers are needed only to regenerate the
+metallib.

@@ -1646,3 +1646,24 @@ first answer:
 The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
 graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
 it rock.
+
+### Optional M5 sorted-MoE prefill path
+
+For the native Qwen prefill experiments on M5-class Apple Silicon, the runtime
+can use a Metal-4/NAX BM32 sorted-expert gather-QMM specialization for the
+64-token MoE batch. It is optional and falls back to the existing custom Metal
+MoE kernels when unavailable.
+
+Enable the existing persistent MPS prefill cache and point the runtime at the
+checked-in metallib:
+
+```sh
+export QN_PREFILL_MPS=1
+export QN_MOE_METALLIB="$PWD/qwen_native/kernels/qn_gather_bm32.metallib"
+```
+
+The metallib is runtime self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh`
+regenerates it from MLX headers with Metal 4 and a macOS 26.2 deployment target;
+that regeneration step is not required to run the native runtime. If the
+metallib cannot be loaded or the specialization is unavailable, model opening
+continues and the existing MoE path is used.
