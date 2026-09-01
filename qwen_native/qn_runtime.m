@@ -6,8 +6,71 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <mach-o/dyld.h>
 
 static void qn_err(char *err,size_t n,const char *msg){ if(err&&n) snprintf(err,n,"%s",msg); }
+
+static int qn_regular_readable(const char *p){
+    struct stat st; return p&&*p&&stat(p,&st)==0&&S_ISREG(st.st_mode)&&access(p,R_OK)==0;
+}
+static int qn_copy_if_file(char out[1024],const char *p){
+    if(!qn_regular_readable(p))return 0; char r[PATH_MAX];
+    const char *src=realpath(p,r)?r:p; snprintf(out,1024,"%s",src); return 1;
+}
+static int qn_join_candidate(char out[1024],const char *base,const char *suffix){
+    if(!base||!*base)return 0; char p[PATH_MAX];
+    if(snprintf(p,sizeof(p),"%s/%s",base,suffix)>=(int)sizeof(p))return 0;
+    return qn_copy_if_file(out,p);
+}
+static void qn_parent_dir(char *p){
+    size_t n=strlen(p); while(n&&p[n-1]=='/')p[--n]=0;
+    while(n&&p[n-1]!='/')p[--n]=0; while(n>1&&p[n-1]=='/')p[--n]=0;
+    if(!n)snprintf(p,2,".");
+}
+static int qn_find_bundled_moe_metallib(char out[1024]){
+    const char *explicit_path=getenv("QN_MOE_METALLIB");
+    if(explicit_path&&*explicit_path)return qn_copy_if_file(out,explicit_path)?1:-1;
+    const char *root=getenv("QN_RUNTIME_ROOT");
+    if(root&&*root&&qn_join_candidate(out,root,"qwen_native/kernels/qn_gather_bm32.metallib"))return 1;
+
+    uint32_t cap=PATH_MAX; char exe[PATH_MAX];
+    if(_NSGetExecutablePath(exe,&cap)==0){
+        char absbuf[PATH_MAX]; if(realpath(exe,absbuf))snprintf(exe,sizeof(exe),"%s",absbuf);
+        qn_parent_dir(exe);
+        if(qn_join_candidate(out,exe,"qwen_native/kernels/qn_gather_bm32.metallib"))return 1;
+        if(qn_join_candidate(out,exe,"../share/qwen-native/qn_gather_bm32.metallib"))return 1;
+        if(qn_join_candidate(out,exe,"../lib/qwen-native/qn_gather_bm32.metallib"))return 1;
+    }
+    char cwd[PATH_MAX];
+    if(getcwd(cwd,sizeof(cwd))&&qn_join_candidate(out,cwd,"qwen_native/kernels/qn_gather_bm32.metallib"))return 1;
+
+#ifndef QN_DISABLE_SOURCE_METALLIB_FALLBACK
+    /* Development-only fallback. Production bundles disable this at compile time
+       so a missing installed metallib cannot be hidden by a source checkout. */
+    char src[PATH_MAX]; snprintf(src,sizeof(src),"%s",__FILE__);
+    char srcabs[PATH_MAX]; if(realpath(src,srcabs))snprintf(src,sizeof(src),"%s",srcabs);
+    qn_parent_dir(src); /* .../qwen_native */
+    if(qn_join_candidate(out,src,"kernels/qn_gather_bm32.metallib"))return 1;
+#endif
+    return 0;
+}
+
+int qn_runtime_configure_from_env(qn_runtime_config_status *status,char *err,size_t errlen){
+    if(status)memset(status,0,sizeof(*status));
+    const char *mode=getenv("QN_RUNTIME_MODE");
+    if(!mode||strcmp(mode,"stable"))return 0;
+    if(status)status->stable_mode=1;
+    if(setenv("QN_PREFILL_MPS","1",1)){qn_err(err,errlen,"cannot enable stable MPS prefill");return -1;}
+    if(status)status->prefill_mps_enabled=1;
+    char mp[1024]={0}; int found=qn_find_bundled_moe_metallib(mp);
+    if(found<0){qn_err(err,errlen,"QN_MOE_METALLIB is set but not a readable file");return -1;}
+    if(!found){qn_err(err,errlen,"stable mode requires bundled qn_gather_bm32.metallib");return -1;}
+    if(setenv("QN_MOE_METALLIB",mp,1)){qn_err(err,errlen,"cannot configure stable MoE metallib");return -1;}
+    if(status){status->moe_metallib_configured=1;snprintf(status->moe_metallib_path,sizeof(status->moe_metallib_path),"%s",mp);}
+    return 0;
+}
 int qn_file_map_open(qn_file_map *m,const char *path,char *err,size_t errlen){
     memset(m,0,sizeof(*m)); m->fd=-1; m->fd=open(path,O_RDONLY); if(m->fd<0){qn_err(err,errlen,strerror(errno));return -1;}
     struct stat st; if(fstat(m->fd,&st)){qn_err(err,errlen,strerror(errno));close(m->fd);m->fd=-1;return -1;}

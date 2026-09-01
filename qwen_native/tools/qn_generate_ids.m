@@ -24,6 +24,17 @@ int main(int argc, char **argv) {
         if (qn_qwen4_model_open(&model, &cfg, err, sizeof(err))) {
             fprintf(stderr, "open: %s\n", err); return 1;
         }
+        const char *runtime_mode = getenv("QN_RUNTIME_MODE");
+        if (runtime_mode && !strcmp(runtime_mode, "stable")) {
+            if (qn_qwen4_model_prepare_production(model, err, sizeof(err))) {
+                fprintf(stderr, "production prepare: %s\n", err); qn_qwen4_model_close(model); return 5;
+            }
+            qn_qwen4_runtime_status rs = {0};
+            qn_qwen4_model_get_runtime_status(model, &rs);
+            fprintf(stderr, "native runtime: stable prepared=%d mps=%u/36+%u/12 bm32=%u/36+%u/12 metallib=%s\n",
+                    rs.production_prepared, rs.gdn_mps_layers, rs.qsa_mps_layers,
+                    rs.gdn_bm32_layers, rs.qsa_bm32_layers, rs.moe_metallib_path);
+        }
         qn_qwen4_prefill_output pf = {0};
         if (qn_qwen4_model_prefill_tokens(model, prompt, n_prompt, NULL, &pf, err, sizeof(err))) {
             fprintf(stderr, "prefill: %s\n", err); qn_qwen4_model_close(model); return 2;

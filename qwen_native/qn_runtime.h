@@ -28,6 +28,18 @@ void qn_file_map_close(qn_file_map *m);
 int qn_file_map_advise(qn_file_map *m, int will_need);
 int qn_file_map_invalidate(qn_file_map *m);
 
+typedef struct {
+    int stable_mode;
+    int prefill_mps_enabled;
+    int moe_metallib_configured;
+    char moe_metallib_path[1024];
+} qn_runtime_config_status;
+
+/* Production configuration is opt-in through QN_RUNTIME_MODE=stable.
+   Stable mode forces the verified MPS prefill path and resolves the bundled
+   BM32 sorted-MoE metallib. It fails closed if that metallib cannot be found. */
+int qn_runtime_configure_from_env(qn_runtime_config_status *status, char *err, size_t errlen);
+
 #ifdef __OBJC__
 typedef struct {
     __strong id<MTLBuffer> weight;

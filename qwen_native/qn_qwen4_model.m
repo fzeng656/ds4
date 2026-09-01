@@ -3,6 +3,7 @@
 #include "qn_gdn_layer.h"
 #include "qn_ple_layer.h"
 #include "qn_model_io.h"
+#include "qn_runtime.h"
 #include <mach/mach_time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,8 @@ struct qn_qwen4_model {
     int64_t ple_token_history[2];
     uint32_t opened_qsa, opened_gdn, position, qsa_initial_capacity;
     uint64_t qsa_cache_bytes;
+    int stable_mode, production_prepared;
+    char moe_metallib_path[1024];
 };
 
 static void E(char *e,size_t n,const char *s){if(e&&n)snprintf(e,n,"%s",s?s:"model runtime error");}
@@ -43,7 +46,9 @@ static int ensure_qsa_cache(qn_qwen4_model *m,uint32_t i,size_t need,char *e,siz
 
 int qn_qwen4_model_open(qn_qwen4_model **out,const qn_qwen4_model_config *c,char *e,size_t n){
     if(!out||!c||!c->model_dir||!c->manifest_path||!c->ngram_table_path){E(e,n,"invalid model config");return -1;}
+    qn_runtime_config_status rs={0};if(qn_runtime_configure_from_env(&rs,e,n))return -1;
     qn_qwen4_model *m=calloc(1,sizeof(*m));if(!m){E(e,n,"calloc model failed");return -1;}
+    m->stable_mode=rs.stable_mode;if(rs.moe_metallib_configured)snprintf(m->moe_metallib_path,sizeof(m->moe_metallib_path),"%s",rs.moe_metallib_path);
     snprintf(m->model_dir,sizeof(m->model_dir),"%s",c->model_dir);snprintf(m->manifest_path,sizeof(m->manifest_path),"%s",c->manifest_path);snprintf(m->ngram_path,sizeof(m->ngram_path),"%s",c->ngram_table_path);m->qsa_initial_capacity=c->qsa_cache_capacity?c->qsa_cache_capacity:16;
     m->ple_conv=calloc((size_t)10240*9,sizeof(float));if(!m->ple_conv){E(e,n,"PLE state allocation failed");qn_qwen4_model_close(m);return -1;}
     m->ple_token_history[0]=m->ple_token_history[1]=248044; /* model EOS */
@@ -79,6 +84,23 @@ int qn_qwen4_model_prepare_prefill64(qn_qwen4_model *m,char *e,size_t n){
     }
     free(hin);free(hout);free(idx);free(key);free(val);return qn_qwen4_model_ensure_ple(m,e,n);
 }
+void qn_qwen4_model_get_runtime_status(qn_qwen4_model*m,qn_qwen4_runtime_status*s){
+    if(!s)return;memset(s,0,sizeof(*s));if(!m)return;s->stable_mode=m->stable_mode;s->production_prepared=m->production_prepared;
+    snprintf(s->moe_metallib_path,sizeof(s->moe_metallib_path),"%s",m->moe_metallib_path);
+    for(uint32_t i=0;i<48;i++){
+        if(is_qsa(i)){if(m->qsa[i]){s->qsa_mps_layers+=qn_qwen4_layer_prefill_mps_enabled(m->qsa[i])?1:0;s->qsa_bm32_layers+=qn_qwen4_layer_moe_bm32_enabled(m->qsa[i])?1:0;}}
+        else if(m->gdn[i]){s->gdn_mps_layers+=qn_gdn_layer_prefill_mps_enabled(m->gdn[i])?1:0;s->gdn_bm32_layers+=qn_gdn_layer_moe_bm32_enabled(m->gdn[i])?1:0;}
+    }
+}
+int qn_qwen4_model_prepare_production(qn_qwen4_model*m,char*e,size_t n){
+    if(!m){E(e,n,"invalid model");return -1;}
+    if(!m->stable_mode){E(e,n,"production prepare requires QN_RUNTIME_MODE=stable before model open");return -1;}
+    if(qn_qwen4_model_prepare_prefill64(m,e,n))return -1;
+    qn_qwen4_runtime_status s;qn_qwen4_model_get_runtime_status(m,&s);
+    if(s.gdn_mps_layers!=36||s.qsa_mps_layers!=12){E(e,n,"stable production requires MPS prefill on all 48 layers");return -1;}
+    if(s.gdn_bm32_layers!=36||s.qsa_bm32_layers!=12){E(e,n,"stable production requires BM32 sorted-MoE on all 48 layers");return -1;}
+    m->production_prepared=1;return 0;
+}
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t p){if(m)m->position=p;}
 
 int qn_qwen4_model_seed_qsa_cache(qn_qwen4_model *m,uint32_t i,uint32_t tokens,const float *idx,const float *k,const float *v,char *e,size_t n){
@@ -107,14 +129,17 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
 }
 
 int qn_qwen4_model_forward_token(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
+    if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
     if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(run_trunk(m,token,h,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
 }
 
 int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_step_output *out,char *e,size_t n){
+    if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
     if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
 }
 
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
+    if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
     if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}
     if(count==1){
         double t0=msnow();float emb[2560],h[10240];uint32_t token=tokens[0];if(token>=248320){E(e,n,"prefill token out of range");return -1;}if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->prompt_tokens=1;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;

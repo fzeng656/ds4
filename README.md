@@ -1647,23 +1647,38 @@ The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
 graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
 it rock.
 
-### Optional M5 sorted-MoE prefill path
+### Stable native Qwen production profile
 
-For the native Qwen prefill experiments on M5-class Apple Silicon, the runtime
-can use a Metal-4/NAX BM32 sorted-expert gather-QMM specialization for the
-64-token MoE batch. It is optional and falls back to the existing custom Metal
-MoE kernels when unavailable.
+The M5 native Qwen runtime now has a fail-closed production profile. Set
+`QN_RUNTIME_MODE=stable` before model open, or use `qn_generate_text.py
+--production`. Stable mode:
 
-Enable the existing persistent MPS prefill cache and point the runtime at the
-checked-in metallib:
+- forces the verified persistent MPS prefill path;
+- automatically resolves the checked-in Metal-4/NAX BM32 sorted-MoE metallib;
+- requires `qn_qwen4_model_prepare_production()` before inference;
+- warms all 48 layers, faults the MoE path resident, and resets GDN recurrent
+  state before serving;
+- verifies that MPS is active on all 36 GDN + 12 QSA layers and that BM32
+  sorted-MoE is active on all 48 layers;
+- fails instead of silently serving with a partially accelerated backend.
+
+Example:
 
 ```sh
-export QN_PREFILL_MPS=1
-export QN_MOE_METALLIB="$PWD/qwen_native/kernels/qn_gather_bm32.metallib"
+python3 qwen_native/tools/qn_generate_text.py \
+  --production \
+  --model /path/to/Qwen3.8-Flash-Next \
+  --prompt "The capital of France is" \
+  --max-tokens 8
 ```
 
-The metallib is runtime self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh`
-regenerates it from MLX headers with Metal 4 and a macOS 26.2 deployment target;
-that regeneration step is not required to run the native runtime. If the
-metallib cannot be loaded or the specialization is unavailable, model opening
-continues and the existing MoE path is used.
+`QN_MOE_METALLIB` remains an optional explicit override. Without an override,
+the runtime searches the executable-relative install locations, the repository
+layout, and `QN_RUNTIME_ROOT`. An explicitly configured but unreadable
+`QN_MOE_METALLIB` is an error in stable mode.
+
+The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
+self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it
+from MLX headers with Metal 4 and a macOS 26.2 deployment target; regeneration
+is not required on production startup. Experimental q8 NAX projection kernels
+are intentionally not part of the stable profile.

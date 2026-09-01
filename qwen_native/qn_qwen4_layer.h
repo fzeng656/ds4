@@ -62,6 +62,8 @@ int qn_qwen4_layer_forward_decode(qn_qwen4_layer *layer,
                                   qn_qwen4_decode_output *output,
                                   char *err, size_t errlen);
 int qn_qwen4_layer_warm_mps64(qn_qwen4_layer *l,char *err,size_t errlen);
+int qn_qwen4_layer_prefill_mps_enabled(qn_qwen4_layer *l);
+int qn_qwen4_layer_moe_bm32_enabled(qn_qwen4_layer *l);
 void qn_qwen4_layer_close(qn_qwen4_layer *layer);
 
 #endif

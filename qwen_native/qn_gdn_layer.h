@@ -16,5 +16,7 @@ int qn_gdn_group_forward3_batch(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,
 int qn_gdn_group_forward3(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,float *hyper_out,char *err,size_t errlen);
 int qn_gdn_layer_warm_mps64(qn_gdn_layer *l,char *err,size_t errlen);
 int qn_gdn_layer_reset_state(qn_gdn_layer *l);
+int qn_gdn_layer_prefill_mps_enabled(qn_gdn_layer *l);
+int qn_gdn_layer_moe_bm32_enabled(qn_gdn_layer *l);
 void qn_gdn_layer_close(qn_gdn_layer *l);
 #endif

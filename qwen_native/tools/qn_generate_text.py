@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, pathlib, subprocess, sys
+import argparse, os, pathlib, subprocess, sys
 from transformers import AutoTokenizer
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -26,6 +26,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--manifest", default=str(REPO / "phase0/qwen38fn_manifest.json"))
     ap.add_argument("--binary", default=str(DEFAULT_BIN))
+    ap.add_argument("--production", action="store_true", help="use fail-closed stable runtime prepare and verified prefill backends")
     args = ap.parse_args()
     model = pathlib.Path(args.model).expanduser().resolve()
     binary = pathlib.Path(args.binary).expanduser().resolve()
@@ -35,7 +36,10 @@ def main():
     if not ids:
         raise SystemExit("prompt tokenized to zero tokens")
     cmd = [str(binary), str(model), args.manifest, str(model / "ngram_table.bin"), str(args.max_tokens)] + [str(i) for i in ids]
-    cp = subprocess.run(cmd, text=True, capture_output=True)
+    env = os.environ.copy()
+    if args.production:
+        env["QN_RUNTIME_MODE"] = "stable"
+    cp = subprocess.run(cmd, text=True, capture_output=True, env=env)
     if cp.stderr:
         print(cp.stderr, file=sys.stderr, end="")
     if cp.returncode:
