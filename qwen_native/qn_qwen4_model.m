@@ -101,6 +101,13 @@ int qn_qwen4_model_prepare_production(qn_qwen4_model*m,char*e,size_t n){
     if(s.gdn_bm32_layers!=36||s.qsa_bm32_layers!=12){E(e,n,"stable production requires BM32 sorted-MoE on all 48 layers");return -1;}
     m->production_prepared=1;return 0;
 }
+int qn_qwen4_model_reset_session(qn_qwen4_model*m,char*e,size_t n){
+    if(!m){E(e,n,"invalid model");return -1;}
+    m->position=0;m->ple_token_history[0]=m->ple_token_history[1]=248044;
+    if(m->ple_conv)memset(m->ple_conv,0,(size_t)10240*9*sizeof(float));
+    for(uint32_t i=0;i<48;i++)if(m->gdn[i]&&qn_gdn_layer_reset_state(m->gdn[i])){E(e,n,"GDN session reset failed");return -1;}
+    return 0;
+}
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t p){if(m)m->position=p;}
 
 int qn_qwen4_model_seed_qsa_cache(qn_qwen4_model *m,uint32_t i,uint32_t tokens,const float *idx,const float *k,const float *v,char *e,size_t n){

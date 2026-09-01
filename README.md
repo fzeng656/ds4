@@ -1682,3 +1682,46 @@ self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it
 from MLX headers with Metal 4 and a macOS 26.2 deployment target; regeneration
 is not required on production startup. Experimental q8 NAX projection kernels
 are intentionally not part of the stable profile.
+
+#### Persistent OpenAI-compatible server
+
+`make qwen-native-production` also builds a persistent native worker and a
+Python HTTP front-end. The worker loads and production-prepares the 70 GB model
+once, then resets only session state between requests while keeping model
+mappings, MPS caches, and BM32 pipelines resident.
+
+```sh
+build/qwen-native/bin/qn_server.py \
+  --model /path/to/Qwen3.8-Flash-Next \
+  --manifest phase0/qwen38fn_manifest.json \
+  --host 127.0.0.1 \
+  --port 8004
+```
+
+Implemented endpoints:
+
+- `GET /health` and `/healthz`
+- `GET /v1/models`
+- `POST /v1/completions`
+- `POST /v1/chat/completions`
+- SSE streaming with `stream=true`
+
+Production safety rules in the current phase:
+
+- the default bind is loopback-only; a non-loopback bind is refused unless an
+  API key is configured with `--api-key` or `QN_API_KEY`;
+- one native model state is active at a time, with a bounded HTTP wait queue
+  (`--max-queue`, default 4); excess requests receive HTTP 429 rather than
+  accumulating unbounded threads/state;
+- a disconnected SSE client is drained through the worker `END` marker before
+  the model slot is released, preventing the next request from consuming stale
+  token lines;
+- SIGINT/SIGTERM shuts down the HTTP listener and its native worker together;
+- the stable worker caps prompts at 4096 tokens and output at 2048 tokens in
+  this phase;
+- generation is greedy only. Requests that explicitly set a non-zero
+  `temperature` are rejected instead of silently changing sampling semantics.
+
+These limits are intentional production guards, not model architecture limits.
+Long-context chunked prefill, sampling, and structured tool-call response
+translation are separate follow-up milestones.

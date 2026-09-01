@@ -56,6 +56,7 @@ int qn_qwen4_model_prepare_prefill64(qn_qwen4_model *m,char *err,size_t errlen);
 int qn_qwen4_model_prepare_production(qn_qwen4_model *m,char *err,size_t errlen);
 void qn_qwen4_model_get_runtime_status(qn_qwen4_model *m,qn_qwen4_runtime_status *status);
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *token_ids,size_t token_count,float *logits,qn_qwen4_prefill_output *out,char *err,size_t errlen);
+int qn_qwen4_model_reset_session(qn_qwen4_model *m,char *err,size_t errlen);
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t position);
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *stats);
 void qn_qwen4_model_close(qn_qwen4_model *m);

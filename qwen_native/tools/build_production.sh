@@ -26,6 +26,7 @@ SOURCES=(
 )
 
 clang "${COMMON[@]}" "$ROOT/qwen_native/tools/qn_generate_ids.m" "${SOURCES[@]}" -o "$BIN/qn_generate_ids"
+clang "${COMMON[@]}" "$ROOT/qwen_native/tools/qn_worker.m" "${SOURCES[@]}" -o "$BIN/qn_worker"
 clang -O2 -fobjc-arc -Wall -Wextra -DQN_DISABLE_SOURCE_METALLIB_FALLBACK=1 -I "$ROOT/qwen_native" \
   "$ROOT/qwen_native/tools/qn_runtime_probe.m" "$ROOT/qwen_native/qn_runtime.m" \
   -framework Foundation -framework Metal -o "$BIN/qn_runtime_probe"
@@ -34,7 +35,11 @@ cp "$ROOT/qwen_native/kernels/qn_gather_bm32.metallib" "$SHARE/qn_gather_bm32.me
 cp "$ROOT/NOTICE" "$SHARE/NOTICE"
 cp "$ROOT/LICENSE" "$SHARE/LICENSE"
 cp "$ROOT/LICENSE-APACHE-2.0" "$SHARE/LICENSE-APACHE-2.0"
+cp "$ROOT/qwen_native/tools/qn_server.py" "$BIN/qn_server.py"
+chmod +x "$BIN/qn_server.py"
 
 printf 'qwen-native production bundle: %s\n' "$OUT"
 printf '  runtime probe: QN_RUNTIME_MODE=stable %s\n' "$BIN/qn_runtime_probe"
 printf '  inference:     QN_RUNTIME_MODE=stable %s MODEL_DIR MANIFEST NGRAM MAX_TOKENS TOKEN_ID...\n' "$BIN/qn_generate_ids"
+printf '  worker:        %s MODEL_DIR MANIFEST NGRAM\n' "$BIN/qn_worker"
+printf '  server:        %s --model MODEL_DIR --manifest MANIFEST [--port 8004]\n' "$BIN/qn_server.py"
