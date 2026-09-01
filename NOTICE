@@ -14,3 +14,33 @@ See LICENSE-APACHE-2.0.
 The adaptation in qwen_native/qn_gdn_layer.m preserves the recurrence while
 adapting activation width, state layout, and dispatch geometry for this native
 Qwen runtime.
+
+mlx-serve, by David Dalcu
+Copyright (c) 2026 David Dalcu
+Licensed under the MIT License.
+
+Used in qwen-native-runtime (`qwen_native/qn_qwen4_layer.m`):
+  * The head-dim-256 fused causal prefill attention design is adapted from
+    mlx-serve's `msv_attn_p256` kernel in `src/transformer.zig`. The native
+    runtime uses an FP32-specific BQ=32/BK=16 geometry to fit Apple GPU
+    threadgroup-memory limits while preserving this runtime's FP32 Q/K/V path.
+
+MIT License (mlx-serve)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
