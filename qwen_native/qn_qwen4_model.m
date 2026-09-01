@@ -28,6 +28,7 @@ struct qn_qwen4_model {
 static void E(char *e,size_t n,const char *s){if(e&&n)snprintf(e,n,"%s",s?s:"model runtime error");}
 static double msnow(void){static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);return (double)mach_absolute_time()*tb.numer/tb.denom/1e6;}
 static int is_qsa(uint32_t i){return i<48 && (i&3u)==3u;}
+#define QN_QWEN4_PRODUCTION_CONTEXT 8192u
 static uint64_t qsa_bytes_for(size_t cap){return (uint64_t)cap*(128u+512u+512u)*sizeof(float);}
 
 static int ensure_qsa_cache(qn_qwen4_model *m,uint32_t i,size_t need,char *e,size_t n){
@@ -137,17 +138,27 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
 
 int qn_qwen4_model_forward_token(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(run_trunk(m,token,h,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
+    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
 }
 
 int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_step_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
+    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
 }
 
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}
+    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}if(count>QN_QWEN4_PRODUCTION_CONTEXT || (uint64_t)m->position+count>QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"prefill exceeds production context limit (8192 tokens)");return -1;}
+    /* Production/model-owner prefill is deliberately chunked at 64 tokens.
+       This keeps every layer on the warmed MPS/BM32 shape, bounds retained
+       scratch independently of prompt length, and preserves causal state via
+       the model's GDN/PLE/QSA caches between chunks. Layer-level APIs remain
+       available for larger research batches. */
+    if(count>64){
+        size_t off=0;double ps=0,ls=0,ts=0;qn_qwen4_prefill_output part={0};
+        while(off<count){size_t nleft=count-off,chunk=nleft>64?64:nleft;float *lp=(off+chunk==count)?logits:NULL;memset(&part,0,sizeof(part));if(qn_qwen4_model_prefill_tokens(m,tokens+off,chunk,lp,&part,e,n))return -1;ps+=part.prefill_ms;ls+=part.logits_ms;ts+=part.total_ms;off+=chunk;}
+        out->next_token=part.next_token;out->prompt_tokens=(uint32_t)count;out->prefill_ms=ps;out->logits_ms=ls;out->total_ms=ts;return 0;
+    }
     if(count==1){
         double t0=msnow();float emb[2560],h[10240];uint32_t token=tokens[0];if(token>=248320){E(e,n,"prefill token out of range");return -1;}if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->prompt_tokens=1;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
     }
@@ -173,7 +184,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
         }
         if(is_qsa(i)){
             if(ensure_qsa_cache(m,i,(size_t)base+T,e,n)){free(a);free(b);return -1;}
-            if((uint64_t)base+T<=4096){
+            if((uint64_t)base+T<=8192){
                 double qms=0;if(qn_qwen4_layer_forward_prefill_batch(m->qsa[i],a,base,T,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],b,&qms,e,n)){free(a);free(b);return -1;}
             }else{
                 for(uint32_t t=0;t<T;t++){

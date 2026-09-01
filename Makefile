@@ -65,7 +65,7 @@ endif
 .PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut qwen-native-production
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut qwen-native-production qwen-native-qsa-context-test
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -78,6 +78,7 @@ help:
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make qwen-native-production  Build the stable native Qwen production bundle"
+	@echo "  make qwen-native-qsa-context-test QWEN4_TEST_MODEL=... QWEN4_TEST_MANIFEST=...  Verify QSA >4K/8K selector boundaries"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
 	@echo "  make mtp-verify-depth  Run legacy MTP speculative verification smoke if MTP GGUF is present"
@@ -128,6 +129,17 @@ metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
 
 qwen-native-production:
 	./qwen_native/tools/build_production.sh
+
+qwen-native-qsa-context-test:
+	@if [ -z "$(QWEN4_TEST_MODEL)" ] || [ -z "$(QWEN4_TEST_MANIFEST)" ]; then \
+		echo "set QWEN4_TEST_MODEL and QWEN4_TEST_MANIFEST"; exit 2; \
+	fi
+	$(CC) $(OBJCFLAGS) -Wno-unused-variable -Wno-unused-function -Iqwen_native -o /tmp/qn_qwen4_qsa_context \
+		qwen_native/tests/qn_qwen4_qsa_context.m qwen_native/qn_runtime.m \
+		qwen_native/qn_manifest.m qwen_native/qn_qwen4_layer.m \
+		-framework Foundation -framework Metal -framework MetalPerformanceShaders
+	QWEN4_TEST_MODEL="$(QWEN4_TEST_MODEL)" QWEN4_TEST_MANIFEST="$(QWEN4_TEST_MANIFEST)" \
+		env -u QN_RUNTIME_MODE -u QN_PREFILL_MPS -u QN_MOE_METALLIB /tmp/qn_qwen4_qsa_context
 
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<

@@ -1683,6 +1683,12 @@ from MLX headers with Metal 4 and a macOS 26.2 deployment target; regeneration
 is not required on production startup. Experimental q8 NAX projection kernels
 are intentionally not part of the stable profile.
 
+Production/model-owner prefill is scheduled in fixed **64-token chunks** up to
+the verified **8192-token total context**. Chunking keeps retained scratch
+bounded independently of prompt length, stays on the warmed MPS/BM32 shape, and
+carries GDN recurrent state, PLE history, and QSA caches across chunk
+boundaries. Layer-level APIs remain available for larger research batches.
+
 #### Persistent OpenAI-compatible server
 
 `make qwen-native-production` also builds a persistent native worker and a
@@ -1717,11 +1723,11 @@ Production safety rules in the current phase:
   the model slot is released, preventing the next request from consuming stale
   token lines;
 - SIGINT/SIGTERM shuts down the HTTP listener and its native worker together;
-- the stable worker caps prompts at 4096 tokens and output at 2048 tokens in
-  this phase;
+- the stable worker enforces an 8192-token total context budget
+  (`prompt_tokens + max_tokens - 1 <= 8192`) and caps output at 2048 tokens;
 - generation is greedy only. Requests that explicitly set a non-zero
   `temperature` are rejected instead of silently changing sampling semantics.
 
 These limits are intentional production guards, not model architecture limits.
-Long-context chunked prefill, sampling, and structured tool-call response
-translation are separate follow-up milestones.
+Sampling and structured tool-call response translation are separate follow-up
+milestones.
