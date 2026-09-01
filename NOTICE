@@ -1,0 +1,16 @@
+Third-party notices
+
+This repository includes an adapted GatedDeltaNet blocked-sequence prefill
+Metal kernel derived from oMLX by jundot / oMLX contributors.
+
+Source provenance:
+  oMLX custom_kernels/qwen35_prefill/gdn.py
+  gated_delta_blocked_seq
+
+Copyright oMLX contributors.
+Licensed under the Apache License, Version 2.0.
+See LICENSE-APACHE-2.0.
+
+The adaptation in qwen_native/qn_gdn_layer.m preserves the recurrence while
+adapting activation width, state layout, and dispatch geometry for this native
+Qwen runtime.
