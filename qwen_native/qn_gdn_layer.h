@@ -14,5 +14,6 @@ int qn_gdn_layer_forward_full_batch(qn_gdn_layer *l,const float *hyper_states,ui
 int qn_gdn_layer_forward_full(qn_gdn_layer *l,const qn_gdn_decode_input *in,qn_gdn_decode_output *out,char *err,size_t errlen);
 int qn_gdn_group_forward3_batch(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,uint32_t tokens,float *hyper_out,char *err,size_t errlen);
 int qn_gdn_group_forward3(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,float *hyper_out,char *err,size_t errlen);
+int qn_gdn_layer_warm_mps64(qn_gdn_layer *l,char *err,size_t errlen);
 void qn_gdn_layer_close(qn_gdn_layer *l);
 #endif

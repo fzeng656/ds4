@@ -16,7 +16,7 @@ def build(binary: pathlib.Path):
     newest = max(p.stat().st_mtime for p in sources)
     if binary.exists() and binary.stat().st_mtime >= newest:
         return
-    cmd = ["clang", "-O3", "-ffast-math", "-fobjc-arc", f"-I{REPO}"] + [str(p) for p in sources] + ["-framework", "Foundation", "-framework", "Metal", "-o", str(binary)]
+    cmd = ["clang", "-O3", "-ffast-math", "-fobjc-arc", f"-I{REPO}"] + [str(p) for p in sources] + ["-framework", "Foundation", "-framework", "Metal", "-framework", "MetalPerformanceShaders", "-o", str(binary)]
     subprocess.run(cmd, check=True)
 
 def main():

@@ -61,6 +61,7 @@ int qn_qwen4_layer_forward_decode(qn_qwen4_layer *layer,
                                   const qn_qwen4_decode_input *input,
                                   qn_qwen4_decode_output *output,
                                   char *err, size_t errlen);
+int qn_qwen4_layer_warm_mps64(qn_qwen4_layer *l,char *err,size_t errlen);
 void qn_qwen4_layer_close(qn_qwen4_layer *layer);
 
 #endif

@@ -57,6 +57,22 @@ int qn_qwen4_model_ensure_layer(qn_qwen4_model *m,uint32_t i,char *e,size_t n){
     if(m->gdn[i])return 0;qn_gdn_layer_config c={m->model_dir,m->manifest_path,i};if(qn_gdn_layer_open(&m->gdn[i],&c,e,n))return -1;m->opened_gdn++;return 0;
 }
 int qn_qwen4_model_ensure_ple(qn_qwen4_model *m,char *e,size_t n){if(!m){E(e,n,"invalid model");return -1;}if(m->ple)return 0;qn_ple_config c={m->model_dir,m->manifest_path,m->ngram_path};return qn_ple_layer_open(&m->ple,&c,e,n);}
+int qn_qwen4_model_prepare_prefill64(qn_qwen4_model *m,char *e,size_t n){
+    if(!m){E(e,n,"invalid model");return -1;}
+    const uint32_t T=64;size_t H=(size_t)T*10240,I=(size_t)T*128,K=(size_t)T*512;
+    float *hin=calloc(H,sizeof(float)),*hout=calloc(H,sizeof(float)),*idx=calloc(I,sizeof(float)),*key=calloc(K,sizeof(float)),*val=calloc(K,sizeof(float));
+    if(!hin||!hout||!idx||!key||!val){free(hin);free(hout);free(idx);free(key);free(val);E(e,n,"prefill warm allocation failed");return -1;}
+    for(uint32_t i=0;i<48;i++){
+        if(qn_qwen4_model_ensure_layer(m,i,e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
+        if(is_qsa(i)){
+            /* QSA has no retained recurrent state: a complete dummy T64 run safely
+               warms FA256 + MPS GEMM dispatch shapes using caller-owned scratch caches. */
+            memset(idx,0,I*sizeof(float));memset(key,0,K*sizeof(float));memset(val,0,K*sizeof(float));double warm_ms=0;
+            if(qn_qwen4_layer_forward_prefill_batch(m->qsa[i],hin,0,T,idx,key,val,hout,&warm_ms,e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
+        }else if(qn_gdn_layer_warm_mps64(m->gdn[i],e,n)){free(hin);free(hout);free(idx);free(key);free(val);return -1;}
+    }
+    free(hin);free(hout);free(idx);free(key);free(val);return qn_qwen4_model_ensure_ple(m,e,n);
+}
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t p){if(m)m->position=p;}
 
 int qn_qwen4_model_seed_qsa_cache(qn_qwen4_model *m,uint32_t i,uint32_t tokens,const float *idx,const float *k,const float *v,char *e,size_t n){

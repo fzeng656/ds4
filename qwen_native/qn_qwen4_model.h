@@ -42,6 +42,7 @@ int qn_qwen4_model_ensure_ple(qn_qwen4_model *m,char *err,size_t errlen);
 int qn_qwen4_model_seed_qsa_cache(qn_qwen4_model *m,uint32_t layer_index,uint32_t tokens,const float *index_raw,const float *keys,const float *values,char *err,size_t errlen);
 int qn_qwen4_model_forward_token(qn_qwen4_model *m,uint32_t token_id,float hyper_state[10240],char *err,size_t errlen);
 int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token_id,float *logits,qn_qwen4_step_output *out,char *err,size_t errlen);
+int qn_qwen4_model_prepare_prefill64(qn_qwen4_model *m,char *err,size_t errlen);
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *token_ids,size_t token_count,float *logits,qn_qwen4_prefill_output *out,char *err,size_t errlen);
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t position);
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *stats);

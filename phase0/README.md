@@ -117,3 +117,21 @@ reduced native L11 QKV wall latency from ~0.675 ms to ~0.451 ms while preserving
 correctness (max absolute error <= 3.54e-8). This closes most of the gap to MLX
 and confirms that scheduling + row-parallel reduction is the right first
 optimization before adopting a larger DS4-style tile kernel.
+
+## Optional M5 prefill acceleration
+
+The native Qwen runtime keeps the mmap/no-copy quantized-weight path as the default.
+On large-memory Apple Silicon, set `QN_PREFILL_MPS=1` before opening the model to
+build persistent FP32 dequantized caches for the large QSA and GDN prefill
+projections. For the current 48-layer Qwen3.8 Flash-Next geometry this cache is
+about 11.6 GiB in addition to the quantized model mappings.
+
+After opening the model, call `qn_qwen4_model_prepare_prefill64()` once before
+serving requests. It opens all layers, warms the 64-token QSA fused-attention and
+MPS GEMM dispatch shapes using caller-owned temporary QSA caches, and warms the
+GDN MPS GEMMs without advancing GDN recurrent state. Without
+`QN_PREFILL_MPS=1`, the same prepare call retains the custom-Metal fallback and
+only performs the safe prefill warmup.
+
+The accelerated path is currently selected only for batch widths >= 64. Decode
+and shorter prefill keep the quantized custom-Metal kernels.
