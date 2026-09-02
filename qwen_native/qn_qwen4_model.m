@@ -22,6 +22,9 @@ struct qn_qwen4_model {
     uint32_t opened_qsa, opened_gdn, position, qsa_initial_capacity;
     uint64_t qsa_cache_bytes;
     int stable_mode, production_prepared;
+    float last_stream[10240]; int last_stream_valid;
+    uint32_t *verify_next_ids; uint32_t verify_capture_count;
+    float *verify_streams;
     char moe_metallib_path[1024];
 };
 
@@ -107,7 +110,7 @@ int qn_qwen4_model_prepare_production(qn_qwen4_model*m,char*e,size_t n){
 }
 int qn_qwen4_model_reset_session(qn_qwen4_model*m,char*e,size_t n){
     if(!m){E(e,n,"invalid model");return -1;}
-    m->position=0;m->ple_token_history[0]=m->ple_token_history[1]=248044;
+    m->position=0;m->last_stream_valid=0;m->ple_token_history[0]=m->ple_token_history[1]=248044;
     if(m->ple_conv)memset(m->ple_conv,0,(size_t)10240*9*sizeof(float));
     for(uint32_t i=0;i<48;i++)if(m->gdn[i]&&qn_gdn_layer_reset_state(m->gdn[i])){E(e,n,"GDN session reset failed");return -1;}
     return 0;
@@ -192,12 +195,12 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
 
 int qn_qwen4_model_forward_token(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
+    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
 }
 
 int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_step_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
+    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
 }
 
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
@@ -214,7 +217,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
         out->next_token=part.next_token;out->prompt_tokens=(uint32_t)count;out->prefill_ms=ps;out->logits_ms=ls;out->total_ms=ts;return 0;
     }
     if(count==1){
-        double t0=msnow();float emb[2560],h[10240];uint32_t token=tokens[0];if(token>=248320){E(e,n,"prefill token out of range");return -1;}if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));if(run_trunk(m,token,h,e,n))return -1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->prompt_tokens=1;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
+        double t0=msnow();float emb[2560],h[10240];uint32_t token=tokens[0];if(token>=248320){E(e,n,"prefill token out of range");return -1;}if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*sizeof(float));if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->prompt_tokens=1;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
     }
     if(count>UINT32_MAX){E(e,n,"prefill token count too large");return -1;}
     uint32_t T=(uint32_t)count,base=m->position;
@@ -252,10 +255,15 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
         }
         float *tmp=a;a=b;b=tmp;
     }
-    double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,a+(size_t)(T-1)*10240,logits,&nt,&lm,e,n)){free(a);free(b);return -1;}
+    if(m->verify_streams&&m->verify_capture_count==T)memcpy(m->verify_streams,a,(size_t)T*10240*sizeof(float));
+    double t1=msnow();memcpy(m->last_stream,a+(size_t)(T-1)*10240,sizeof(m->last_stream));m->last_stream_valid=1;uint32_t nt=0;double lm=0;if(m->verify_next_ids&&m->verify_capture_count==T){double lsum=0;for(uint32_t t=0;t<T;t++){double one=0;uint32_t ni=0;float *lp=(t+1==T)?logits:NULL;if(qn_model_io_logits(m->io,a+(size_t)t*10240,lp,&ni,&one,e,n)){free(a);free(b);return -1;}m->verify_next_ids[t]=ni;lsum+=one;nt=ni;}lm=lsum;}else if(qn_model_io_logits(m->io,a+(size_t)(T-1)*10240,logits,&nt,&lm,e,n)){free(a);free(b);return -1;}
     m->ple_token_history[0]=ple_hist[0];m->ple_token_history[1]=ple_hist[1];m->position=base+T;
     out->next_token=nt;out->prompt_tokens=T;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;free(a);free(b);return 0;
 }
+
+int qn_qwen4_model_copy_last_stream(qn_qwen4_model*m,float out[10240]){if(!m||!out||!m->last_stream_valid)return -1;memcpy(out,m->last_stream,sizeof(m->last_stream));return 0;}
+int qn_qwen4_model_verify_tokens_capture(qn_qwen4_model*m,const uint32_t*tokens,size_t count,uint32_t*next_ids,float*streams,qn_qwen4_prefill_output*out,char*e,size_t n){if(!m||!tokens||count<2||count>64||!next_ids||!out){E(e,n,"invalid verify args");return -1;}m->verify_next_ids=next_ids;m->verify_streams=streams;m->verify_capture_count=(uint32_t)count;int rc=qn_qwen4_model_prefill_tokens(m,tokens,count,NULL,out,e,n);m->verify_next_ids=NULL;m->verify_streams=NULL;m->verify_capture_count=0;return rc;}
+int qn_qwen4_model_verify_tokens(qn_qwen4_model*m,const uint32_t*tokens,size_t count,uint32_t*next_ids,qn_qwen4_prefill_output*out,char*e,size_t n){return qn_qwen4_model_verify_tokens_capture(m,tokens,count,next_ids,NULL,out,e,n);}
 
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *s){if(!m||!s)return;memset(s,0,sizeof(*s));s->num_layers=48;s->qsa_layers=12;s->gdn_layers=36;s->gdn_conv_state_bytes=(uint64_t)36*10240*4*4;s->gdn_recurrent_state_bytes=(uint64_t)36*48*128*128*4;s->ple_state_bytes=(uint64_t)10240*9*4+2*8;s->opened_qsa_layers=m->opened_qsa;s->opened_gdn_layers=m->opened_gdn;s->ple_opened=m->ple!=0;s->qsa_cache_capacity=m->qsa_initial_capacity;s->qsa_cache_bytes=m->qsa_cache_bytes;s->position=m->position;}
 void qn_qwen4_model_close(qn_qwen4_model *m){if(!m)return;for(uint32_t i=0;i<48;i++){if(m->qsa[i])qn_qwen4_layer_close(m->qsa[i]);if(m->gdn[i])qn_gdn_layer_close(m->gdn[i]);free(m->qsa_index[i]);free(m->qsa_key[i]);free(m->qsa_value[i]);}if(m->ple)qn_ple_layer_close(m->ple);if(m->io)qn_model_io_close(m->io);free(m->ple_conv);free(m);}

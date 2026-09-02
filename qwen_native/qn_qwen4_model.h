@@ -59,5 +59,8 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *token_ids,si
 int qn_qwen4_model_reset_session(qn_qwen4_model *m,char *err,size_t errlen);
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t position);
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *stats);
+int qn_qwen4_model_copy_last_stream(qn_qwen4_model *m,float out[10240]);
+int qn_qwen4_model_verify_tokens(qn_qwen4_model *m,const uint32_t *token_ids,size_t token_count,uint32_t *next_ids,qn_qwen4_prefill_output *out,char *err,size_t errlen);
+int qn_qwen4_model_verify_tokens_capture(qn_qwen4_model *m,const uint32_t *token_ids,size_t token_count,uint32_t *next_ids,float *streams,qn_qwen4_prefill_output *out,char *err,size_t errlen);
 void qn_qwen4_model_close(qn_qwen4_model *m);
 #endif

@@ -19,6 +19,7 @@ SOURCES=(
   "$ROOT/qwen_native/qn_runtime.m"
   "$ROOT/qwen_native/qn_manifest.m"
   "$ROOT/qwen_native/qn_model_io.m"
+  "$ROOT/qwen_native/qn_mtp_head.m"
   "$ROOT/qwen_native/qn_gdn_layer.m"
   "$ROOT/qwen_native/qn_ple_layer.m"
   "$ROOT/qwen_native/qn_qwen4_layer.m"

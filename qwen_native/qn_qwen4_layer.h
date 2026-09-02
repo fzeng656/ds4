@@ -73,6 +73,7 @@ int qn_qwen4_layer_copy_current_cache(qn_qwen4_layer *layer,float *index_raw,flo
 int qn_qwen4_layer_warm_mps64(qn_qwen4_layer *l,char *err,size_t errlen);
 int qn_qwen4_layer_prefill_mps_enabled(qn_qwen4_layer *l);
 int qn_qwen4_layer_moe_bm32_enabled(qn_qwen4_layer *l);
+void qn_qwen4_layer_invalidate_resident_cache(qn_qwen4_layer *l);
 void qn_qwen4_layer_close(qn_qwen4_layer *layer);
 
 #endif
