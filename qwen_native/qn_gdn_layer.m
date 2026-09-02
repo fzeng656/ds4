@@ -22,7 +22,7 @@ struct qn_gdn_layer {
  qn_affine_metal_view expert_gate[512],expert_up[512],expert_down[512]; uint8_t expert_cached[512];
  __strong id<MTLBuffer> expert_gate_bank_w,expert_gate_bank_s,expert_gate_bank_b,expert_up_bank_w,expert_up_bank_s,expert_up_bank_b,expert_down_bank_w,expert_down_bank_s,expert_down_bank_b;
  uint64_t egw,egs,egb,euw,eus,eub,edw,eds,edb; uint8_t eg_map,eu_map,ed_map;
- __strong id<MTLBuffer> hb,xn,lo,mw,mixed,inj,qkvb,zb,ab,bb,convb,cv,gb,bet,sb,core,ng,att,fin;
+ __strong id<MTLBuffer> hb,xn,lo,mw,mixed,inj,qkvb,zb,ab,bb,convb,conv_shadow,cv,gb,bet,sb,sb_shadow,core,ng,att,fin;
  __strong id<MTLBuffer> mhb,mhxn,mhlo,mhmw,mhmixed,mhinj,router_logits,egate,eup,ehid,edown,routed,shared,sgate,mfinal,topids,topws;
 };
 static void E(char*e,size_t n,const char*s){if(e&&n)snprintf(e,n,"%s",s?s:"gdn runtime error");}
@@ -228,8 +228,8 @@ for(NSString*k in @[@"q8_mv",@"q8_mv_g2",@"gdn_proj4_decode",@"q8_dequant_f32",@
  BANK(expert_gate_bank_w,l->eg_map,l->egw,ewbytes);BANK(expert_gate_bank_s,l->eg_map,l->egs,esbytes);BANK(expert_gate_bank_b,l->eg_map,l->egb,esbytes);BANK(expert_up_bank_w,l->eu_map,l->euw,ewbytes);BANK(expert_up_bank_s,l->eu_map,l->eus,esbytes);BANK(expert_up_bank_b,l->eu_map,l->eub,esbytes);BANK(expert_down_bank_w,l->ed_map,l->edw,dwbytes);BANK(expert_down_bank_s,l->ed_map,l->eds,dsbytes);BANK(expert_down_bank_b,l->ed_map,l->edb,dsbytes);
 #undef BANK
  #define B(name,bytes) l->name=[l->device newBufferWithLength:(bytes) options:MTLResourceStorageModeShared]
- B(hb,40960);B(xn,40960);B(lo,1280);B(mw,40960);B(mixed,10240);B(inj,16);B(qkvb,40960);B(zb,24576);B(ab,192);B(bb,192);B(convb,163840);B(cv,40960);B(gb,192);B(bet,192);B(sb,48*16384*4);B(core,24576);B(ng,24576);B(att,10240);B(fin,40960);B(mhb,40960);B(mhxn,40960);B(mhlo,1280);B(mhmw,40960);B(mhmixed,10240);B(mhinj,16);B(router_logits,2048);B(egate,2560);B(eup,2560);B(ehid,10*2560);B(edown,10240);B(routed,10240);B(shared,10240);B(sgate,4);B(mfinal,40960);B(topids,40);B(topws,40);
- memset(l->convb.contents,0,163840);memset(l->sb.contents,0,48*16384*4);
+ B(hb,40960);B(xn,40960);B(lo,1280);B(mw,40960);B(mixed,10240);B(inj,16);B(qkvb,40960);B(zb,24576);B(ab,192);B(bb,192);B(convb,163840);B(conv_shadow,163840);B(cv,40960);B(gb,192);B(bet,192);B(sb,48*16384*4);B(sb_shadow,48*16384*4);B(core,24576);B(ng,24576);B(att,10240);B(fin,40960);B(mhb,40960);B(mhxn,40960);B(mhlo,1280);B(mhmw,40960);B(mhmixed,10240);B(mhinj,16);B(router_logits,2048);B(egate,2560);B(eup,2560);B(ehid,10*2560);B(edown,10240);B(routed,10240);B(shared,10240);B(sgate,4);B(mfinal,40960);B(topids,40);B(topws,40);
+ memset(l->convb.contents,0,163840);memset(l->conv_shadow.contents,0,163840);memset(l->sb.contents,0,48*16384*4);memset(l->sb_shadow.contents,0,48*16384*4);
  #undef B
  if(getenv("QN_PREFILL_MPS")&&getenv("QN_PREFILL_MPS")[0]=='1'){
  id<MTLComputePipelineState>dq=pp(l,@"q8_dequant_f32",&x);if(!dq){E(e,n,x.description.UTF8String);qn_gdn_layer_close(l);return -1;}l->mps_qkvw=[l->device newBufferWithLength:(NSUInteger)10240*2560*sizeof(float) options:MTLResourceStorageModePrivate];l->mps_zw=[l->device newBufferWithLength:(NSUInteger)6144*2560*sizeof(float) options:MTLResourceStorageModePrivate];l->mps_outw=[l->device newBufferWithLength:(NSUInteger)2560*6144*sizeof(float) options:MTLResourceStorageModePrivate];l->mps_hdownw=[l->device newBufferWithLength:(NSUInteger)320*10240*sizeof(float) options:MTLResourceStorageModePrivate];l->mps_hupw=[l->device newBufferWithLength:(NSUInteger)10240*320*sizeof(float) options:MTLResourceStorageModePrivate];l->mps_mhdownw=[l->device newBufferWithLength:(NSUInteger)320*10240*sizeof(float) options:MTLResourceStorageModePrivate];l->mps_mhupw=[l->device newBufferWithLength:(NSUInteger)10240*320*sizeof(float) options:MTLResourceStorageModePrivate];if(!l->mps_qkvw||!l->mps_zw||!l->mps_outw||!l->mps_hdownw||!l->mps_hupw||!l->mps_mhdownw||!l->mps_mhupw){E(e,n,"MPS GDN weight cache allocation failed");qn_gdn_layer_close(l);return -1;}
@@ -512,7 +512,9 @@ int qn_gdn_layer_forward_full(qn_gdn_layer*l,const qn_gdn_decode_input*in,qn_gdn
  return 0;
 }
 
-int qn_gdn_layer_reset_state(qn_gdn_layer*l){if(!l)return -1;memset(l->convb.contents,0,163840);memset(l->sb.contents,0,48*16384*4);return 0;}
+int qn_gdn_layer_reset_state(qn_gdn_layer*l){if(!l)return -1;memset(l->convb.contents,0,163840);memset(l->conv_shadow.contents,0,163840);memset(l->sb.contents,0,48*16384*4);memset(l->sb_shadow.contents,0,48*16384*4);return 0;}
+int qn_gdn_layer_encode_state_copy_to_shadow(qn_gdn_layer*l,id<MTLBlitCommandEncoder>b){if(!l||!b||!l->conv_shadow||!l->sb_shadow)return -1;[b copyFromBuffer:l->convb sourceOffset:0 toBuffer:l->conv_shadow destinationOffset:0 size:163840];[b copyFromBuffer:l->sb sourceOffset:0 toBuffer:l->sb_shadow destinationOffset:0 size:(NSUInteger)48*16384*4];return 0;}
+void qn_gdn_layer_swap_state_buffers(qn_gdn_layer*l){if(!l)return;id<MTLBuffer>t=l->convb;l->convb=l->conv_shadow;l->conv_shadow=t;t=l->sb;l->sb=l->sb_shadow;l->sb_shadow=t;}
 
 int qn_gdn_layer_prefill_mps_enabled(qn_gdn_layer*l){return l&&l->mps_qkvw&&l->mps_zw&&l->mps_outw&&l->mps_hdownw&&l->mps_hupw&&l->mps_mhdownw&&l->mps_mhupw;}
 int qn_gdn_layer_moe_bm32_enabled(qn_gdn_layer*l){return l&&l->moe_gather_bm32!=nil;}

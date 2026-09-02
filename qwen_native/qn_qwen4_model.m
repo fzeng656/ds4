@@ -25,6 +25,9 @@ struct qn_qwen4_model {
     float last_stream[10240]; int last_stream_valid;
     uint32_t *verify_next_ids; uint32_t verify_capture_count;
     float *verify_streams;
+    __strong id<MTLDevice> shadow_device; __strong id<MTLCommandQueue> shadow_queue;
+    __strong id<MTLCommandBuffer> shadow_copy_cb; int shadow_copy_pending;
+    float *shadow_ple_conv; float shadow_last_stream[10240]; int64_t shadow_ple_hist[2]; uint32_t shadow_position; int shadow_last_valid, shadow_active;
     char moe_metallib_path[1024];
 };
 
@@ -57,7 +60,7 @@ int qn_qwen4_model_open(qn_qwen4_model **out,const qn_qwen4_model_config *c,char
     qn_qwen4_model *m=calloc(1,sizeof(*m));if(!m){E(e,n,"calloc model failed");return -1;}
     m->stable_mode=rs.stable_mode;if(rs.moe_metallib_configured)snprintf(m->moe_metallib_path,sizeof(m->moe_metallib_path),"%s",rs.moe_metallib_path);
     snprintf(m->model_dir,sizeof(m->model_dir),"%s",c->model_dir);snprintf(m->manifest_path,sizeof(m->manifest_path),"%s",c->manifest_path);snprintf(m->ngram_path,sizeof(m->ngram_path),"%s",c->ngram_table_path);m->qsa_initial_capacity=c->qsa_cache_capacity?c->qsa_cache_capacity:16;
-    m->ple_conv=calloc((size_t)10240*9,sizeof(float));if(!m->ple_conv){E(e,n,"PLE state allocation failed");qn_qwen4_model_close(m);return -1;}
+    m->ple_conv=calloc((size_t)10240*9,sizeof(float));m->shadow_ple_conv=calloc((size_t)10240*9,sizeof(float));if(!m->ple_conv||!m->shadow_ple_conv){E(e,n,"PLE state allocation failed");qn_qwen4_model_close(m);return -1;}@autoreleasepool{m->shadow_device=MTLCreateSystemDefaultDevice();m->shadow_queue=[m->shadow_device newCommandQueue];if(!m->shadow_queue){E(e,n,"spec shadow Metal queue unavailable");qn_qwen4_model_close(m);return -1;}}
     m->ple_token_history[0]=m->ple_token_history[1]=248044; /* model EOS */
     qn_model_io_config io={m->model_dir,m->manifest_path};if(qn_model_io_open(&m->io,&io,e,n)){qn_qwen4_model_close(m);return -1;}
     *out=m;return 0;
@@ -130,9 +133,9 @@ static int run_trunk_gpu_full(qn_qwen4_model*m,uint32_t token,float h[10240],cha
   int64_t ph[3]={m->ple_token_history[0],m->ple_token_history[1],(int64_t)token};if(qn_ple_layer_submit_buffer(m->ple,buf,ph,m->ple_conv,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
   if(qn_gdn_layer_submit_buffer(m->gdn[1],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
   if(qn_gdn_layer_submit_buffer(m->gdn[2],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
-  qn_qwen4_layer_set_command_queue(m->qsa[3],queue);qn_qwen4_decode_input in3={NULL,m->qsa_index[3],m->qsa_key[3],m->qsa_value[3],m->position};if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[3],buf,&in3,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  qn_qwen4_layer_set_command_queue(m->qsa[3],queue);qn_qwen4_decode_input in3={NULL,m->qsa_index[3],m->qsa_key[3],m->qsa_value[3],m->position,0};if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[3],buf,&in3,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
   for(uint32_t i=4;i<48;i+=4){uint32_t qi=i+3;if(qn_qwen4_model_ensure_layer(m,i,e,n)||qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n)||qn_qwen4_model_ensure_layer(m,qi,e,n))return -1;if(ensure_qsa_cache(m,qi,(size_t)m->position+1,e,n))return -1;
-   if(qn_gdn_group_forward3_submit_buffer(m->gdn[i],m->gdn[i+1],m->gdn[i+2],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;qn_qwen4_layer_set_command_queue(m->qsa[qi],queue);qn_qwen4_decode_input in={NULL,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position};if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[qi],buf,&in,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+   if(qn_gdn_group_forward3_submit_buffer(m->gdn[i],m->gdn[i+1],m->gdn[i+2],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;qn_qwen4_layer_set_command_queue(m->qsa[qi],queue);qn_qwen4_decode_input in={NULL,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position,0};if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[qi],buf,&in,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
   }
   [cbs[nc-1] waitUntilCompleted];for(uint32_t j=0;j<nc;j++)if(cbs[j].status==MTLCommandBufferStatusError){E(e,n,cbs[j].error.description.UTF8String);return -1;}memcpy(h,buf.contents,10240*4);if(qn_ple_layer_copy_state(m->ple,m->ple_conv)){E(e,n,"PLE state mirror failed");return -1;}
   for(uint32_t qi=3;qi<48;qi+=4){float*ci=m->qsa_index[qi]+(size_t)m->position*128,*ck=m->qsa_key[qi]+(size_t)m->position*512,*cv=m->qsa_value[qi]+(size_t)m->position*512;if(qn_qwen4_layer_copy_current_cache(m->qsa[qi],ci,ck,cv)){E(e,n,"QSA cache mirror failed");return -1;}}
@@ -149,7 +152,7 @@ static int run_trunk_gpu_chain_from4(qn_qwen4_model*m,float h[10240],char*e,size
    if(i==4){if(qn_gdn_group_forward3_submit_host(m->gdn[i],m->gdn[i+1],m->gdn[i+2],h,&buf,&cb,e,n))return -1;queue=cb.commandQueue;}
    else if(qn_gdn_group_forward3_submit_buffer(m->gdn[i],m->gdn[i+1],m->gdn[i+2],buf,queue,&buf,&cb,e,n))return -1;
    cbs[nc++]=cb;qn_qwen4_layer_set_command_queue(m->qsa[qi],queue);
-   qn_qwen4_decode_input in={NULL,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position};
+   qn_qwen4_decode_input in={NULL,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position,0};
    if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[qi],buf,&in,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
   }
   if(!nc||!buf){E(e,n,"empty GPU trunk chain");return -1;}[cbs[nc-1] waitUntilCompleted];
@@ -172,7 +175,7 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
                 uint32_t qi=i+3;if(qn_qwen4_model_ensure_layer(m,qi,e,n))return -1;if(ensure_qsa_cache(m,qi,(size_t)m->position+1,e,n))return -1;
                 id<MTLBuffer>gbuf=nil;id<MTLCommandBuffer>gcb=nil;if(qn_gdn_group_forward3_submit_host(m->gdn[i],m->gdn[i+1],m->gdn[i+2],h,&gbuf,&gcb,e,n))return -1;
                 qn_qwen4_layer_set_command_queue(m->qsa[qi],gcb.commandQueue);
-                float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={h,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position};qn_qwen4_decode_output o={0};o.hyper_state=next;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
+                float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={h,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position,0};qn_qwen4_decode_output o={0};o.hyper_state=next;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
                 if(qn_qwen4_layer_forward_decode_buffer(m->qsa[qi],gbuf,&in,&o,e,n))return -1;
                 if(gcb.status==MTLCommandBufferStatusError){E(e,n,gcb.error.description.UTF8String);return -1;}
                 memcpy(m->qsa_index[qi]+(size_t)m->position*128,ci,128*4);memcpy(m->qsa_key[qi]+(size_t)m->position*512,ck,512*4);memcpy(m->qsa_value[qi]+(size_t)m->position*512,cv,512*4);
@@ -184,7 +187,7 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
         if(qn_qwen4_model_ensure_layer(m,i,e,n))return -1;
         if(is_qsa(i)){
             if(ensure_qsa_cache(m,i,(size_t)m->position+1,e,n))return -1;
-            float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={h,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],m->position};qn_qwen4_decode_output o={0};o.hyper_state=next;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
+            float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={h,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],m->position,0};qn_qwen4_decode_output o={0};o.hyper_state=next;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
             if(qn_qwen4_layer_forward_decode(m->qsa[i],&in,&o,e,n))return -1;
             memcpy(m->qsa_index[i]+(size_t)m->position*128,ci,128*4);memcpy(m->qsa_key[i]+(size_t)m->position*512,ck,512*4);memcpy(m->qsa_value[i]+(size_t)m->position*512,cv,512*4);
         }else{qn_gdn_decode_input in={h,NULL,NULL};qn_gdn_decode_output o={0};o.hyper_state=next;if(qn_gdn_layer_forward_full(m->gdn[i],&in,&o,e,n))return -1;}
@@ -245,7 +248,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
                 double qms=0;if(qn_qwen4_layer_forward_prefill_batch(m->qsa[i],a,base,T,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],b,&qms,e,n)){free(a);free(b);return -1;}
             }else{
                 for(uint32_t t=0;t<T;t++){
-                    uint32_t pos=base+t;float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={a+(size_t)t*10240,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],pos};qn_qwen4_decode_output o={0};o.hyper_state=b+(size_t)t*10240;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
+                    uint32_t pos=base+t;float ci[128],ck[512],cv[512];qn_qwen4_decode_input in={a+(size_t)t*10240,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],pos,0};qn_qwen4_decode_output o={0};o.hyper_state=b+(size_t)t*10240;o.indexer_raw_key=ci;o.key_cache=ck;o.value_cache=cv;
                     if(qn_qwen4_layer_forward_decode(m->qsa[i],&in,&o,e,n)){free(a);free(b);return -1;}
                     memcpy(m->qsa_index[i]+(size_t)pos*128,ci,128*sizeof(float));memcpy(m->qsa_key[i]+(size_t)pos*512,ck,512*sizeof(float));memcpy(m->qsa_value[i]+(size_t)pos*512,cv,512*sizeof(float));
                 }
@@ -256,14 +259,24 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
         float *tmp=a;a=b;b=tmp;
     }
     if(m->verify_streams&&m->verify_capture_count==T)memcpy(m->verify_streams,a,(size_t)T*10240*sizeof(float));
-    double t1=msnow();memcpy(m->last_stream,a+(size_t)(T-1)*10240,sizeof(m->last_stream));m->last_stream_valid=1;uint32_t nt=0;double lm=0;if(m->verify_next_ids&&m->verify_capture_count==T){double lsum=0;for(uint32_t t=0;t<T;t++){double one=0;uint32_t ni=0;float *lp=(t+1==T)?logits:NULL;if(qn_model_io_logits(m->io,a+(size_t)t*10240,lp,&ni,&one,e,n)){free(a);free(b);return -1;}m->verify_next_ids[t]=ni;lsum+=one;nt=ni;}lm=lsum;}else if(qn_model_io_logits(m->io,a+(size_t)(T-1)*10240,logits,&nt,&lm,e,n)){free(a);free(b);return -1;}
+    double t1=msnow();memcpy(m->last_stream,a+(size_t)(T-1)*10240,sizeof(m->last_stream));m->last_stream_valid=1;uint32_t nt=0;double lm=0;if(m->verify_next_ids&&m->verify_capture_count==T){if(qn_model_io_logits_batch(m->io,a,T,m->verify_next_ids,&lm,e,n)){free(a);free(b);return -1;}nt=m->verify_next_ids[T-1];if(logits){double one=0;if(qn_model_io_logits(m->io,a+(size_t)(T-1)*10240,logits,&nt,&one,e,n)){free(a);free(b);return -1;}lm+=one;}}else if(qn_model_io_logits(m->io,a+(size_t)(T-1)*10240,logits,&nt,&lm,e,n)){free(a);free(b);return -1;}
     m->ple_token_history[0]=ple_hist[0];m->ple_token_history[1]=ple_hist[1];m->position=base+T;
     out->next_token=nt;out->prompt_tokens=T;out->prefill_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;free(a);free(b);return 0;
 }
+
+int qn_qwen4_model_spec_shadow_dispatch(qn_qwen4_model*m,char*e,size_t n){
+ if(!m||m->shadow_active||m->shadow_copy_pending){E(e,n,"invalid spec shadow dispatch");return -1;}for(uint32_t i=0;i<48;i++)if(!is_qsa(i)&&qn_qwen4_model_ensure_layer(m,i,e,n))return -1;
+ m->shadow_position=m->position;m->shadow_ple_hist[0]=m->ple_token_history[0];m->shadow_ple_hist[1]=m->ple_token_history[1];memcpy(m->shadow_ple_conv,m->ple_conv,(size_t)10240*9*sizeof(float));m->shadow_last_valid=m->last_stream_valid;if(m->last_stream_valid)memcpy(m->shadow_last_stream,m->last_stream,sizeof(m->last_stream));
+ @autoreleasepool{id<MTLCommandBuffer>cb=[m->shadow_queue commandBuffer];id<MTLBlitCommandEncoder>b=[cb blitCommandEncoder];for(uint32_t i=0;i<48;i++)if(!is_qsa(i)&&qn_gdn_layer_encode_state_copy_to_shadow(m->gdn[i],b)){[b endEncoding];E(e,n,"GDN shadow encode failed");return -1;}[b endEncoding];[cb commit];m->shadow_copy_cb=cb;m->shadow_copy_pending=1;}return 0;
+}
+int qn_qwen4_model_spec_shadow_activate(qn_qwen4_model*m,double*wait_ms,char*e,size_t n){if(!m||!m->shadow_copy_pending||m->shadow_active){E(e,n,"invalid spec shadow activate");return -1;}double t0=msnow();@autoreleasepool{[m->shadow_copy_cb waitUntilCompleted];if(m->shadow_copy_cb.status==MTLCommandBufferStatusError){E(e,n,m->shadow_copy_cb.error.description.UTF8String);m->shadow_copy_cb=nil;m->shadow_copy_pending=0;return -1;}m->shadow_copy_cb=nil;}m->shadow_copy_pending=0;for(uint32_t i=0;i<48;i++)if(!is_qsa(i))qn_gdn_layer_swap_state_buffers(m->gdn[i]);m->shadow_active=1;if(wait_ms)*wait_ms=msnow()-t0;return 0;}
+int qn_qwen4_model_spec_shadow_begin(qn_qwen4_model*m,double*elapsed,char*e,size_t n){double t0=msnow();if(qn_qwen4_model_spec_shadow_dispatch(m,e,n))return -1;if(qn_qwen4_model_spec_shadow_activate(m,NULL,e,n))return -1;if(elapsed)*elapsed=msnow()-t0;return 0;}
+int qn_qwen4_model_spec_shadow_commit(qn_qwen4_model*m){if(!m||!m->shadow_active)return -1;m->shadow_active=0;return 0;}
+int qn_qwen4_model_spec_shadow_rollback(qn_qwen4_model*m,char*e,size_t n){if(!m||!m->shadow_active){E(e,n,"invalid spec shadow rollback");return -1;}for(uint32_t i=0;i<48;i++)if(!is_qsa(i)&&m->gdn[i])qn_gdn_layer_swap_state_buffers(m->gdn[i]);m->position=m->shadow_position;m->ple_token_history[0]=m->shadow_ple_hist[0];m->ple_token_history[1]=m->shadow_ple_hist[1];memcpy(m->ple_conv,m->shadow_ple_conv,(size_t)10240*9*sizeof(float));m->last_stream_valid=m->shadow_last_valid;if(m->shadow_last_valid)memcpy(m->last_stream,m->shadow_last_stream,sizeof(m->last_stream));for(uint32_t i=0;i<48;i++)if(is_qsa(i)&&m->qsa[i])qn_qwen4_layer_set_resident_cache_tokens(m->qsa[i],m->shadow_position);m->shadow_active=0;return 0;}
 
 int qn_qwen4_model_copy_last_stream(qn_qwen4_model*m,float out[10240]){if(!m||!out||!m->last_stream_valid)return -1;memcpy(out,m->last_stream,sizeof(m->last_stream));return 0;}
 int qn_qwen4_model_verify_tokens_capture(qn_qwen4_model*m,const uint32_t*tokens,size_t count,uint32_t*next_ids,float*streams,qn_qwen4_prefill_output*out,char*e,size_t n){if(!m||!tokens||count<2||count>64||!next_ids||!out){E(e,n,"invalid verify args");return -1;}m->verify_next_ids=next_ids;m->verify_streams=streams;m->verify_capture_count=(uint32_t)count;int rc=qn_qwen4_model_prefill_tokens(m,tokens,count,NULL,out,e,n);m->verify_next_ids=NULL;m->verify_streams=NULL;m->verify_capture_count=0;return rc;}
 int qn_qwen4_model_verify_tokens(qn_qwen4_model*m,const uint32_t*tokens,size_t count,uint32_t*next_ids,qn_qwen4_prefill_output*out,char*e,size_t n){return qn_qwen4_model_verify_tokens_capture(m,tokens,count,next_ids,NULL,out,e,n);}
 
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *s){if(!m||!s)return;memset(s,0,sizeof(*s));s->num_layers=48;s->qsa_layers=12;s->gdn_layers=36;s->gdn_conv_state_bytes=(uint64_t)36*10240*4*4;s->gdn_recurrent_state_bytes=(uint64_t)36*48*128*128*4;s->ple_state_bytes=(uint64_t)10240*9*4+2*8;s->opened_qsa_layers=m->opened_qsa;s->opened_gdn_layers=m->opened_gdn;s->ple_opened=m->ple!=0;s->qsa_cache_capacity=m->qsa_initial_capacity;s->qsa_cache_bytes=m->qsa_cache_bytes;s->position=m->position;}
-void qn_qwen4_model_close(qn_qwen4_model *m){if(!m)return;for(uint32_t i=0;i<48;i++){if(m->qsa[i])qn_qwen4_layer_close(m->qsa[i]);if(m->gdn[i])qn_gdn_layer_close(m->gdn[i]);free(m->qsa_index[i]);free(m->qsa_key[i]);free(m->qsa_value[i]);}if(m->ple)qn_ple_layer_close(m->ple);if(m->io)qn_model_io_close(m->io);free(m->ple_conv);free(m);}
+void qn_qwen4_model_close(qn_qwen4_model *m){if(!m)return;@autoreleasepool{m->shadow_copy_cb=nil;m->shadow_queue=nil;m->shadow_device=nil;}for(uint32_t i=0;i<48;i++){if(m->qsa[i])qn_qwen4_layer_close(m->qsa[i]);if(m->gdn[i])qn_gdn_layer_close(m->gdn[i]);free(m->qsa_index[i]);free(m->qsa_key[i]);free(m->qsa_value[i]);}if(m->ple)qn_ple_layer_close(m->ple);if(m->io)qn_model_io_close(m->io);free(m->ple_conv);free(m->shadow_ple_conv);free(m);}

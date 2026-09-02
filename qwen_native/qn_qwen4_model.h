@@ -62,5 +62,10 @@ void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *stats);
 int qn_qwen4_model_copy_last_stream(qn_qwen4_model *m,float out[10240]);
 int qn_qwen4_model_verify_tokens(qn_qwen4_model *m,const uint32_t *token_ids,size_t token_count,uint32_t *next_ids,qn_qwen4_prefill_output *out,char *err,size_t errlen);
 int qn_qwen4_model_verify_tokens_capture(qn_qwen4_model *m,const uint32_t *token_ids,size_t token_count,uint32_t *next_ids,float *streams,qn_qwen4_prefill_output *out,char *err,size_t errlen);
+int qn_qwen4_model_spec_shadow_dispatch(qn_qwen4_model *m,char *err,size_t errlen);
+int qn_qwen4_model_spec_shadow_activate(qn_qwen4_model *m,double *wait_ms,char *err,size_t errlen);
+int qn_qwen4_model_spec_shadow_begin(qn_qwen4_model *m,double *elapsed_ms,char *err,size_t errlen);
+int qn_qwen4_model_spec_shadow_commit(qn_qwen4_model *m);
+int qn_qwen4_model_spec_shadow_rollback(qn_qwen4_model *m,char *err,size_t errlen);
 void qn_qwen4_model_close(qn_qwen4_model *m);
 #endif

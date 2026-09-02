@@ -25,5 +25,9 @@ int qn_gdn_layer_warm_mps64(qn_gdn_layer *l,char *err,size_t errlen);
 int qn_gdn_layer_reset_state(qn_gdn_layer *l);
 int qn_gdn_layer_prefill_mps_enabled(qn_gdn_layer *l);
 int qn_gdn_layer_moe_bm32_enabled(qn_gdn_layer *l);
+#ifdef __OBJC__
+int qn_gdn_layer_encode_state_copy_to_shadow(qn_gdn_layer *l,id<MTLBlitCommandEncoder> blit);
+void qn_gdn_layer_swap_state_buffers(qn_gdn_layer *l);
+#endif
 void qn_gdn_layer_close(qn_gdn_layer *l);
 #endif

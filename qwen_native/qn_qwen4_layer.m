@@ -489,5 +489,6 @@ int qn_qwen4_layer_copy_current_cache(qn_qwen4_layer*l,float*index_raw,float*key
 int qn_qwen4_layer_prefill_mps_enabled(qn_qwen4_layer*l){return l&&l->mps_qweight&&l->mps_oweight;}
 int qn_qwen4_layer_moe_bm32_enabled(qn_qwen4_layer*l){return l&&l->moe_gather_bm32!=nil;}
 void qn_qwen4_layer_invalidate_resident_cache(qn_qwen4_layer*l){if(l)l->resident_cache_tokens=UINT32_MAX;}
+void qn_qwen4_layer_set_resident_cache_tokens(qn_qwen4_layer*l,uint32_t tokens){if(l)l->resident_cache_tokens=tokens;}
 
 void qn_qwen4_layer_close(qn_qwen4_layer*l){if(!l)return;@autoreleasepool{l->scratch=nil;l->pipelines=nil;l->library=nil;l->queue=nil;l->device=nil;}for(uint32_t i=0;i<l->manifest_map_count;i++)qn_file_map_close(&l->manifest_maps[i]);qn_file_map_close(&l->shard8);qn_file_map_close(&l->shard9);qn_file_map_close(&l->shard10);free(l);}
