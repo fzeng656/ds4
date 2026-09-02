@@ -20,7 +20,8 @@ typedef struct {
     const float *indexer_raw_history; /* (position) x 128 */
     const float *key_history;         /* (position) x 2 x 256 */
     const float *value_history;       /* (position) x 2 x 256 */
-    uint32_t position;                /* zero based current token position */
+    uint32_t position;                /* zero based cache/history position */
+    uint32_t position_base;           /* absolute RoPE base; target QSA uses 0, MTP uses prompt/generation base */
 } qn_qwen4_decode_input;
 
 typedef struct {
