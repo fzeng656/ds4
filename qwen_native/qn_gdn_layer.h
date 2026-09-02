@@ -17,6 +17,7 @@ int qn_gdn_group_forward3(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const 
 #ifdef __OBJC__
 #import <Metal/Metal.h>
 int qn_gdn_group_forward3_submit_host(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+int qn_gdn_group_forward3_submit_buffer(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,id<MTLBuffer> hyper_in,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
 #endif
 int qn_gdn_layer_warm_mps64(qn_gdn_layer *l,char *err,size_t errlen);
 int qn_gdn_layer_reset_state(qn_gdn_layer *l);

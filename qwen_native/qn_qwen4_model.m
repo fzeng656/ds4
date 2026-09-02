@@ -29,6 +29,7 @@ static void E(char *e,size_t n,const char *s){if(e&&n)snprintf(e,n,"%s",s?s:"mod
 static double msnow(void){static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);return (double)mach_absolute_time()*tb.numer/tb.denom/1e6;}
 static int is_qsa(uint32_t i){return i<48 && (i&3u)==3u;}
 static int gpu_block4_enabled(void){const char*v=getenv("QN_GPU_BLOCK4");return !v||v[0]!='0';}
+static int gpu_trunk_chain_enabled(void){const char*v=getenv("QN_GPU_TRUNK_CHAIN"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
 #define QN_QWEN4_PRODUCTION_CONTEXT 8192u
 static uint64_t qsa_bytes_for(size_t cap){return (uint64_t)cap*(128u+512u+512u)*sizeof(float);}
 
@@ -116,9 +117,30 @@ int qn_qwen4_model_seed_qsa_cache(qn_qwen4_model *m,uint32_t i,uint32_t tokens,c
     if(!m||!is_qsa(i)||(!idx&&tokens)||(!k&&tokens)||(!v&&tokens)){E(e,n,"invalid QSA cache seed");return -1;}if(ensure_qsa_cache(m,i,tokens?tokens:1,e,n))return -1;if(tokens){memcpy(m->qsa_index[i],idx,(size_t)tokens*128*4);memcpy(m->qsa_key[i],k,(size_t)tokens*512*4);memcpy(m->qsa_value[i],v,(size_t)tokens*512*4);}return 0;
 }
 
+static int run_trunk_gpu_chain_from4(qn_qwen4_model*m,float h[10240],char*e,size_t n){
+ @autoreleasepool{
+  __strong id<MTLCommandBuffer> cbs[32]={nil};uint32_t nc=0;id<MTLBuffer>buf=nil;id<MTLCommandBuffer>cb=nil;id<MTLCommandQueue>queue=nil;
+  for(uint32_t i=4;i<48;i+=4){uint32_t qi=i+3;
+   if(qn_qwen4_model_ensure_layer(m,i,e,n)||qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n)||qn_qwen4_model_ensure_layer(m,qi,e,n))return -1;
+   if(ensure_qsa_cache(m,qi,(size_t)m->position+1,e,n))return -1;
+   if(i==4){if(qn_gdn_group_forward3_submit_host(m->gdn[i],m->gdn[i+1],m->gdn[i+2],h,&buf,&cb,e,n))return -1;queue=cb.commandQueue;}
+   else if(qn_gdn_group_forward3_submit_buffer(m->gdn[i],m->gdn[i+1],m->gdn[i+2],buf,queue,&buf,&cb,e,n))return -1;
+   cbs[nc++]=cb;qn_qwen4_layer_set_command_queue(m->qsa[qi],queue);
+   qn_qwen4_decode_input in={NULL,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position};
+   if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[qi],buf,&in,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  }
+  if(!nc||!buf){E(e,n,"empty GPU trunk chain");return -1;}[cbs[nc-1] waitUntilCompleted];
+  for(uint32_t j=0;j<nc;j++)if(cbs[j].status==MTLCommandBufferStatusError){E(e,n,cbs[j].error.description.UTF8String);return -1;}
+  memcpy(h,buf.contents,10240*4);
+  for(uint32_t qi=7;qi<48;qi+=4){float*ci=m->qsa_index[qi]+(size_t)m->position*128,*ck=m->qsa_key[qi]+(size_t)m->position*512,*cv=m->qsa_value[qi]+(size_t)m->position*512;if(qn_qwen4_layer_copy_current_cache(m->qsa[qi],ci,ck,cv)){E(e,n,"QSA cache mirror failed");return -1;}}
+ }
+ return 0;
+}
+
 static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
     float next[10240];
     for(uint32_t i=0;i<48;i++){
+        if(i==4 && gpu_trunk_chain_enabled())return run_trunk_gpu_chain_from4(m,h,e,n);
         if(i==1){if(qn_qwen4_model_ensure_ple(m,e,n))return -1;float po[10240];qn_ple_input pi={0};pi.hyper_state=h;pi.token_history[0]=m->ple_token_history[0];pi.token_history[1]=m->ple_token_history[1];pi.token_history[2]=(int64_t)token;pi.conv_state=m->ple_conv;qn_ple_output py={0};py.ple_output=po;if(qn_ple_layer_forward(m->ple,&pi,&py,e,n))return -1;for(uint32_t j=0;j<10240;j++)h[j]+=po[j];}
         if(i>=4 && (i%4)==0){
             if(qn_qwen4_model_ensure_layer(m,i,e,n)||qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n))return -1;

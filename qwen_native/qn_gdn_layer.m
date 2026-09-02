@@ -441,6 +441,17 @@ int qn_gdn_group_forward3_submit_host(qn_gdn_layer*a,qn_gdn_layer*b,qn_gdn_layer
  return 0;
 }
 
+int qn_gdn_group_forward3_submit_buffer(qn_gdn_layer*a,qn_gdn_layer*b,qn_gdn_layer*c,id<MTLBuffer>hyper_in,id<MTLCommandQueue>queue,id<MTLBuffer>*gpu_out,id<MTLCommandBuffer>*submitted,char*e,size_t n){
+ if(!a||!b||!c||!hyper_in||!queue||!gpu_out||!submitted){E(e,n,"invalid GDN buffer submit args");return -1;}
+ @autoreleasepool{
+  if(a->device.registryID!=b->device.registryID||a->device.registryID!=c->device.registryID){E(e,n,"GDN buffer submit device mismatch");return -1;}
+  id<MTLCommandBuffer>cb=[queue commandBuffer];id<MTLComputeCommandEncoder>ce=[cb computeCommandEncoder];
+  if(qn_gdn_encode_full(a,ce,hyper_in,a->mfinal,e,n)||qn_gdn_encode_full(b,ce,a->mfinal,b->mfinal,e,n)||qn_gdn_encode_full(c,ce,b->mfinal,c->mfinal,e,n)){[ce endEncoding];return -1;}
+  [ce endEncoding];[cb commit];*gpu_out=c->mfinal;*submitted=cb;
+ }
+ return 0;
+}
+
 int qn_gdn_layer_forward_full(qn_gdn_layer*l,const qn_gdn_decode_input*in,qn_gdn_decode_output*out,char*e,size_t n){
  if(!l||!in||!out||!in->hyper_state||!out->hyper_state){E(e,n,"invalid forward args");return -1;}
  @autoreleasepool{
