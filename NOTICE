@@ -25,7 +25,15 @@ Used in qwen-native-runtime (`qwen_native/qn_qwen4_layer.m`):
     runtime uses an FP32-specific BQ=32/BK=16 geometry to fit Apple GPU
     threadgroup-memory limits while preserving this runtime's FP32 Q/K/V path.
 
-MIT License (mlx-serve)
+MLX `sdpa_vector` decode layout
+Copyright © 2024 Apple Inc. and MLX contributors.
+Licensed under the MIT License.
+
+Used in qwen-native-runtime (`qwen_native/qn_qwen4_layer.m`):
+  * `sparse_attn_vector_decode` adapts MLX's 32-simdgroup online-softmax
+    vector-attention layout to QSA's selected-token ID list and FP32 cache.
+
+MIT License (mlx-serve and MLX-derived portions)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
