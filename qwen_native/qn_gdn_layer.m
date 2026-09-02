@@ -28,6 +28,7 @@ struct qn_gdn_layer {
 static void E(char*e,size_t n,const char*s){if(e&&n)snprintf(e,n,"%s",s?s:"gdn runtime error");}
 static double msnow(void){static mach_timebase_info_data_t tb;if(!tb.denom)mach_timebase_info(&tb);return (double)mach_absolute_time()*tb.numer/tb.denom/1e6;}
 static int gdn_proj4_fused_enabled(void){const char*v=getenv("QN_GDN_PROJ4_FUSED");return !v||v[0]!='0';}
+static int small_batch_bm32_enabled(void){const char*v=getenv("QN_SMALL_BATCH_BM32");return v&&v[0]!='0';}
 static NSString*src(void){return @R"METAL(
 #include <metal_stdlib>
 using namespace metal;inline float bf16f(ushort v){return as_type<float>((uint)v<<16);}inline float sigm(float x){return 1.0f/(1.0f+exp(-x));}
@@ -340,7 +341,7 @@ static int qn_gdn_encode_mlp_batch(qn_gdn_layer*l,id<MTLCommandBuffer>cb,id<MTLC
  [ce setComputePipelineState:mx];[ce setBuffer:xn offset:0 atIndex:0];[ce setBuffer:mw offset:0 atIndex:1];[ce setBuffer:mixed offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
  [ce setComputePipelineState:ij];[ce setBuffer:l->miw.buffer offset:0 atIndex:0];[ce setBuffer:xn offset:0 atIndex:1];[ce setBuffer:inj offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*4*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
  enc_rows4(ce,qr,&l->router,mixed,router,512,2560,T);[ce setComputePipelineState:rt];[ce setBuffer:router offset:0 atIndex:0];[ce setBuffer:topids offset:0 atIndex:1];[ce setBuffer:topws offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreadgroups:MTLSizeMake(T,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
- if(T==64&&l->moe_gather_bm32){
+ if((T==64||(T>=2&&T<=8&&small_batch_bm32_enabled()))&&l->moe_gather_bm32){
   uint32_t A=T*10;id<MTLBuffer>sid=batchbuf(l,@"moe_sid",A*4),sorig=batchbuf(l,@"moe_sorig",A*4),inv=batchbuf(l,@"moe_inv",A*4),xbf=batchbuf(l,@"moe_xbf",(NSUInteger)A*2560*2),gbf=batchbuf(l,@"moe_gbf",(NSUInteger)A*640*2),ubf=batchbuf(l,@"moe_ubf",(NSUInteger)A*640*2),actbf=batchbuf(l,@"moe_actbf",(NSUInteger)A*640*2),dbf=batchbuf(l,@"moe_dbf",(NSUInteger)A*2560*2);if(!sid||!sorig||!inv||!xbf||!gbf||!ubf||!actbf||!dbf){E(e,n,"sorted MoE scratch allocation failed");return -1;}
   id sp=pp(l,@"moe_sort1024",&x),pk=pp(l,@"moe_pack_bf16",&x),sg=pp(l,@"moe_swiglu_bf16",&x),rd=pp(l,@"moe_reduce_sorted",&x);if(!sp||!pk||!sg||!rd){E(e,n,x.description.UTF8String);return -1;}
   [ce setComputePipelineState:sp];[ce setBuffer:topids offset:0 atIndex:0];[ce setBuffer:sid offset:0 atIndex:1];[ce setBuffer:sorig offset:0 atIndex:2];[ce setBuffer:inv offset:0 atIndex:3];[ce setBytes:&T length:4 atIndex:4];[ce dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];

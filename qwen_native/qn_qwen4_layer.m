@@ -53,6 +53,7 @@ static double now_ms(void){static mach_timebase_info_data_t tb;if(!tb.denom)mach
 #define QN_QSA_RESIDENT_CAP 8192u
 static int qsa_resident_cache_enabled(void){const char*v=getenv("QN_QSA_RESIDENT_CACHE");return !v||strcmp(v,"0")!=0;}
 static int qsa_vector_attn_enabled(void){const char*v=getenv("QN_QSA_VECTOR_ATTN");return !v||strcmp(v,"0")!=0;}
+static int small_batch_bm32_enabled(void){const char*v=getenv("QN_SMALL_BATCH_BM32");return v&&v[0]!='0';}
 
 static NSString *kernel_source(void){return @R"METAL(
 #include <metal_stdlib>
@@ -410,7 +411,7 @@ static int qn_qwen4_encode_mlp_batch(qn_qwen4_layer*l,id<MTLComputeCommandEncode
  [ce setComputePipelineState:mx];[ce setBuffer:xn offset:0 atIndex:0];[ce setBuffer:mw offset:0 atIndex:1];[ce setBuffer:mixed offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*2560,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
  [ce setComputePipelineState:ij];[ce setBuffer:l->mlp_inject_weight.buffer offset:0 atIndex:0];[ce setBuffer:xn offset:0 atIndex:1];[ce setBuffer:inj offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreads:MTLSizeMake((NSUInteger)T*4*32,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
  encode_affine_rows4(ce,qr,&l->router_view,mixed,router,512,2560,T);[ce setComputePipelineState:rt];[ce setBuffer:router offset:0 atIndex:0];[ce setBuffer:topids offset:0 atIndex:1];[ce setBuffer:topws offset:0 atIndex:2];[ce setBytes:&T length:4 atIndex:3];[ce dispatchThreadgroups:MTLSizeMake(T,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
- if(T==64&&l->moe_gather_bm32){
+ if((T==64||(T>=2&&T<=8&&small_batch_bm32_enabled()))&&l->moe_gather_bm32){
   uint32_t A=T*10;id<MTLBuffer>sid=scratch(l,@"qmoe_sid",A*4),sorig=scratch(l,@"qmoe_sorig",A*4),inv=scratch(l,@"qmoe_inv",A*4),xbf=scratch(l,@"qmoe_xbf",(NSUInteger)A*2560*2),gbf=scratch(l,@"qmoe_gbf",(NSUInteger)A*640*2),ubf=scratch(l,@"qmoe_ubf",(NSUInteger)A*640*2),actbf=scratch(l,@"qmoe_actbf",(NSUInteger)A*640*2),dbf=scratch(l,@"qmoe_dbf",(NSUInteger)A*2560*2);if(!sid||!sorig||!inv||!xbf||!gbf||!ubf||!actbf||!dbf){seterr(err,errlen,"QSA sorted MoE scratch allocation failed");return -1;}
   id sp=pipeline_for(l,@"qmoe_sort1024",&e),pk=pipeline_for(l,@"qmoe_pack_bf16",&e),sg=pipeline_for(l,@"qmoe_swiglu_bf16",&e),rd=pipeline_for(l,@"qmoe_reduce_sorted",&e);if(!sp||!pk||!sg||!rd){seterr(err,errlen,e.description.UTF8String);return -1;}
   [ce setComputePipelineState:sp];[ce setBuffer:topids offset:0 atIndex:0];[ce setBuffer:sid offset:0 atIndex:1];[ce setBuffer:sorig offset:0 atIndex:2];[ce setBuffer:inv offset:0 atIndex:3];[ce setBytes:&T length:4 atIndex:4];[ce dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1024,1,1)];
