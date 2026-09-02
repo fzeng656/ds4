@@ -12,6 +12,7 @@ typedef struct {
     uint32_t layer_index;
     const char *model_dir;      /* Phase3A: preferred manifest-backed path */
     const char *manifest_path;  /* phase0 qwen38fn_manifest.json */
+    const char *tensor_prefix;  /* optional exact prefix, e.g. language_model.mtp.layers.0 */
 } qn_qwen4_layer_config;
 
 typedef struct {
