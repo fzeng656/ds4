@@ -61,6 +61,11 @@ int qn_qwen4_layer_forward_decode(qn_qwen4_layer *layer,
                                   const qn_qwen4_decode_input *input,
                                   qn_qwen4_decode_output *output,
                                   char *err, size_t errlen);
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+void qn_qwen4_layer_set_command_queue(qn_qwen4_layer *layer,id<MTLCommandQueue> queue);
+int qn_qwen4_layer_forward_decode_buffer(qn_qwen4_layer *layer,id<MTLBuffer> hyper_buffer,const qn_qwen4_decode_input *input,qn_qwen4_decode_output *output,char *err,size_t errlen);
+#endif
 int qn_qwen4_layer_warm_mps64(qn_qwen4_layer *l,char *err,size_t errlen);
 int qn_qwen4_layer_prefill_mps_enabled(qn_qwen4_layer *l);
 int qn_qwen4_layer_moe_bm32_enabled(qn_qwen4_layer *l);
