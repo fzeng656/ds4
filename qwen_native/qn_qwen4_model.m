@@ -30,6 +30,7 @@ static double msnow(void){static mach_timebase_info_data_t tb;if(!tb.denom)mach_
 static int is_qsa(uint32_t i){return i<48 && (i&3u)==3u;}
 static int gpu_block4_enabled(void){const char*v=getenv("QN_GPU_BLOCK4");return !v||v[0]!='0';}
 static int gpu_trunk_chain_enabled(void){const char*v=getenv("QN_GPU_TRUNK_CHAIN"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
+static int gpu_full_trunk_enabled(void){const char*v=getenv("QN_GPU_FULL_TRUNK"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
 #define QN_QWEN4_PRODUCTION_CONTEXT 8192u
 static uint64_t qsa_bytes_for(size_t cap){return (uint64_t)cap*(128u+512u+512u)*sizeof(float);}
 
@@ -117,6 +118,25 @@ int qn_qwen4_model_seed_qsa_cache(qn_qwen4_model *m,uint32_t i,uint32_t tokens,c
     if(!m||!is_qsa(i)||(!idx&&tokens)||(!k&&tokens)||(!v&&tokens)){E(e,n,"invalid QSA cache seed");return -1;}if(ensure_qsa_cache(m,i,tokens?tokens:1,e,n))return -1;if(tokens){memcpy(m->qsa_index[i],idx,(size_t)tokens*128*4);memcpy(m->qsa_key[i],k,(size_t)tokens*512*4);memcpy(m->qsa_value[i],v,(size_t)tokens*512*4);}return 0;
 }
 
+static int run_trunk_gpu_full(qn_qwen4_model*m,uint32_t token,float h[10240],char*e,size_t n){
+ @autoreleasepool{
+  __strong id<MTLCommandBuffer> cbs[40]={nil};uint32_t nc=0;id<MTLBuffer>buf=nil;id<MTLCommandBuffer>cb=nil;id<MTLCommandQueue>queue=nil;
+  if(qn_qwen4_model_ensure_layer(m,0,e,n)||qn_qwen4_model_ensure_ple(m,e,n)||qn_qwen4_model_ensure_layer(m,1,e,n)||qn_qwen4_model_ensure_layer(m,2,e,n)||qn_qwen4_model_ensure_layer(m,3,e,n))return -1;
+  if(ensure_qsa_cache(m,3,(size_t)m->position+1,e,n))return -1;
+  if(qn_gdn_layer_submit_host(m->gdn[0],h,nil,&buf,&cb,e,n))return -1;queue=cb.commandQueue;cbs[nc++]=cb;
+  int64_t ph[3]={m->ple_token_history[0],m->ple_token_history[1],(int64_t)token};if(qn_ple_layer_submit_buffer(m->ple,buf,ph,m->ple_conv,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  if(qn_gdn_layer_submit_buffer(m->gdn[1],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  if(qn_gdn_layer_submit_buffer(m->gdn[2],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  qn_qwen4_layer_set_command_queue(m->qsa[3],queue);qn_qwen4_decode_input in3={NULL,m->qsa_index[3],m->qsa_key[3],m->qsa_value[3],m->position};if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[3],buf,&in3,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  for(uint32_t i=4;i<48;i+=4){uint32_t qi=i+3;if(qn_qwen4_model_ensure_layer(m,i,e,n)||qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n)||qn_qwen4_model_ensure_layer(m,qi,e,n))return -1;if(ensure_qsa_cache(m,qi,(size_t)m->position+1,e,n))return -1;
+   if(qn_gdn_group_forward3_submit_buffer(m->gdn[i],m->gdn[i+1],m->gdn[i+2],buf,queue,&buf,&cb,e,n))return -1;cbs[nc++]=cb;qn_qwen4_layer_set_command_queue(m->qsa[qi],queue);qn_qwen4_decode_input in={NULL,m->qsa_index[qi],m->qsa_key[qi],m->qsa_value[qi],m->position};if(qn_qwen4_layer_forward_decode_buffer_submit(m->qsa[qi],buf,&in,&buf,&cb,e,n))return -1;cbs[nc++]=cb;
+  }
+  [cbs[nc-1] waitUntilCompleted];for(uint32_t j=0;j<nc;j++)if(cbs[j].status==MTLCommandBufferStatusError){E(e,n,cbs[j].error.description.UTF8String);return -1;}memcpy(h,buf.contents,10240*4);if(qn_ple_layer_copy_state(m->ple,m->ple_conv)){E(e,n,"PLE state mirror failed");return -1;}
+  for(uint32_t qi=3;qi<48;qi+=4){float*ci=m->qsa_index[qi]+(size_t)m->position*128,*ck=m->qsa_key[qi]+(size_t)m->position*512,*cv=m->qsa_value[qi]+(size_t)m->position*512;if(qn_qwen4_layer_copy_current_cache(m->qsa[qi],ci,ck,cv)){E(e,n,"QSA cache mirror failed");return -1;}}
+ }
+ return 0;
+}
+
 static int run_trunk_gpu_chain_from4(qn_qwen4_model*m,float h[10240],char*e,size_t n){
  @autoreleasepool{
   __strong id<MTLCommandBuffer> cbs[32]={nil};uint32_t nc=0;id<MTLBuffer>buf=nil;id<MTLCommandBuffer>cb=nil;id<MTLCommandQueue>queue=nil;
@@ -138,6 +158,7 @@ static int run_trunk_gpu_chain_from4(qn_qwen4_model*m,float h[10240],char*e,size
 }
 
 static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
+    if(gpu_full_trunk_enabled())return run_trunk_gpu_full(m,token,h,e,n);
     float next[10240];
     for(uint32_t i=0;i<48;i++){
         if(i==4 && gpu_trunk_chain_enabled())return run_trunk_gpu_chain_from4(m,h,e,n);

@@ -452,6 +452,13 @@ int qn_gdn_group_forward3_submit_buffer(qn_gdn_layer*a,qn_gdn_layer*b,qn_gdn_lay
  return 0;
 }
 
+int qn_gdn_layer_submit_buffer(qn_gdn_layer*l,id<MTLBuffer>hyper_in,id<MTLCommandQueue>queue,id<MTLBuffer>*gpu_out,id<MTLCommandBuffer>*submitted,char*e,size_t n){
+ if(!l||!hyper_in||!queue||!gpu_out||!submitted){E(e,n,"invalid GDN layer submit args");return -1;}@autoreleasepool{id<MTLCommandBuffer>cb=[queue commandBuffer];id<MTLComputeCommandEncoder>ce=[cb computeCommandEncoder];if(qn_gdn_encode_full(l,ce,hyper_in,l->mfinal,e,n)){[ce endEncoding];return -1;}[ce endEncoding];[cb commit];*gpu_out=l->mfinal;*submitted=cb;}return 0;
+}
+int qn_gdn_layer_submit_host(qn_gdn_layer*l,const float*hyper_in,id<MTLCommandQueue>queue,id<MTLBuffer>*gpu_out,id<MTLCommandBuffer>*submitted,char*e,size_t n){
+ if(!l||!hyper_in||!gpu_out||!submitted){E(e,n,"invalid GDN layer host submit args");return -1;}memcpy(l->hb.contents,hyper_in,40960);return qn_gdn_layer_submit_buffer(l,l->hb,queue?queue:l->queue,gpu_out,submitted,e,n);
+}
+
 int qn_gdn_layer_forward_full(qn_gdn_layer*l,const qn_gdn_decode_input*in,qn_gdn_decode_output*out,char*e,size_t n){
  if(!l||!in||!out||!in->hyper_state||!out->hyper_state){E(e,n,"invalid forward args");return -1;}
  @autoreleasepool{
