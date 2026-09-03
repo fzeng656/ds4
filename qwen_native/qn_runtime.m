@@ -89,7 +89,8 @@ int qn_runtime_configure_from_env(qn_runtime_config_status *status,char *err,siz
        qn_set_default_env("QN_PREFILL_GPU_FULL_TRUNK","1",err,errlen) ||
        qn_set_default_env("QN_QSA_BATCH_SELECTOR","1",err,errlen) ||
        qn_set_default_env("QN_QSA_VECTOR_BATCH","1",err,errlen) ||
-       qn_set_default_env("QN_QSA_MSV_F32_MASKED","1",err,errlen))return -1;
+       qn_set_default_env("QN_QSA_MSV_F32_MASKED","1",err,errlen) ||
+       qn_set_default_env("QN_QSA_MSV_F32_BQ64","1",err,errlen))return -1;
     if(setenv("QN_PREFILL_MPS","1",1)){qn_err(err,errlen,"cannot enable stable MPS prefill");return -1;}
     if(status)status->prefill_mps_enabled=1;
     char mp[1024]={0}; int found=qn_find_bundled_moe_metallib(mp);
