@@ -213,9 +213,9 @@ int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
     if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}if(count>QN_QWEN4_PRODUCTION_CONTEXT || (uint64_t)m->position+count>QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"prefill exceeds production context limit (8192 tokens)");return -1;}
-    /* Production/model-owner prefill defaults to the validated 64-token chunk.
-       QN_PREFILL_CHUNK is a research seam for larger-batch parity sweeps; the
-       default remains fail-safe 64 until a larger shape is validated. */
+    /* Stable runtime config now supplies the validated 2048-token Phase6 chunk.
+       Keep 64 here as the non-stable/fallback default; QN_PREFILL_CHUNK remains
+       an explicit rollback/shape override. */
     size_t prefill_chunk=64;const char*pc=getenv("QN_PREFILL_CHUNK");if(pc&&*pc){char*ep=NULL;unsigned long v=strtoul(pc,&ep,10);if(ep&&*ep==0&&v>=2&&v<=QN_QWEN4_PRODUCTION_CONTEXT)prefill_chunk=(size_t)v;}
     if(count>prefill_chunk){
         size_t off=0;double ps=0,ls=0,ts=0;qn_qwen4_prefill_output part={0};

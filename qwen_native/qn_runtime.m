@@ -11,6 +11,11 @@
 #include <mach-o/dyld.h>
 
 static void qn_err(char *err,size_t n,const char *msg){ if(err&&n) snprintf(err,n,"%s",msg); }
+static int qn_set_default_env(const char *key,const char *value,char *err,size_t errlen){
+    if(getenv(key)!=NULL)return 0;
+    if(setenv(key,value,0)){char msg[256];snprintf(msg,sizeof(msg),"cannot configure stable default %s",key);qn_err(err,errlen,msg);return -1;}
+    return 0;
+}
 
 static int qn_regular_readable(const char *p){
     struct stat st; return p&&*p&&stat(p,&st)==0&&S_ISREG(st.st_mode)&&access(p,R_OK)==0;
@@ -75,6 +80,15 @@ int qn_runtime_configure_from_env(qn_runtime_config_status *status,char *err,siz
     const char *mode=getenv("QN_RUNTIME_MODE");
     if(!mode||strcmp(mode,"stable"))return 0;
     if(status)status->stable_mode=1;
+    /* Phase6 validated production prefill defaults. Explicit caller settings
+       always win, so every fast-path component remains independently rollbackable. */
+    if(qn_set_default_env("QN_PREFILL_CHUNK","2048",err,errlen) ||
+       qn_set_default_env("QN_GDN_SHARED_BATCH_POOL","1",err,errlen) ||
+       qn_set_default_env("QN_P1_BF16_DENSE","1",err,errlen) ||
+       qn_set_default_env("QN_P1_SORTED_MOE","1",err,errlen) ||
+       qn_set_default_env("QN_PREFILL_GPU_FULL_TRUNK","1",err,errlen) ||
+       qn_set_default_env("QN_QSA_BATCH_SELECTOR","1",err,errlen) ||
+       qn_set_default_env("QN_QSA_VECTOR_BATCH","1",err,errlen))return -1;
     if(setenv("QN_PREFILL_MPS","1",1)){qn_err(err,errlen,"cannot enable stable MPS prefill");return -1;}
     if(status)status->prefill_mps_enabled=1;
     char mp[1024]={0}; int found=qn_find_bundled_moe_metallib(mp);
