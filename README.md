@@ -1677,14 +1677,21 @@ the runtime searches the executable-relative install locations, the repository
 layout, and `QN_RUNTIME_ROOT`. An explicitly configured but unreadable
 `QN_MOE_METALLIB` is an error in stable mode.
 
+For production prefill batches (`T >= 256`), the stable runtime now uses the
+expert-aligned BM32 specialization by default. It builds one BM32 tile list per
+expert, avoiding cross-expert recomputation while preserving the existing BF16
+NAX arithmetic. Set `QN_MOE_ALIGNED_BM32=0` only as a rollback/debug override.
+The original BM32 specialization remains bundled for small batches and rollback.
+
 The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
 self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it
 from MLX headers with Metal 4 and a macOS 26.2 deployment target; regeneration
 is not required on production startup. Experimental q8 NAX projection kernels
 are intentionally not part of the stable profile.
 
-Production/model-owner prefill is scheduled in fixed **64-token chunks** up to
-the verified **8192-token total context**. Chunking keeps retained scratch
+Stable production prefill is scheduled in validated **2048-token chunks** by default up to
+the verified **8192-token total context** (`QN_PREFILL_CHUNK` remains an explicit
+rollback/shape override). Chunking keeps retained scratch
 bounded independently of prompt length, stays on the warmed MPS/BM32 shape, and
 carries GDN recurrent state, PLE history, and QSA caches across chunk
 boundaries. Layer-level APIs remain available for larger research batches.
