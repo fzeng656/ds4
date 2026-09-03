@@ -33,6 +33,7 @@ clang -O2 -fobjc-arc -Wall -Wextra -DQN_DISABLE_SOURCE_METALLIB_FALLBACK=1 -I "$
   -framework Foundation -framework Metal -o "$BIN/qn_runtime_probe"
 
 cp "$ROOT/qwen_native/kernels/qn_gather_bm32.metallib" "$SHARE/qn_gather_bm32.metallib"
+cp "$ROOT/qwen_native/kernels/qn_prefill_nax.metallib" "$SHARE/qn_prefill_nax.metallib"
 cp "$ROOT/NOTICE" "$SHARE/NOTICE"
 cp "$ROOT/LICENSE" "$SHARE/LICENSE"
 cp "$ROOT/LICENSE-APACHE-2.0" "$SHARE/LICENSE-APACHE-2.0"

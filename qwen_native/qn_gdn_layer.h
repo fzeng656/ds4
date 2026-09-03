@@ -13,6 +13,11 @@ int qn_gdn_layer_forward_mlp_batch(qn_gdn_layer *l,const float *hyper_states,uin
 int qn_gdn_layer_forward_full_batch(qn_gdn_layer *l,const float *hyper_states,uint32_t tokens,float *hyper_outputs,char *err,size_t errlen);
 int qn_gdn_layer_forward_full(qn_gdn_layer *l,const qn_gdn_decode_input *in,qn_gdn_decode_output *out,char *err,size_t errlen);
 int qn_gdn_group_forward3_batch(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,uint32_t tokens,float *hyper_out,char *err,size_t errlen);
+int qn_gdn_group_forward3_batch_submit_host(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,uint32_t tokens,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+int qn_gdn_group_forward3_batch_submit_buffer(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,id<MTLBuffer> hyper_in,uint32_t tokens,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+id<MTLCommandQueue> qn_gdn_layer_command_queue(qn_gdn_layer *l);
+int qn_gdn_layer_batch_submit_host(qn_gdn_layer *l,const float *hyper_in,uint32_t tokens,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+int qn_gdn_layer_batch_submit_buffer(qn_gdn_layer *l,id<MTLBuffer> hyper_in,uint32_t tokens,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
 int qn_gdn_group_forward3(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,const float *hyper_in,float *hyper_out,char *err,size_t errlen);
 #ifdef __OBJC__
 #import <Metal/Metal.h>
@@ -20,11 +25,13 @@ int qn_gdn_group_forward3_submit_host(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_lay
 int qn_gdn_group_forward3_submit_buffer(qn_gdn_layer *a,qn_gdn_layer *b,qn_gdn_layer *c,id<MTLBuffer> hyper_in,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
 int qn_gdn_layer_submit_host(qn_gdn_layer *l,const float *hyper_in,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
 int qn_gdn_layer_submit_buffer(qn_gdn_layer *l,id<MTLBuffer> hyper_in,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+void qn_gdn_layer_set_batch_pool(qn_gdn_layer *l,NSMutableDictionary *pool);
 #endif
 int qn_gdn_layer_warm_mps64(qn_gdn_layer *l,char *err,size_t errlen);
 int qn_gdn_layer_reset_state(qn_gdn_layer *l);
 int qn_gdn_layer_prefill_mps_enabled(qn_gdn_layer *l);
 int qn_gdn_layer_moe_bm32_enabled(qn_gdn_layer *l);
+void qn_gdn_layer_release_batch_buffers(qn_gdn_layer *l);
 #ifdef __OBJC__
 int qn_gdn_layer_encode_state_copy_to_shadow(qn_gdn_layer *l,id<MTLBlitCommandEncoder> blit);
 void qn_gdn_layer_swap_state_buffers(qn_gdn_layer *l);

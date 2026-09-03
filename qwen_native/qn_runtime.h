@@ -32,7 +32,9 @@ typedef struct {
     int stable_mode;
     int prefill_mps_enabled;
     int moe_metallib_configured;
+    int prefill_metallib_configured;
     char moe_metallib_path[1024];
+    char prefill_metallib_path[1024];
 } qn_runtime_config_status;
 
 /* Production configuration is opt-in through QN_RUNTIME_MODE=stable.

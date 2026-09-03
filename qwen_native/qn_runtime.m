@@ -56,6 +56,19 @@ static int qn_find_bundled_moe_metallib(char out[1024]){
 #endif
     return 0;
 }
+static int qn_find_bundled_prefill_metallib(char out[1024]){
+    const char *explicit_path=getenv("QN_PREFILL_METALLIB");
+    if(explicit_path&&*explicit_path)return qn_copy_if_file(out,explicit_path)?1:-1;
+    const char *root=getenv("QN_RUNTIME_ROOT");
+    if(root&&*root&&qn_join_candidate(out,root,"qwen_native/kernels/qn_prefill_nax.metallib"))return 1;
+    uint32_t cap=PATH_MAX;char exe[PATH_MAX];
+    if(_NSGetExecutablePath(exe,&cap)==0){char absbuf[PATH_MAX];if(realpath(exe,absbuf))snprintf(exe,sizeof(exe),"%s",absbuf);qn_parent_dir(exe);if(qn_join_candidate(out,exe,"qwen_native/kernels/qn_prefill_nax.metallib"))return 1;if(qn_join_candidate(out,exe,"../share/qwen-native/qn_prefill_nax.metallib"))return 1;if(qn_join_candidate(out,exe,"../lib/qwen-native/qn_prefill_nax.metallib"))return 1;}
+    char cwd[PATH_MAX];if(getcwd(cwd,sizeof(cwd))&&qn_join_candidate(out,cwd,"qwen_native/kernels/qn_prefill_nax.metallib"))return 1;
+#ifndef QN_DISABLE_SOURCE_METALLIB_FALLBACK
+    char src[PATH_MAX];snprintf(src,sizeof(src),"%s",__FILE__);char srcabs[PATH_MAX];if(realpath(src,srcabs))snprintf(src,sizeof(src),"%s",srcabs);qn_parent_dir(src);if(qn_join_candidate(out,src,"kernels/qn_prefill_nax.metallib"))return 1;
+#endif
+    return 0;
+}
 
 int qn_runtime_configure_from_env(qn_runtime_config_status *status,char *err,size_t errlen){
     if(status)memset(status,0,sizeof(*status));
@@ -69,6 +82,11 @@ int qn_runtime_configure_from_env(qn_runtime_config_status *status,char *err,siz
     if(!found){qn_err(err,errlen,"stable mode requires bundled qn_gather_bm32.metallib");return -1;}
     if(setenv("QN_MOE_METALLIB",mp,1)){qn_err(err,errlen,"cannot configure stable MoE metallib");return -1;}
     if(status){status->moe_metallib_configured=1;snprintf(status->moe_metallib_path,sizeof(status->moe_metallib_path),"%s",mp);}
+    char pp[1024]={0};found=qn_find_bundled_prefill_metallib(pp);
+    if(found<0){qn_err(err,errlen,"QN_PREFILL_METALLIB is set but not a readable file");return -1;}
+    if(!found){qn_err(err,errlen,"stable mode requires bundled qn_prefill_nax.metallib");return -1;}
+    if(setenv("QN_PREFILL_METALLIB",pp,1)){qn_err(err,errlen,"cannot configure stable prefill metallib");return -1;}
+    if(status){status->prefill_metallib_configured=1;snprintf(status->prefill_metallib_path,sizeof(status->prefill_metallib_path),"%s",pp);}
     return 0;
 }
 int qn_file_map_open(qn_file_map *m,const char *path,char *err,size_t errlen){

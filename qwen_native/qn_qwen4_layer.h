@@ -65,6 +65,8 @@ int qn_qwen4_layer_forward_decode(qn_qwen4_layer *layer,
                                   char *err, size_t errlen);
 #ifdef __OBJC__
 #import <Metal/Metal.h>
+int qn_qwen4_layer_forward_prefill_batch_buffer_submit(qn_qwen4_layer *layer,id<MTLBuffer> hyper_buffer,uint32_t base_position,uint32_t tokens,const float *index_history,const float *key_history,const float *value_history,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+int qn_qwen4_layer_prefill_batch_finalize(qn_qwen4_layer *layer,id<MTLCommandBuffer> submitted,uint32_t base_position,uint32_t tokens,float *index_history,float *key_history,float *value_history,float *hyper_outputs,double *elapsed_ms,char *err,size_t errlen);
 void qn_qwen4_layer_set_command_queue(qn_qwen4_layer *layer,id<MTLCommandQueue> queue);
 int qn_qwen4_layer_forward_decode_buffer(qn_qwen4_layer *layer,id<MTLBuffer> hyper_buffer,const qn_qwen4_decode_input *input,qn_qwen4_decode_output *output,char *err,size_t errlen);
 int qn_qwen4_layer_forward_decode_buffer_submit(qn_qwen4_layer *layer,id<MTLBuffer> hyper_buffer,const qn_qwen4_decode_input *input,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
@@ -74,6 +76,7 @@ int qn_qwen4_layer_warm_mps64(qn_qwen4_layer *l,char *err,size_t errlen);
 int qn_qwen4_layer_prefill_mps_enabled(qn_qwen4_layer *l);
 int qn_qwen4_layer_moe_bm32_enabled(qn_qwen4_layer *l);
 void qn_qwen4_layer_invalidate_resident_cache(qn_qwen4_layer *l);
+void qn_qwen4_layer_release_prefill_buffers(qn_qwen4_layer *l);
 void qn_qwen4_layer_set_resident_cache_tokens(qn_qwen4_layer *l,uint32_t tokens);
 void qn_qwen4_layer_close(qn_qwen4_layer *layer);
 

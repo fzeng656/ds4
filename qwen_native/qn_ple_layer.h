@@ -12,6 +12,8 @@ int qn_ple_layer_forward_batch(qn_ple_layer *l,const float *hyper_states,const i
 #ifdef __OBJC__
 #import <Metal/Metal.h>
 int qn_ple_layer_submit_buffer(qn_ple_layer *l,id<MTLBuffer> hyper_in,const int64_t token_history[3],float *conv_state,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+int qn_ple_layer_forward_batch_buffer_submit(qn_ple_layer *l,id<MTLBuffer> hyper_in,const int64_t *token_ids,uint32_t tokens,const int64_t token_history[2],const float *conv_state,id<MTLCommandQueue> queue,id<MTLBuffer> *gpu_out,id<MTLCommandBuffer> *submitted,char *err,size_t errlen);
+int qn_ple_layer_batch_finalize(qn_ple_layer *l,id<MTLCommandBuffer> submitted,int64_t token_history[2],float *conv_state,char *err,size_t errlen);
 int qn_ple_layer_copy_state(qn_ple_layer *l,float *conv_state);
 #endif
 void qn_ple_layer_close(qn_ple_layer *l);
