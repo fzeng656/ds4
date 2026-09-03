@@ -119,7 +119,10 @@ int qn_qwen4_model_reset_session(qn_qwen4_model*m,char*e,size_t n){
     if(!m){E(e,n,"invalid model");return -1;}
     m->position=0;m->last_stream_valid=0;m->ple_token_history[0]=m->ple_token_history[1]=248044;
     if(m->ple_conv)memset(m->ple_conv,0,(size_t)10240*9*sizeof(float));
-    for(uint32_t i=0;i<48;i++)if(m->gdn[i]&&qn_gdn_layer_reset_state(m->gdn[i])){E(e,n,"GDN session reset failed");return -1;}
+    for(uint32_t i=0;i<48;i++){
+        if(m->gdn[i]&&qn_gdn_layer_reset_state(m->gdn[i])){E(e,n,"GDN session reset failed");return -1;}
+        if(m->qsa[i])qn_qwen4_layer_invalidate_resident_cache(m->qsa[i]);
+    }
     return 0;
 }
 void qn_qwen4_model_set_position(qn_qwen4_model *m,uint32_t p){if(m)m->position=p;}
