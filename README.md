@@ -1686,9 +1686,11 @@ The original BM32 specialization remains bundled for small batches and rollback.
 The QSA prefill executor also uses an adaptive BQ128/BK16 masked-attention tile
 for total context lengths up to 6144 tokens. This keeps the existing FP32
 MMA/online-softmax order bit-exact while sharing each K/V staging pass across
-twice as many query rows. Contexts above 6144 automatically retain BQ64,
-which is faster near the verified 8K limit. Set `QN_QSA_BQ128=0` to force
-the BQ64 rollback path at all lengths.
+twice as many query rows. The 512-thread BQ128 tile stages each BK16 K/V slab
+once per threadgroup (512-way staging stride), avoiding the redundant second-half
+loads of the earlier 256-stride implementation. Contexts above 6144 automatically
+retain BQ64, which is faster near the verified 8K limit. Set `QN_QSA_BQ128=0`
+to force the BQ64 rollback path at all lengths.
 
 The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
 self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it

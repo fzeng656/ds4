@@ -297,10 +297,10 @@ kernel void qsa_fa256_f32_masked_bq128(device const float*q[[buffer(0)]],device 
  float2 Qf[32];int qr=tm+sm;if(qr<qrows){device const float*row=Qp+(long)qr*24*BD;for(int d=0;d<32;d++){Qf[d]=float2(row[d*8+sn],row[d*8+sn+1]);}}else for(int d=0;d<32;d++)Qf[d]=0;
  float2 Of[32];for(int d=0;d<32;d++)Of[d]=0;float m=-3e38f,l=0;int rowpos=(int)base+q0+qr;
  int nk=((int)total+BK-1)/BK;for(int kb=0;kb<kb_lim;kb++){if(!skip[(long)qt*nk+kb])continue;int c0=kb*BK,rows=min(BK,(int)total-c0);threadgroup_barrier(mem_flags::mem_threadgroup);
-   for(int i=tid;i<BK*32;i+=256){int r=i>>5,c8=i&31;if(r<rows){device const float*src=Kp+(long)(c0+r)*2*BD+c8*8;for(int u=0;u<8;u++)Ks[(c8*8+u)*LDK+r]=src[u];}else for(int u=0;u<8;u++)Ks[(c8*8+u)*LDK+r]=0;}
+   for(int i=tid;i<BK*32;i+=512){int r=i>>5,c8=i&31;if(r<rows){device const float*src=Kp+(long)(c0+r)*2*BD+c8*8;for(int u=0;u<8;u++)Ks[(c8*8+u)*LDK+r]=src[u];}else for(int u=0;u<8;u++)Ks[(c8*8+u)*LDK+r]=0;}
    threadgroup_barrier(mem_flags::mem_threadgroup);float2 Sf[2]={0,0};int koff=sm*LDK+sn;for(int d=0;d<32;d++){float2 qv=Qf[d];int b=koff+d*8*LDK;float2 k0=float2(Ks[b],Ks[b+1]);float2 k1=float2(Ks[b+8],Ks[b+9]);qnfa_mma(Sf[0],qv,k0);qnfa_mma(Sf[1],qv,k1);}Sf[0]*=0.0625f*1.4426950408889634f;Sf[1]*=0.0625f*1.4426950408889634f;
    for(int z=0;z<2;z++)for(int jj=0;jj<2;jj++){int col=c0+z*8+sn+jj;bool bad=(qr>=qrows||col>=rows+c0||col>rowpos);if(!bad&&!mask[(long)(q0+qr)*(long)total+col])bad=true;if(bad)Sf[z][jj]=-INFINITY;}
-   threadgroup_barrier(mem_flags::mem_threadgroup);for(int i=tid;i<BK*32;i+=256){int r=i>>5,c8=i&31;device const float*src=Vp+(long)(c0+r)*2*BD+c8*8;threadgroup float*dst=Vs+r*LDV+c8*8;if(r<rows)for(int u=0;u<8;u++)dst[u]=src[u];else for(int u=0;u<8;u++)dst[u]=0;}
+   threadgroup_barrier(mem_flags::mem_threadgroup);for(int i=tid;i<BK*32;i+=512){int r=i>>5,c8=i&31;device const float*src=Vp+(long)(c0+r)*2*BD+c8*8;threadgroup float*dst=Vs+r*LDV+c8*8;if(r<rows)for(int u=0;u<8;u++)dst[u]=src[u];else for(int u=0;u<8;u++)dst[u]=0;}
    float nm=max(m,max(qnfa_rowmax(Sf[0]),qnfa_rowmax(Sf[1])));Sf[0]=exp2(Sf[0]-nm);Sf[1]=exp2(Sf[1]-nm);float fac=exp2(m-nm);for(int d=0;d<32;d++)Of[d]*=fac;l*=fac;m=nm;threadgroup_barrier(mem_flags::mem_threadgroup);
    for(int kt=0;kt<2;kt++){float2 pf=Sf[kt];l+=qnfa_rowsum(pf);int vb=(kt*8+sm)*LDV+sn;for(int d=0;d<32;d++){float2 vv=float2(Vs[vb+d*8],Vs[vb+d*8+1]);qnfa_mma(Of[d],pf,vv);}}
  }
