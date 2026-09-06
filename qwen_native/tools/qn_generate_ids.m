@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < n_prompt; ++i) prompt[i] = (uint32_t)strtoul(argv[5 + i], NULL, 10);
 
         char err[1024] = {0};
-        qn_qwen4_model_config cfg = {model_dir, manifest, ngram, 16};
+        qn_qwen4_model_config cfg = {model_dir, manifest, ngram, 65536};
         qn_qwen4_model *model = NULL;
         if (qn_qwen4_model_open(&model, &cfg, err, sizeof(err))) {
             fprintf(stderr, "open: %s\n", err); return 1;

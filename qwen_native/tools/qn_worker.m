@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     setenv("QN_RUNTIME_MODE", "stable", 1);
     @autoreleasepool {
         char err[1024] = {0};
-        qn_qwen4_model_config cfg = {argv[1], argv[2], argv[3], 16};
+        qn_qwen4_model_config cfg = {argv[1], argv[2], argv[3], 65536};
         qn_qwen4_model *model = NULL;
         if (qn_qwen4_model_open(&model, &cfg, err, sizeof(err))) {
             fprintf(stderr, "worker open: %s\n", err); return 1;

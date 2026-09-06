@@ -1695,7 +1695,7 @@ physical-history scan cost of the masked BK16 executor. For contexts beyond 16K,
 selector keeps exact top-k semantics with a hierarchical merge: each 1024-block chunk
 keeps 512 candidates, pairs are reduced back to 512, and the existing final merge
 selects the global top 512. This preserves the validated FP32 MMA/online-softmax result
-through 32K without scanning the full physical K/V history. Set `QN_QSA_GATHER_GQA=0`
+through 64K without scanning the full physical K/V history. Set `QN_QSA_GATHER_GQA=0`
 to roll long contexts back to masked BQ64, or `QN_QSA_BQ128=0` to force the BQ64 path
 below 8192.
 
@@ -1710,7 +1710,10 @@ the verified **65536-token total context** (`QN_PREFILL_CHUNK` remains an explic
 rollback/shape override). Chunking keeps retained scratch
 bounded independently of prompt length, stays on the warmed MPS/BM32 shape, and
 carries GDN recurrent state, PLE history, and QSA caches across chunk
-boundaries. Layer-level APIs remain available for larger research batches.
+boundaries. Production inference/worker binaries reserve the full 65536-token host QSA
+cache capacity up front (virtual/lazy allocation) so long prompts do not trigger geometric
+32K→64K reallocation plus full index/K/V copies under memory pressure. Layer-level APIs
+remain available for larger research batches.
 
 #### Persistent OpenAI-compatible server
 
