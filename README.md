@@ -1706,7 +1706,7 @@ is not required on production startup. Experimental q8 NAX projection kernels
 are intentionally not part of the stable profile.
 
 Stable production prefill is scheduled in validated **2048-token chunks** by default up to
-the verified **32768-token total context** (`QN_PREFILL_CHUNK` remains an explicit
+the verified **65536-token total context** (`QN_PREFILL_CHUNK` remains an explicit
 rollback/shape override). Chunking keeps retained scratch
 bounded independently of prompt length, stays on the warmed MPS/BM32 shape, and
 carries GDN recurrent state, PLE history, and QSA caches across chunk
@@ -1753,8 +1753,8 @@ Production safety rules in the current phase:
 - production chat templates use `enable_thinking=False`, so OpenAI
   `assistant.content` contains visible answer text rather than Qwen reasoning
   tokens, and multi-turn template tokenization remains prefix-reusable;
-- the stable worker enforces a 32768-token total context budget
-  (`prompt_tokens + max_tokens <= 32768`) and caps output at 2048 tokens;
+- the stable worker enforces a 65536-token total context budget
+  (`prompt_tokens + max_tokens <= 65536`) and caps output at 2048 tokens;
 - generation is greedy only. Requests that explicitly set a non-zero
   `temperature` are rejected instead of silently changing sampling semantics.
 

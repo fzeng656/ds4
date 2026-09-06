@@ -41,7 +41,7 @@ static int prefill_gpu_trunk_chain_enabled(void){const char*v=getenv("QN_PREFILL
 static int prefill_gpu_full_trunk_enabled(void){const char*v=getenv("QN_PREFILL_GPU_FULL_TRUNK");return v&&v[0]!='0';}
 static int gpu_trunk_chain_enabled(void){const char*v=getenv("QN_GPU_TRUNK_CHAIN"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
 static int gpu_full_trunk_enabled(void){const char*v=getenv("QN_GPU_FULL_TRUNK"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
-#define QN_QWEN4_PRODUCTION_CONTEXT 32768u
+#define QN_QWEN4_PRODUCTION_CONTEXT 65536u
 static uint64_t qsa_bytes_for(size_t cap){return (uint64_t)cap*(128u+512u+512u)*sizeof(float);}
 
 static int ensure_qsa_cache(qn_qwen4_model *m,uint32_t i,size_t need,char *e,size_t n){
@@ -205,17 +205,17 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
 
 int qn_qwen4_model_forward_token(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (32768 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
+    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (65536 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
 }
 
 int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_step_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (32768 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
+    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (65536 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
 }
 
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}if(count>QN_QWEN4_PRODUCTION_CONTEXT || (uint64_t)m->position+count>QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"prefill exceeds production context limit (32768 tokens)");return -1;}
+    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}if(count>QN_QWEN4_PRODUCTION_CONTEXT || (uint64_t)m->position+count>QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"prefill exceeds production context limit (65536 tokens)");return -1;}
     /* Stable runtime config now supplies the validated 2048-token Phase6 chunk.
        Keep 64 here as the non-stable/fallback default; QN_PREFILL_CHUNK remains
        an explicit rollback/shape override. */
