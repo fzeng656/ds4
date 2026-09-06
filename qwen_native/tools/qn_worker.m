@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define QN_WORKER_MAX_PROMPT 16384u
+#define QN_WORKER_MAX_PROMPT 32768u
 #define QN_WORKER_MAX_OUTPUT 2048u
 #define QN_WORKER_MAX_STOPS 32u
 

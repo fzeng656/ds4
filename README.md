@@ -1691,9 +1691,13 @@ once per threadgroup (512-way staging stride), avoiding the redundant second-hal
 loads of the earlier 256-stride implementation. Contexts above 6144 and below 8192
 retain BQ64. At 8192 tokens and above, the stable executor chronologically packs the
 selected QSA blocks and evaluates them with a compact GQA K/V gather, avoiding the
-physical-history scan cost of the masked BK16 executor while preserving the validated
-FP32 MMA/online-softmax result through 16K. Set `QN_QSA_GATHER_GQA=0` to roll long
-contexts back to masked BQ64, or `QN_QSA_BQ128=0` to force the BQ64 path below 8192.
+physical-history scan cost of the masked BK16 executor. For contexts beyond 16K, the
+selector keeps exact top-k semantics with a hierarchical merge: each 1024-block chunk
+keeps 512 candidates, pairs are reduced back to 512, and the existing final merge
+selects the global top 512. This preserves the validated FP32 MMA/online-softmax result
+through 32K without scanning the full physical K/V history. Set `QN_QSA_GATHER_GQA=0`
+to roll long contexts back to masked BQ64, or `QN_QSA_BQ128=0` to force the BQ64 path
+below 8192.
 
 The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
 self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it
@@ -1702,7 +1706,7 @@ is not required on production startup. Experimental q8 NAX projection kernels
 are intentionally not part of the stable profile.
 
 Stable production prefill is scheduled in validated **2048-token chunks** by default up to
-the verified **16384-token total context** (`QN_PREFILL_CHUNK` remains an explicit
+the verified **32768-token total context** (`QN_PREFILL_CHUNK` remains an explicit
 rollback/shape override). Chunking keeps retained scratch
 bounded independently of prompt length, stays on the warmed MPS/BM32 shape, and
 carries GDN recurrent state, PLE history, and QSA caches across chunk
@@ -1749,8 +1753,8 @@ Production safety rules in the current phase:
 - production chat templates use `enable_thinking=False`, so OpenAI
   `assistant.content` contains visible answer text rather than Qwen reasoning
   tokens, and multi-turn template tokenization remains prefix-reusable;
-- the stable worker enforces a 16384-token total context budget
-  (`prompt_tokens + max_tokens <= 16384`) and caps output at 2048 tokens;
+- the stable worker enforces a 32768-token total context budget
+  (`prompt_tokens + max_tokens <= 32768`) and caps output at 2048 tokens;
 - generation is greedy only. Requests that explicitly set a non-zero
   `temperature` are rejected instead of silently changing sampling semantics.
 

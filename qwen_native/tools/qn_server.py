@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 
 MAX_BODY = 4 * 1024 * 1024
-MAX_PROMPT_TOKENS = 16384
+MAX_PROMPT_TOKENS = 32768
 MAX_OUTPUT_TOKENS = 2048
 
 
