@@ -1689,7 +1689,7 @@ MMA/online-softmax order bit-exact while sharing each K/V staging pass across
 twice as many query rows. The 512-thread BQ128 tile stages each BK16 K/V slab
 once per threadgroup (512-way staging stride), avoiding the redundant second-half
 loads of the earlier 256-stride implementation. Contexts above 6144 automatically
-retain BQ64, which is faster near the verified 8K limit. Set `QN_QSA_BQ128=0`
+retain BQ64, which remains the validated long-context path through 16K. Set `QN_QSA_BQ128=0`
 to force the BQ64 rollback path at all lengths.
 
 The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
@@ -1699,7 +1699,7 @@ is not required on production startup. Experimental q8 NAX projection kernels
 are intentionally not part of the stable profile.
 
 Stable production prefill is scheduled in validated **2048-token chunks** by default up to
-the verified **8192-token total context** (`QN_PREFILL_CHUNK` remains an explicit
+the verified **16384-token total context** (`QN_PREFILL_CHUNK` remains an explicit
 rollback/shape override). Chunking keeps retained scratch
 bounded independently of prompt length, stays on the warmed MPS/BM32 shape, and
 carries GDN recurrent state, PLE history, and QSA caches across chunk
@@ -1746,8 +1746,8 @@ Production safety rules in the current phase:
 - production chat templates use `enable_thinking=False`, so OpenAI
   `assistant.content` contains visible answer text rather than Qwen reasoning
   tokens, and multi-turn template tokenization remains prefix-reusable;
-- the stable worker enforces an 8192-token total context budget
-  (`prompt_tokens + max_tokens <= 8192`) and caps output at 2048 tokens;
+- the stable worker enforces a 16384-token total context budget
+  (`prompt_tokens + max_tokens <= 16384`) and caps output at 2048 tokens;
 - generation is greedy only. Requests that explicitly set a non-zero
   `temperature` are rejected instead of silently changing sampling semantics.
 

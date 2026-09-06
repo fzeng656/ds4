@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define QN_WORKER_MAX_PROMPT 8192u
+#define QN_WORKER_MAX_PROMPT 16384u
 #define QN_WORKER_MAX_OUTPUT 2048u
 #define QN_WORKER_MAX_STOPS 32u
 
@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
             for (uint32_t i = 0; i < nstops; ++i) { x = next_tok(&save); if (parse_u32(x, &stops[i])) { bad = 1; break; } }
             if (bad) { printf("ERR 400 invalid_stop_id\n"); continue; }
             x = next_tok(&save); if (parse_u32(x, &nprompt) || !nprompt || nprompt > QN_WORKER_MAX_PROMPT) { printf("ERR 400 invalid_prompt_count\n"); continue; }
-            if ((uint64_t)nprompt + (uint64_t)max_tokens > 8192u) { printf("ERR 400 context_limit_exceeded\n"); continue; }
+            if ((uint64_t)nprompt + (uint64_t)max_tokens > QN_WORKER_MAX_PROMPT) { printf("ERR 400 context_limit_exceeded\n"); continue; }
             uint32_t *prompt = malloc((size_t)nprompt * sizeof(uint32_t));
             if (!prompt) { printf("FATAL allocation_failed\n"); free(line); qn_qwen4_model_close(model); return 70; }
             for (uint32_t i = 0; i < nprompt; ++i) { x = next_tok(&save); if (parse_u32(x, &prompt[i])) { bad = 1; break; } }

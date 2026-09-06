@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 
 MAX_BODY = 4 * 1024 * 1024
-MAX_PROMPT_TOKENS = 8192
+MAX_PROMPT_TOKENS = 16384
 MAX_OUTPUT_TOKENS = 2048
 
 
@@ -264,7 +264,7 @@ class Handler(BaseHTTPRequestHandler):
             st = self.app.worker.status()
             return self._send_json(HTTPStatus.OK if st["healthy"] else HTTPStatus.SERVICE_UNAVAILABLE,
                                    {"status": "ok" if st["healthy"] else "error", "worker": st,
-                                    "model": self.app.model_id, "stop_ids": self.app.stop_ids, "context_limit": MAX_PROMPT_TOKENS, "prefill_chunk": 64})
+                                    "model": self.app.model_id, "stop_ids": self.app.stop_ids, "context_limit": MAX_PROMPT_TOKENS, "prefill_chunk": 2048})
         if path == "/v1/models":
             return self._send_json(HTTPStatus.OK, {"object": "list", "data": [{"id": self.app.model_id, "object": "model", "created": 0, "owned_by": "local"}]})
         return self._error(HTTPStatus.NOT_FOUND, "not found")

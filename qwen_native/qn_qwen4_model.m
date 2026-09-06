@@ -41,7 +41,7 @@ static int prefill_gpu_trunk_chain_enabled(void){const char*v=getenv("QN_PREFILL
 static int prefill_gpu_full_trunk_enabled(void){const char*v=getenv("QN_PREFILL_GPU_FULL_TRUNK");return v&&v[0]!='0';}
 static int gpu_trunk_chain_enabled(void){const char*v=getenv("QN_GPU_TRUNK_CHAIN"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
 static int gpu_full_trunk_enabled(void){const char*v=getenv("QN_GPU_FULL_TRUNK"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
-#define QN_QWEN4_PRODUCTION_CONTEXT 8192u
+#define QN_QWEN4_PRODUCTION_CONTEXT 16384u
 static uint64_t qsa_bytes_for(size_t cap){return (uint64_t)cap*(128u+512u+512u)*sizeof(float);}
 
 static int ensure_qsa_cache(qn_qwen4_model *m,uint32_t i,size_t need,char *e,size_t n){
@@ -205,17 +205,17 @@ static int run_trunk(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,siz
 
 int qn_qwen4_model_forward_token(qn_qwen4_model *m,uint32_t token,float h[10240],char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
+    if(!m||!h||token>=248320){E(e,n,"invalid forward token args");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (16384 tokens)");return -1;}if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;return 0;
 }
 
 int qn_qwen4_model_step(qn_qwen4_model *m,uint32_t token,float *logits,qn_qwen4_step_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (8192 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
+    if(!m||!out||token>=248320){E(e,n,"invalid model step");return -1;}if(m->position>=QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"production context limit reached (16384 tokens)");return -1;}double t0=msnow();float emb[2560],h[10240];if(qn_model_io_embed(m->io,token,emb,e,n))return -1;for(int g=0;g<4;g++)memcpy(h+g*2560,emb,2560*4);if(run_trunk(m,token,h,e,n))return -1;memcpy(m->last_stream,h,sizeof(m->last_stream));m->last_stream_valid=1;double t1=msnow();uint32_t nt=0;double lm=0;if(qn_model_io_logits(m->io,h,logits,&nt,&lm,e,n))return -1;m->ple_token_history[0]=m->ple_token_history[1];m->ple_token_history[1]=(int64_t)token;m->position++;out->next_token=nt;out->trunk_ms=t1-t0;out->logits_ms=lm;out->total_ms=msnow()-t0;return 0;
 }
 
 int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_t count,float *logits,qn_qwen4_prefill_output *out,char *e,size_t n){
     if(m&&m->stable_mode&&!m->production_prepared){E(e,n,"stable runtime requires qn_qwen4_model_prepare_production before inference");return -1;}
-    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}if(count>QN_QWEN4_PRODUCTION_CONTEXT || (uint64_t)m->position+count>QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"prefill exceeds production context limit (8192 tokens)");return -1;}
+    if(!m||!tokens||!count||!out){E(e,n,"invalid prefill arguments");return -1;}if(count>QN_QWEN4_PRODUCTION_CONTEXT || (uint64_t)m->position+count>QN_QWEN4_PRODUCTION_CONTEXT){E(e,n,"prefill exceeds production context limit (16384 tokens)");return -1;}
     /* Stable runtime config now supplies the validated 2048-token Phase6 chunk.
        Keep 64 here as the non-stable/fallback default; QN_PREFILL_CHUNK remains
        an explicit rollback/shape override. */
@@ -236,7 +236,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
     for(uint32_t t=0;t<T;t++){float emb[2560];if(qn_model_io_embed(m->io,tokens[t],emb,e,n)){free(a);free(b);return -1;}for(int g=0;g<4;g++)memcpy(a+(size_t)t*10240+g*2560,emb,2560*sizeof(float));}
     int64_t ple_hist[2]={m->ple_token_history[0],m->ple_token_history[1]};
     for(uint32_t i=0;i<48;i++){
-        if(prefill_gpu_full_trunk_enabled()&&i==0&&(uint64_t)base+T<=8192){
+        if(prefill_gpu_full_trunk_enabled()&&i==0&&(uint64_t)base+T<=QN_QWEN4_PRODUCTION_CONTEXT){
             for(uint32_t j=0;j<48;j++)if(qn_qwen4_model_ensure_layer(m,j,e,n)){free(a);free(b);return -1;}if(qn_qwen4_model_ensure_ple(m,e,n)){free(a);free(b);return -1;}for(uint32_t j=3;j<48;j+=4)if(ensure_qsa_cache(m,j,(size_t)base+T,e,n)){free(a);free(b);return -1;}
             id<MTLCommandQueue>q=qn_gdn_layer_command_queue(m->gdn[0]);if(!q){free(a);free(b);E(e,n,"prefill full trunk queue unavailable");return -1;}for(uint32_t j=3;j<48;j+=4)qn_qwen4_layer_set_command_queue(m->qsa[j],q);
             int64_t*ids64=malloc((size_t)T*sizeof(int64_t));if(!ids64){free(a);free(b);E(e,n,"prefill full trunk PLE ids allocation failed");return -1;}for(uint32_t t=0;t<T;t++)ids64[t]=(int64_t)tokens[t];
@@ -257,7 +257,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
             for(size_t z=0;z<elems;z++)a[z]+=po[z];free(po);free(ids64);
         }
         if(qn_qwen4_model_ensure_layer(m,i,e,n)){free(a);free(b);return -1;}
-        if(prefill_gpu_trunk_chain_enabled()&&i==4&&(uint64_t)base+T<=8192){
+        if(prefill_gpu_trunk_chain_enabled()&&i==4&&(uint64_t)base+T<=QN_QWEN4_PRODUCTION_CONTEXT){
             for(uint32_t j=4;j<48;j++)if(qn_qwen4_model_ensure_layer(m,j,e,n)){free(a);free(b);return -1;}for(uint32_t j=7;j<48;j+=4)if(ensure_qsa_cache(m,j,(size_t)base+T,e,n)){free(a);free(b);return -1;}
             id<MTLCommandQueue>q=qn_gdn_layer_command_queue(m->gdn[4]);if(!q){free(a);free(b);E(e,n,"prefill GPU trunk queue unavailable");return -1;}for(uint32_t j=7;j<48;j+=4)qn_qwen4_layer_set_command_queue(m->qsa[j],q);
             id<MTLBuffer>cur=nil,gb=nil,qb=nil;id<MTLCommandBuffer>gcb[11]={0},qcb[11]={0};uint32_t qidx[11]={0};double _ct=msnow();int bi=0;
@@ -265,7 +265,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
             [qcb[10] waitUntilCompleted];if(qcb[10].status==MTLCommandBufferStatusError){E(e,n,qcb[10].error.description.UTF8String);free(a);free(b);return -1;}for(int k=0;k<11;k++){if(gcb[k].status==MTLCommandBufferStatusError||qcb[k].status==MTLCommandBufferStatusError){E(e,n,"prefill GPU trunk command buffer failed");free(a);free(b);return -1;}float*outp=(k==10)?b:NULL;if(qn_qwen4_layer_prefill_batch_finalize(m->qsa[qidx[k]],qcb[k],base,T,m->qsa_index[qidx[k]],m->qsa_key[qidx[k]],m->qsa_value[qidx[k]],outp,NULL,e,n)){free(a);free(b);return -1;}}
             prof_gdn+=msnow()-_ct;float*tmp=a;a=b;b=tmp;i=47;continue;
         }
-        if(prefill_gpu_block4_enabled()&&i>=4&&!is_qsa(i)&&i+3<48&&!is_qsa(i+1)&&!is_qsa(i+2)&&is_qsa(i+3)&&(uint64_t)base+T<=8192){
+        if(prefill_gpu_block4_enabled()&&i>=4&&!is_qsa(i)&&i+3<48&&!is_qsa(i+1)&&!is_qsa(i+2)&&is_qsa(i+3)&&(uint64_t)base+T<=QN_QWEN4_PRODUCTION_CONTEXT){
             if(qn_qwen4_model_ensure_layer(m,i+1,e,n)||qn_qwen4_model_ensure_layer(m,i+2,e,n)||qn_qwen4_model_ensure_layer(m,i+3,e,n)){free(a);free(b);return -1;}
             if(ensure_qsa_cache(m,i+3,(size_t)base+T,e,n)){free(a);free(b);return -1;}
             id<MTLCommandQueue>q=qn_gdn_layer_command_queue(m->gdn[i]);if(!q){free(a);free(b);E(e,n,"prefill GPU block4 queue unavailable");return -1;}qn_qwen4_layer_set_command_queue(m->qsa[i+3],q);
@@ -284,7 +284,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
         }
         if(is_qsa(i)){
             if(ensure_qsa_cache(m,i,(size_t)base+T,e,n)){free(a);free(b);return -1;}
-            if((uint64_t)base+T<=8192){
+            if((uint64_t)base+T<=QN_QWEN4_PRODUCTION_CONTEXT){
                 double qms=0;if(qn_qwen4_layer_forward_prefill_batch(m->qsa[i],a,base,T,m->qsa_index[i],m->qsa_key[i],m->qsa_value[i],b,&qms,e,n)){free(a);free(b);return -1;}prof_qsa+=qms;if(T>=256){const char*rv=getenv("QN_PREFILL_RELEASE_LARGE");if(rv&&rv[0]!='0')qn_qwen4_layer_release_prefill_buffers(m->qsa[i]);}
             }else{
                 for(uint32_t t=0;t<T;t++){
