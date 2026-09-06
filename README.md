@@ -1688,9 +1688,12 @@ for total context lengths up to 6144 tokens. This keeps the existing FP32
 MMA/online-softmax order bit-exact while sharing each K/V staging pass across
 twice as many query rows. The 512-thread BQ128 tile stages each BK16 K/V slab
 once per threadgroup (512-way staging stride), avoiding the redundant second-half
-loads of the earlier 256-stride implementation. Contexts above 6144 automatically
-retain BQ64, which remains the validated long-context path through 16K. Set `QN_QSA_BQ128=0`
-to force the BQ64 rollback path at all lengths.
+loads of the earlier 256-stride implementation. Contexts above 6144 and below 8192
+retain BQ64. At 8192 tokens and above, the stable executor chronologically packs the
+selected QSA blocks and evaluates them with a compact GQA K/V gather, avoiding the
+physical-history scan cost of the masked BK16 executor while preserving the validated
+FP32 MMA/online-softmax result through 16K. Set `QN_QSA_GATHER_GQA=0` to roll long
+contexts back to masked BQ64, or `QN_QSA_BQ128=0` to force the BQ64 path below 8192.
 
 The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
 self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it
