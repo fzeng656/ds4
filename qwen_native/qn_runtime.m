@@ -84,6 +84,7 @@ int qn_runtime_configure_from_env(qn_runtime_config_status *status,char *err,siz
        always win, so every fast-path component remains independently rollbackable. */
     if(qn_set_default_env("QN_PREFILL_CHUNK","2048",err,errlen) ||
        qn_set_default_env("QN_GDN_SHARED_BATCH_POOL","1",err,errlen) ||
+       qn_set_default_env("QN_QSA_SHARED_BATCH_POOL","1",err,errlen) ||
        qn_set_default_env("QN_P1_BF16_DENSE","1",err,errlen) ||
        qn_set_default_env("QN_P1_SORTED_MOE","1",err,errlen) ||
        qn_set_default_env("QN_PREFILL_GPU_FULL_TRUNK","1",err,errlen) ||

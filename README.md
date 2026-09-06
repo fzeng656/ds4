@@ -1702,6 +1702,22 @@ through 64K without scanning the full physical K/V history. Set `QN_QSA_GATHER_G
 to roll long contexts back to masked BQ64, or `QN_QSA_BQ128=0` to force the BQ64 path
 below 8192.
 
+Stable QSA decode also retains the compressed 4-token index-block keys after the first
+decode step. Subsequent steps only build newly completed blocks instead of rerunning
+`kcomp_rope` across the full context, while score/top-k semantics remain unchanged. The
+64K resident buffer costs about 8 MiB per QSA layer (about 96 MiB across 12 QSA layers)
+and is invalidated on cache reset or `position_base` changes. Set
+`QN_QSA_DECODE_INDEX_CACHE=0` to restore full-history decode recomputation.
+
+Stable production also shares QSA batch-only scratch across the 12 QSA layers because
+the full-trunk command buffers execute serially on one Metal queue. Per-layer resident
+index/K/V buffers and CPU-written selector IDs remain private. This removes the repeated
+2K-batch scratch footprint that previously pushed 64K prefill into macOS compression and
+swap; batch temporaries are released at the prefill-to-decode handoff while resident cache
+is preserved. Set `QN_QSA_SHARED_BATCH_POOL=0` to restore per-layer scratch allocation or
+`QN_RELEASE_PREFILL_TEMPORARIES=0` to retain prefill temporaries after the prompt.
+
+
 The checked-in `qwen_native/kernels/qn_gather_bm32.metallib` is runtime
 self-contained. `qwen_native/kernels/build_qn_gather_bm32.sh` regenerates it
 from MLX headers with Metal 4 and a macOS 26.2 deployment target; regeneration

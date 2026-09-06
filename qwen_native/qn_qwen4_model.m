@@ -29,6 +29,7 @@ struct qn_qwen4_model {
     __strong id<MTLCommandBuffer> shadow_copy_cb; int shadow_copy_pending;
     float *shadow_ple_conv; float shadow_last_stream[10240]; int64_t shadow_ple_hist[2]; uint32_t shadow_position; int shadow_last_valid, shadow_active;
     __strong NSMutableDictionary *gdn_batch_pool;
+    __strong NSMutableDictionary *qsa_batch_pool;
     char moe_metallib_path[1024];
 };
 
@@ -41,6 +42,7 @@ static int prefill_gpu_trunk_chain_enabled(void){const char*v=getenv("QN_PREFILL
 static int prefill_gpu_full_trunk_enabled(void){const char*v=getenv("QN_PREFILL_GPU_FULL_TRUNK");return v&&v[0]!='0';}
 static int gpu_trunk_chain_enabled(void){const char*v=getenv("QN_GPU_TRUNK_CHAIN"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
 static int gpu_full_trunk_enabled(void){const char*v=getenv("QN_GPU_FULL_TRUNK"),*r=getenv("QN_QSA_RESIDENT_CACHE");return (!v||v[0]!='0')&&(!r||r[0]!='0');}
+static int release_prefill_temporaries_enabled(qn_qwen4_model*m){const char*v=getenv("QN_RELEASE_PREFILL_TEMPORARIES");if(v&&*v)return v[0]!='0';return m&&m->stable_mode;}
 #define QN_QWEN4_PRODUCTION_CONTEXT 65536u
 static uint64_t qsa_bytes_for(size_t cap){return (uint64_t)cap*(128u+512u+512u)*sizeof(float);}
 
@@ -64,7 +66,7 @@ int qn_qwen4_model_open(qn_qwen4_model **out,const qn_qwen4_model_config *c,char
     qn_qwen4_model *m=calloc(1,sizeof(*m));if(!m){E(e,n,"calloc model failed");return -1;}
     m->stable_mode=rs.stable_mode;if(rs.moe_metallib_configured)snprintf(m->moe_metallib_path,sizeof(m->moe_metallib_path),"%s",rs.moe_metallib_path);
     snprintf(m->model_dir,sizeof(m->model_dir),"%s",c->model_dir);snprintf(m->manifest_path,sizeof(m->manifest_path),"%s",c->manifest_path);snprintf(m->ngram_path,sizeof(m->ngram_path),"%s",c->ngram_table_path);m->qsa_initial_capacity=c->qsa_cache_capacity?c->qsa_cache_capacity:16;const char*hr=getenv("QN_QSA_HOST_RESERVE");if(hr&&*hr){char*ep=NULL;unsigned long v=strtoul(hr,&ep,10);if(ep&&*ep==0&&v>=m->qsa_initial_capacity&&v<=QN_QWEN4_PRODUCTION_CONTEXT)m->qsa_initial_capacity=(uint32_t)v;}
-    m->ple_conv=calloc((size_t)10240*9,sizeof(float));m->shadow_ple_conv=calloc((size_t)10240*9,sizeof(float));if(!m->ple_conv||!m->shadow_ple_conv){E(e,n,"PLE state allocation failed");qn_qwen4_model_close(m);return -1;}@autoreleasepool{m->shadow_device=MTLCreateSystemDefaultDevice();m->shadow_queue=[m->shadow_device newCommandQueue];m->gdn_batch_pool=[NSMutableDictionary dictionary];if(!m->shadow_queue||!m->gdn_batch_pool){E(e,n,"model Metal/shared pool unavailable");qn_qwen4_model_close(m);return -1;}}
+    m->ple_conv=calloc((size_t)10240*9,sizeof(float));m->shadow_ple_conv=calloc((size_t)10240*9,sizeof(float));if(!m->ple_conv||!m->shadow_ple_conv){E(e,n,"PLE state allocation failed");qn_qwen4_model_close(m);return -1;}@autoreleasepool{m->shadow_device=MTLCreateSystemDefaultDevice();m->shadow_queue=[m->shadow_device newCommandQueue];m->gdn_batch_pool=[NSMutableDictionary dictionary];m->qsa_batch_pool=[NSMutableDictionary dictionary];if(!m->shadow_queue||!m->gdn_batch_pool||!m->qsa_batch_pool){E(e,n,"model Metal/shared pool unavailable");qn_qwen4_model_close(m);return -1;}}
     m->ple_token_history[0]=m->ple_token_history[1]=248044; /* model EOS */
     qn_model_io_config io={m->model_dir,m->manifest_path};if(qn_model_io_open(&m->io,&io,e,n)){qn_qwen4_model_close(m);return -1;}
     *out=m;return 0;
@@ -72,7 +74,7 @@ int qn_qwen4_model_open(qn_qwen4_model **out,const qn_qwen4_model_config *c,char
 
 int qn_qwen4_model_ensure_layer(qn_qwen4_model *m,uint32_t i,char *e,size_t n){
     if(!m||i>=48){E(e,n,"invalid layer index");return -1;}
-    if(is_qsa(i)){if(m->qsa[i])return 0;qn_qwen4_layer_config c={0};c.layer_index=i;c.model_dir=m->model_dir;c.manifest_path=m->manifest_path;if(qn_qwen4_layer_open(&m->qsa[i],&c,e,n))return -1;m->opened_qsa++;return 0;}
+    if(is_qsa(i)){if(m->qsa[i])return 0;qn_qwen4_layer_config c={0};c.layer_index=i;c.model_dir=m->model_dir;c.manifest_path=m->manifest_path;if(qn_qwen4_layer_open(&m->qsa[i],&c,e,n))return -1;{const char*sp=getenv("QN_QSA_SHARED_BATCH_POOL");if(sp&&sp[0]!='0')qn_qwen4_layer_set_batch_pool(m->qsa[i],m->qsa_batch_pool);}m->opened_qsa++;return 0;}
     if(m->gdn[i])return 0;qn_gdn_layer_config c={m->model_dir,m->manifest_path,i};if(qn_gdn_layer_open(&m->gdn[i],&c,e,n))return -1;{const char*sp=getenv("QN_GDN_SHARED_BATCH_POOL");if(sp&&sp[0]!='0')qn_gdn_layer_set_batch_pool(m->gdn[i],m->gdn_batch_pool);}m->opened_gdn++;return 0;
 }
 int qn_qwen4_model_ensure_ple(qn_qwen4_model *m,char *e,size_t n){if(!m){E(e,n,"invalid model");return -1;}if(m->ple)return 0;qn_ple_config c={m->model_dir,m->manifest_path,m->ngram_path};return qn_ple_layer_open(&m->ple,&c,e,n);}
@@ -223,6 +225,7 @@ int qn_qwen4_model_prefill_tokens(qn_qwen4_model *m,const uint32_t *tokens,size_
     if(count>prefill_chunk){
         size_t off=0;double ps=0,ls=0,ts=0;qn_qwen4_prefill_output part={0};
         while(off<count){size_t nleft=count-off,chunk=nleft>prefill_chunk?prefill_chunk:nleft;float *lp=(off+chunk==count)?logits:NULL;memset(&part,0,sizeof(part));if(qn_qwen4_model_prefill_tokens(m,tokens+off,chunk,lp,&part,e,n))return -1;ps+=part.prefill_ms;ls+=part.logits_ms;ts+=part.total_ms;off+=chunk;}
+        if(release_prefill_temporaries_enabled(m)){for(uint32_t i=3;i<48;i+=4)if(m->qsa[i])qn_qwen4_layer_release_prefill_temporaries(m->qsa[i]);@autoreleasepool{[m->qsa_batch_pool removeAllObjects];[m->gdn_batch_pool removeAllObjects];}}
         out->next_token=part.next_token;out->prompt_tokens=(uint32_t)count;out->prefill_ms=ps;out->logits_ms=ls;out->total_ms=ts;return 0;
     }
     if(count==1){
@@ -320,4 +323,4 @@ int qn_qwen4_model_verify_tokens_capture(qn_qwen4_model*m,const uint32_t*tokens,
 int qn_qwen4_model_verify_tokens(qn_qwen4_model*m,const uint32_t*tokens,size_t count,uint32_t*next_ids,qn_qwen4_prefill_output*out,char*e,size_t n){return qn_qwen4_model_verify_tokens_capture(m,tokens,count,next_ids,NULL,out,e,n);}
 
 void qn_qwen4_model_get_stats(qn_qwen4_model *m,qn_qwen4_model_stats *s){if(!m||!s)return;memset(s,0,sizeof(*s));s->num_layers=48;s->qsa_layers=12;s->gdn_layers=36;s->gdn_conv_state_bytes=(uint64_t)36*10240*4*4;s->gdn_recurrent_state_bytes=(uint64_t)36*48*128*128*4;s->ple_state_bytes=(uint64_t)10240*9*4+2*8;s->opened_qsa_layers=m->opened_qsa;s->opened_gdn_layers=m->opened_gdn;s->ple_opened=m->ple!=0;s->qsa_cache_capacity=m->qsa_initial_capacity;s->qsa_cache_bytes=m->qsa_cache_bytes;s->position=m->position;}
-void qn_qwen4_model_close(qn_qwen4_model *m){if(!m)return;@autoreleasepool{m->shadow_copy_cb=nil;m->shadow_queue=nil;m->shadow_device=nil;m->gdn_batch_pool=nil;}for(uint32_t i=0;i<48;i++){if(m->qsa[i])qn_qwen4_layer_close(m->qsa[i]);if(m->gdn[i])qn_gdn_layer_close(m->gdn[i]);free(m->qsa_index[i]);free(m->qsa_key[i]);free(m->qsa_value[i]);}if(m->ple)qn_ple_layer_close(m->ple);if(m->io)qn_model_io_close(m->io);free(m->ple_conv);free(m->shadow_ple_conv);free(m);}
+void qn_qwen4_model_close(qn_qwen4_model *m){if(!m)return;@autoreleasepool{m->shadow_copy_cb=nil;m->shadow_queue=nil;m->shadow_device=nil;m->qsa_batch_pool=nil;m->gdn_batch_pool=nil;}for(uint32_t i=0;i<48;i++){if(m->qsa[i])qn_qwen4_layer_close(m->qsa[i]);if(m->gdn[i])qn_gdn_layer_close(m->gdn[i]);free(m->qsa_index[i]);free(m->qsa_key[i]);free(m->qsa_value[i]);}if(m->ple)qn_ple_layer_close(m->ple);if(m->io)qn_model_io_close(m->io);free(m->ple_conv);free(m->shadow_ple_conv);free(m);}
