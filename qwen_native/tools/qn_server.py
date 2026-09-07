@@ -285,6 +285,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(HTTPStatus.OK if st["healthy"] else HTTPStatus.SERVICE_UNAVAILABLE,
                                    {"status": "ok" if st["healthy"] else "error", "worker": st,
                                     "model": self.app.model_id, "stop_ids": self.app.stop_ids, "context_limit": MAX_PROMPT_TOKENS, "prefill_chunk": 2048})
+        if path == "/metrics":
+            st = self.app.worker.status()
+            body = (
+                "# HELP qwen_native_worker_healthy Native worker health (1=healthy).\n"
+                "# TYPE qwen_native_worker_healthy gauge\n"
+                f"qwen_native_worker_healthy {1 if st['healthy'] else 0}\n"
+                "# HELP qwen_native_worker_busy Native worker busy state (1=busy).\n"
+                "# TYPE qwen_native_worker_busy gauge\n"
+                f"qwen_native_worker_busy {1 if st['busy'] else 0}\n"
+                "# HELP qwen_native_cached_tokens Tokens currently retained in the hot prefix cache.\n"
+                "# TYPE qwen_native_cached_tokens gauge\n"
+                f"qwen_native_cached_tokens {st['cached_tokens']}\n"
+                "# HELP qwen_native_last_reused_tokens Prefix tokens reused by the most recent request.\n"
+                "# TYPE qwen_native_last_reused_tokens gauge\n"
+                f"qwen_native_last_reused_tokens {st['last_reused_tokens']}\n"
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/v1/models":
             return self._send_json(HTTPStatus.OK, {"object": "list", "data": [{"id": self.app.model_id, "object": "model", "created": 0, "owned_by": "local"}]})
         return self._error(HTTPStatus.NOT_FOUND, "not found")
@@ -422,6 +444,15 @@ class NativeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     request_queue_size = 32
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            # Health/metrics probes and clients may close a keep-alive socket
+            # before the handler reads the next request. This is normal transport
+            # churn, not a server/model failure; keep the foreground log clean.
+            return
+        super().handle_error(request, client_address)
 
 
 def is_loopback(host):
