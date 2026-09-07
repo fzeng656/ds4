@@ -541,6 +541,7 @@ def main():
     ap.add_argument("--qsa-host-reserve", type=int, default=65536, help="QSA host-cache reserve in tokens (default: 65536)")
     ap.add_argument("--ple-fast", action=argparse.BooleanOptionalAction, default=True, help="enable MLX-parity fast PLE prefill (default: enabled)")
     ap.add_argument("--qsa-decode-cache", action=argparse.BooleanOptionalAction, default=True, help="enable compressed QSA decode index cache (default: enabled)")
+    ap.add_argument("--mtp", action=argparse.BooleanOptionalAction, default=True, help="enable MTP speculative decode (default: enabled)")
     ap.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True, help="enable Qwen thinking/reasoning in the chat template (default: enabled)")
     args = ap.parse_args()
     if not 2 <= args.prefill_chunk <= MAX_PROMPT_TOKENS:
@@ -551,6 +552,7 @@ def main():
     os.environ["QN_QSA_HOST_RESERVE"] = str(args.qsa_host_reserve)
     os.environ["QN_PLE_P1_QMM_F32_BF16"] = "1" if args.ple_fast else "0"
     os.environ["QN_QSA_DECODE_INDEX_CACHE"] = "1" if args.qsa_decode_cache else "0"
+    os.environ["QN_MTP"] = "1" if args.mtp else "0"
     if not is_loopback(args.host) and not args.api_key:
         raise SystemExit("refusing non-loopback bind without --api-key or QN_API_KEY")
     if args.max_queue < 0 or args.max_queue > 64:
