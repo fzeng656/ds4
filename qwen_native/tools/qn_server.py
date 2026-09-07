@@ -100,17 +100,37 @@ class NativeWorker:
                     if not parts:
                         continue
                     if parts[0] == "BEGIN" and len(parts) in (3, 4):
+                        prompt_tokens = int(parts[1])
+                        prefill_ms = float(parts[2])
                         reused = int(parts[3]) if len(parts) == 4 else 0
+                        new_tokens = max(0, prompt_tokens - reused)
                         with self.state_lock:
                             self.last_reused_tokens = reused
-                        yield {"type": "begin", "prompt_tokens": int(parts[1]), "prefill_ms": float(parts[2]), "reused_tokens": reused}
+                        if prefill_ms > 0.0 and new_tokens > 0:
+                            prefill_tps = new_tokens * 1000.0 / prefill_ms
+                            print(f"[prefill] prompt={prompt_tokens} new={new_tokens} reused={reused} time={prefill_ms:.1f}ms speed={prefill_tps:.1f} tok/s", flush=True)
+                        else:
+                            print(f"[prefill] prompt={prompt_tokens} new={new_tokens} reused={reused} time={prefill_ms:.1f}ms speed=cache-hit", flush=True)
+                        decode_seen = 0
+                        yield {"type": "begin", "prompt_tokens": prompt_tokens, "prefill_ms": prefill_ms, "reused_tokens": reused}
                     elif parts[0] == "TOK" and len(parts) == 3:
-                        yield {"type": "token", "id": int(parts[1]), "decode_ms": float(parts[2])}
+                        tok_ms = float(parts[2])
+                        decode_seen += 1
+                        if decode_seen >= 8 and decode_seen % 8 == 0 and tok_ms > 0.0:
+                            # TOK carries cumulative decode time *before* this emitted token,
+                            # so tok_ms covers decode_seen-1 completed decode steps.
+                            measured = decode_seen - 1
+                            decode_tps = measured * 1000.0 / tok_ms
+                            print(f"[decode] tokens={decode_seen} time={tok_ms:.1f}ms speed={decode_tps:.1f} tok/s", flush=True)
+                        yield {"type": "token", "id": int(parts[1]), "decode_ms": tok_ms}
                     elif parts[0] == "END" and len(parts) == 4:
                         completion = int(parts[2])
+                        decode_ms = float(parts[3])
                         with self.state_lock:
                             self.cached_tokens = min(MAX_PROMPT_TOKENS, len(prompt_ids) + completion)
-                        yield {"type": "end", "finish_reason": parts[1], "completion_tokens": completion, "decode_ms": float(parts[3])}
+                        decode_tps = (completion * 1000.0 / decode_ms) if decode_ms > 0.0 and completion > 0 else 0.0
+                        print(f"[done] tokens={completion} time={decode_ms:.1f}ms avg={decode_tps:.1f} tok/s reason={parts[1]}", flush=True)
+                        yield {"type": "end", "finish_reason": parts[1], "completion_tokens": completion, "decode_ms": decode_ms}
                         break
                     else:
                         raise WorkerError(f"invalid worker response: {line}")
