@@ -1709,6 +1709,8 @@ decode step. Subsequent steps only build newly completed blocks instead of rerun
 and is invalidated on cache reset or `position_base` changes. Set
 `QN_QSA_DECODE_INDEX_CACHE=0` to restore full-history decode recomputation.
 
+Stable single-token routed-MoE decode also reads the selected 4-bit expert banks in place. Gate/up projections use one SIMD group per `(expert slot, output row)` and scan packed K words, while the down projection evaluates the ten selected experts in parallel SIMD groups and performs the router-weighted reduction inside the threadgroup. The path is enabled for both GDN and QSA layers. Set `QN_MOE_DECODE_GQMV=0` to restore the legacy GDN routed-expert kernels and `QN_QSA_MOE_DECODE_GQMV=0` to restore the legacy QSA routed-expert kernels.
+
 Stable production also shares QSA batch-only scratch across the 12 QSA layers because
 the full-trunk command buffers execute serially on one Metal queue. Per-layer resident
 index/K/V buffers and CPU-written selector IDs remain private. This removes the repeated
