@@ -197,10 +197,42 @@ class App:
     def encode_chat(self, messages, tools=None):
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty array")
+        # OpenAI Chat Completions represents historical tool-call arguments as a
+        # JSON string. Qwen3.8's chat template iterates arguments as a mapping,
+        # so normalize only that field before rendering the prompt.
+        normalized = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("each chat message must be an object")
+            m = dict(message)
+            calls = m.get("tool_calls")
+            if isinstance(calls, list):
+                ncalls = []
+                for call in calls:
+                    if not isinstance(call, dict):
+                        ncalls.append(call)
+                        continue
+                    c = dict(call)
+                    fn = c.get("function")
+                    if isinstance(fn, dict):
+                        f = dict(fn)
+                        args = f.get("arguments")
+                        if isinstance(args, str):
+                            try:
+                                parsed = json.loads(args)
+                            except json.JSONDecodeError as exc:
+                                raise ValueError(f"invalid historical tool arguments JSON: {exc}")
+                            if not isinstance(parsed, dict):
+                                raise ValueError("historical tool arguments must decode to an object")
+                            f["arguments"] = parsed
+                        c["function"] = f
+                    ncalls.append(c)
+                m["tool_calls"] = ncalls
+            normalized.append(m)
         kwargs = dict(tokenize=True, add_generation_prompt=True, enable_thinking=False)
         if tools is not None:
             kwargs["tools"] = tools
-        ids = self.tokenizer.apply_chat_template(messages, **kwargs)
+        ids = self.tokenizer.apply_chat_template(normalized, **kwargs)
         if isinstance(ids, dict):
             ids = ids.get("input_ids")
         elif hasattr(ids, "input_ids"):
@@ -258,6 +290,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _error(self, code, message, typ="invalid_request_error"):
+        print(f"[http-error] status={int(code)} type={typ} message={message}", file=sys.stderr, flush=True)
         self._send_json(code, {"error": {"message": str(message), "type": typ, "param": None, "code": None}})
 
     def _read_json(self):
