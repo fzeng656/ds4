@@ -272,6 +272,12 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.app
 
     def log_message(self, fmt, *args):
+        # Keep foreground logs focused on inference; metrics probes are noisy.
+        try:
+            if urlparse(self.path).path == "/metrics":
+                return
+        except Exception:
+            pass
         sys.stderr.write("[http] %s - %s\n" % (self.address_string(), fmt % args))
 
     def _auth_ok(self):
