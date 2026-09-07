@@ -1713,6 +1713,8 @@ Stable single-token routed-MoE decode also reads the selected 4-bit expert banks
 
 Stable GDN single-token decode also keeps its activation stream, convolution state, and recurrent delta state in BF16 storage while retaining F32 accumulation and the existing F32 external trunk boundary. Prefill remains on the validated F32 path; the first decode converts the prefill state once, and batch/MTP verify converts back only when it needs the F32 state. Speculative shadow copy/rollback tracks both representations so prefix reuse and MTP state restoration stay valid. Stable mode enables this by default; set `QN_GDN_DECODE_BF16=0` to restore the legacy all-F32 GDN decode path.
 
+Stable GDN BF16 decode also fuses the shared-expert gate/up projection with SwiGLU and folds the shared-expert gate scaling plus routed-output add into one threadgroup kernel. This removes four small decode dispatches and their intermediate BF16 traffic while preserving the same BF16 round points. Stable mode enables the fusion by default; set `QN_GDN_SHARED_FUSED=0` to restore the unfused shared-expert decode path.
+
 Stable production also shares QSA batch-only scratch across the 12 QSA layers because
 the full-trunk command buffers execute serially on one Metal queue. Per-layer resident
 index/K/V buffers and CPU-written selector IDs remain private. This removes the repeated
