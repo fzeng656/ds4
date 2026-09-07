@@ -1783,3 +1783,9 @@ Production safety rules in the current phase:
 These limits are intentional production guards, not model architecture limits.
 Sampling and structured tool-call response translation are separate follow-up
 milestones.
+
+### Phase 6s: MLX-parity PLE prefill NAX
+
+Stable mode now uses `QN_PLE_P1_QMM_F32_BF16=1` for PLE key/value prefill projections. The kernel keeps activations/output in F32 while reading the checkpoint's BF16 quantization scales/biases, matching the MLX quantized-matmul numerical path much more closely than the legacy per-row q8 kernel. `QN_PLE_P1_QMM_F32_BF16=0` restores the legacy path.
+
+Validation on the 2K PLE MLX oracle: output RMSE `4.00e-7`, conv state bit-identical. Production A/B improved prefill by roughly 5-6% at 16K/32K and 4.65% at 64K with no added swapout; prefix reuse and the 64K prefill-to-decode boundary passed.
