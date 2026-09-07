@@ -1711,6 +1711,8 @@ and is invalidated on cache reset or `position_base` changes. Set
 
 Stable single-token routed-MoE decode also reads the selected 4-bit expert banks in place. Gate/up projections use one SIMD group per `(expert slot, output row)` and scan packed K words, while the down projection evaluates the ten selected experts in parallel SIMD groups and performs the router-weighted reduction inside the threadgroup. The path is enabled for both GDN and QSA layers. Set `QN_MOE_DECODE_GQMV=0` to restore the legacy GDN routed-expert kernels and `QN_QSA_MOE_DECODE_GQMV=0` to restore the legacy QSA routed-expert kernels.
 
+Stable GDN single-token decode also keeps its activation stream, convolution state, and recurrent delta state in BF16 storage while retaining F32 accumulation and the existing F32 external trunk boundary. Prefill remains on the validated F32 path; the first decode converts the prefill state once, and batch/MTP verify converts back only when it needs the F32 state. Speculative shadow copy/rollback tracks both representations so prefix reuse and MTP state restoration stay valid. Stable mode enables this by default; set `QN_GDN_DECODE_BF16=0` to restore the legacy all-F32 GDN decode path.
+
 Stable production also shares QSA batch-only scratch across the 12 QSA layers because
 the full-trunk command buffers execute serially on one Metal queue. Per-layer resident
 index/K/V buffers and CPU-written selector IDs remain private. This removes the repeated
