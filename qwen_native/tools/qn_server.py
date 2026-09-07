@@ -510,7 +510,19 @@ def main():
     ap.add_argument("--port", type=int, default=8004)
     ap.add_argument("--api-key", default=os.getenv("QN_API_KEY"))
     ap.add_argument("--max-queue", type=int, default=4, help="waiting requests allowed in addition to the active request")
+    ap.add_argument("--prefill-chunk", type=int, default=2048, help="stable prefill chunk size (default: 2048)")
+    ap.add_argument("--qsa-host-reserve", type=int, default=65536, help="QSA host-cache reserve in tokens (default: 65536)")
+    ap.add_argument("--ple-fast", action=argparse.BooleanOptionalAction, default=True, help="enable MLX-parity fast PLE prefill (default: enabled)")
+    ap.add_argument("--qsa-decode-cache", action=argparse.BooleanOptionalAction, default=True, help="enable compressed QSA decode index cache (default: enabled)")
     args = ap.parse_args()
+    if not 2 <= args.prefill_chunk <= MAX_PROMPT_TOKENS:
+        raise SystemExit(f"--prefill-chunk must be 2..{MAX_PROMPT_TOKENS}")
+    if not 16 <= args.qsa_host_reserve <= MAX_PROMPT_TOKENS:
+        raise SystemExit(f"--qsa-host-reserve must be 16..{MAX_PROMPT_TOKENS}")
+    os.environ["QN_PREFILL_CHUNK"] = str(args.prefill_chunk)
+    os.environ["QN_QSA_HOST_RESERVE"] = str(args.qsa_host_reserve)
+    os.environ["QN_PLE_P1_QMM_F32_BF16"] = "1" if args.ple_fast else "0"
+    os.environ["QN_QSA_DECODE_INDEX_CACHE"] = "1" if args.qsa_decode_cache else "0"
     if not is_loopback(args.host) and not args.api_key:
         raise SystemExit("refusing non-loopback bind without --api-key or QN_API_KEY")
     if args.max_queue < 0 or args.max_queue > 64:
