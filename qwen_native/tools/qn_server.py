@@ -194,7 +194,7 @@ class App:
             return prompt
         raise ValueError("prompt must be a string or token-id array")
 
-    def encode_chat(self, messages, tools=None):
+    def encode_chat(self, messages, tools=None, reasoning_effort=None):
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty array")
         # OpenAI Chat Completions represents historical tool-call arguments as a
@@ -229,7 +229,16 @@ class App:
                     ncalls.append(c)
                 m["tool_calls"] = ncalls
             normalized.append(m)
-        kwargs = dict(tokenize=True, add_generation_prompt=True, enable_thinking=False)
+        kwargs = dict(tokenize=True, add_generation_prompt=True, enable_thinking=self.args.thinking)
+        if self.args.thinking and reasoning_effort is not None:
+            effort = str(reasoning_effort).lower()
+            if effort in ("high", "xhigh", "max", "ultra"):
+                effort = "xhigh"
+            elif effort in ("minimal", "low"):
+                effort = "low"
+            else:
+                effort = "medium"
+            kwargs["reasoning_effort"] = effort
         if tools is not None:
             kwargs["tools"] = tools
         ids = self.tokenizer.apply_chat_template(normalized, **kwargs)
@@ -366,7 +375,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 max_tokens = self.app.validate_generation(body)
                 if path == "/v1/chat/completions":
-                    prompt_ids = self.app.encode_chat(body.get("messages"), body.get("tools"))
+                    prompt_ids = self.app.encode_chat(body.get("messages"), body.get("tools"), body.get("reasoning_effort"))
                     kind = "chat"
                 else:
                     prompt_ids = self.app.encode_completion(body.get("prompt"))
@@ -447,8 +456,14 @@ class Handler(BaseHTTPRequestHandler):
                     visible.append(ev["id"])
                     if client_ok:
                         now = self.app.tokenizer.decode(visible, skip_special_tokens=True)
-                        delta = now[len(sent):] if now.startswith(sent) else self.app.tokenizer.decode([ev["id"]], skip_special_tokens=True)
-                        sent = now
+                        # Byte-fallback tokenizers can temporarily decode an incomplete
+                        # UTF-8 sequence as U+FFFD at a token boundary (common for emoji).
+                        # Hold that unstable suffix until later tokens complete it instead
+                        # of streaming a visible replacement character to the client.
+                        stable_now = now.rstrip("\ufffd")
+                        delta = stable_now[len(sent):] if stable_now.startswith(sent) else ""
+                        if stable_now.startswith(sent):
+                            sent = stable_now
                         if delta:
                             if kind == "chat":
                                 obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": self.app.model_id,
@@ -465,6 +480,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._safe_sse("[DONE]")
             self.close_connection = True
             return
+        if client_ok:
+            final_text = self.app.tokenizer.decode(visible, skip_special_tokens=True)
+            if final_text.startswith(sent):
+                tail = final_text[len(sent):]
+                if tail:
+                    if kind == "chat":
+                        obj = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": self.app.model_id,
+                               "choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
+                    else:
+                        obj = {"id": cid, "object": "text_completion", "created": created, "model": self.app.model_id,
+                               "choices": [{"index": 0, "text": tail, "finish_reason": None, "logprobs": None}]}
+                    client_ok = self._safe_sse(obj)
         reason = end["finish_reason"] if end else "error"
         if client_ok:
             if kind == "chat":
@@ -514,6 +541,7 @@ def main():
     ap.add_argument("--qsa-host-reserve", type=int, default=65536, help="QSA host-cache reserve in tokens (default: 65536)")
     ap.add_argument("--ple-fast", action=argparse.BooleanOptionalAction, default=True, help="enable MLX-parity fast PLE prefill (default: enabled)")
     ap.add_argument("--qsa-decode-cache", action=argparse.BooleanOptionalAction, default=True, help="enable compressed QSA decode index cache (default: enabled)")
+    ap.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True, help="enable Qwen thinking/reasoning in the chat template (default: enabled)")
     args = ap.parse_args()
     if not 2 <= args.prefill_chunk <= MAX_PROMPT_TOKENS:
         raise SystemExit(f"--prefill-chunk must be 2..{MAX_PROMPT_TOKENS}")
