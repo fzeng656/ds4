@@ -10430,6 +10430,156 @@ static void visible_live_free(visible_live_state *st) {
     memset(st, 0, sizeof(*st));
 }
 
+
+/* OpenClaw emits small same-model auxiliary requests for live status / trajectory
+ * summaries while a long agent turn is resident. In single-slot mode those
+ * requests must not destroy the authoritative Responses KV frontier: snapshot
+ * the resident session plus protocol metadata, run the auxiliary request on the
+ * same model, then restore the resident frontier immediately afterwards. */
+static bool request_is_openclaw_aux(const request *r) {
+    if (!r || !r->raw_body) return false;
+    return strstr(r->raw_body,
+                  "You write the live status line for an AI assistant") != NULL ||
+           strstr(r->raw_body,
+                  "You judge the trajectory of a running AI agent session") != NULL;
+}
+
+typedef struct {
+    bool active;
+    int live_tokens;
+    ds4_session_snapshot snapshot;
+    live_tool_state responses_live;
+    live_tool_state anthropic_live;
+    visible_live_state thinking_live;
+    int continued_last_store_tokens;
+    openclaw_turn_boundary openclaw_turns[OPENCLAW_COMPACTION_TURN_RING];
+    int openclaw_turn_next;
+    uint64_t openclaw_turn_clock;
+    bool openclaw_compaction_ephemeral;
+} openclaw_aux_resident_pin;
+
+static void live_tool_state_clone(live_tool_state *dst,
+                                  const live_tool_state *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->valid = src->valid;
+    dst->live_tokens = src->live_tokens;
+    dst->visible_text = src->visible_text ? xstrdup(src->visible_text) : NULL;
+    dst->visible_len = src->visible_len;
+    dst->visible_text_alt = src->visible_text_alt ?
+                            xstrdup(src->visible_text_alt) : NULL;
+    dst->visible_len_alt = src->visible_len_alt;
+    dst->images = src->images;
+    for (int i = 0; i < src->call_ids.len; i++)
+        id_list_push_unique(&dst->call_ids, src->call_ids.v[i]);
+}
+
+static void visible_live_state_clone(visible_live_state *dst,
+                                     const visible_live_state *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->valid = src->valid;
+    dst->live_tokens = src->live_tokens;
+    dst->visible_text = src->visible_text ? xstrdup(src->visible_text) : NULL;
+    dst->visible_len = src->visible_len;
+    dst->tool_turn = src->tool_turn;
+    dst->images = src->images;
+}
+
+static void openclaw_aux_resident_pin_free(openclaw_aux_resident_pin *pin) {
+    if (!pin) return;
+    ds4_session_snapshot_free(&pin->snapshot);
+    live_tool_state_free(&pin->responses_live);
+    live_tool_state_free(&pin->anthropic_live);
+    visible_live_free(&pin->thinking_live);
+    memset(pin, 0, sizeof(*pin));
+}
+
+static void openclaw_aux_resident_pin_begin(server *s, server_slot *slot,
+                                            const request *r,
+                                            openclaw_aux_resident_pin *pin) {
+    memset(pin, 0, sizeof(*pin));
+    if (!s || !slot || !request_is_openclaw_aux(r)) return;
+
+    const int live_tokens = ds4_session_pos(slot->session);
+    if (live_tokens < 2048) return;
+
+    char err[160] = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    const int rc = ds4_session_save_snapshot(slot->session, &pin->snapshot,
+                                             err, sizeof(err));
+    pthread_mutex_unlock(&s->inference_mu);
+    if (rc != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: OpenClaw aux resident pin snapshot failed live=%d error=%s",
+                   live_tokens, err[0] ? err : "unknown");
+        openclaw_aux_resident_pin_free(pin);
+        return;
+    }
+
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clone(&pin->responses_live, &slot->responses_live);
+    live_tool_state_clone(&pin->anthropic_live, &slot->anthropic_live);
+    visible_live_state_clone(&pin->thinking_live, &slot->thinking_live);
+    memcpy(pin->openclaw_turns, slot->openclaw_turns,
+           sizeof(pin->openclaw_turns));
+    pin->openclaw_turn_next = slot->openclaw_turn_next;
+    pin->openclaw_turn_clock = slot->openclaw_turn_clock;
+    pthread_mutex_unlock(&s->tool_mu);
+
+    pin->continued_last_store_tokens = slot->continued_last_store_tokens;
+    pin->openclaw_compaction_ephemeral = slot->openclaw_compaction_ephemeral;
+    pin->live_tokens = live_tokens;
+    pin->active = true;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: OpenClaw aux resident pin saved live=%d snapshot=%.2f MiB",
+               live_tokens, (double)pin->snapshot.len / (1024.0 * 1024.0));
+}
+
+static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
+                                              openclaw_aux_resident_pin *pin) {
+    if (!s || !slot || !pin || !pin->active) {
+        openclaw_aux_resident_pin_free(pin);
+        return;
+    }
+
+    char err[160] = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    const int rc = ds4_session_load_snapshot(slot->session, &pin->snapshot,
+                                             err, sizeof(err));
+    pthread_mutex_unlock(&s->inference_mu);
+    if (rc != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: OpenClaw aux resident pin restore failed live=%d error=%s",
+                   pin->live_tokens, err[0] ? err : "unknown");
+        openclaw_aux_resident_pin_free(pin);
+        return;
+    }
+
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_free(&slot->responses_live);
+    live_tool_state_free(&slot->anthropic_live);
+    visible_live_free(&slot->thinking_live);
+    slot->responses_live = pin->responses_live;
+    slot->anthropic_live = pin->anthropic_live;
+    slot->thinking_live = pin->thinking_live;
+    memset(&pin->responses_live, 0, sizeof(pin->responses_live));
+    memset(&pin->anthropic_live, 0, sizeof(pin->anthropic_live));
+    memset(&pin->thinking_live, 0, sizeof(pin->thinking_live));
+    memcpy(slot->openclaw_turns, pin->openclaw_turns,
+           sizeof(slot->openclaw_turns));
+    slot->openclaw_turn_next = pin->openclaw_turn_next;
+    slot->openclaw_turn_clock = pin->openclaw_turn_clock;
+    pthread_mutex_unlock(&s->tool_mu);
+
+    slot->continued_last_store_tokens = pin->continued_last_store_tokens;
+    slot->openclaw_compaction_ephemeral = pin->openclaw_compaction_ephemeral;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: OpenClaw aux resident pin restored live=%d snapshot=%.2f MiB",
+               pin->live_tokens, (double)pin->snapshot.len / (1024.0 * 1024.0));
+    openclaw_aux_resident_pin_free(pin);
+}
+
 static void thinking_live_clear(server *s, server_slot *slot) {
     if (!s || !slot) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -15180,10 +15330,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
+    openclaw_aux_resident_pin aux_pin = {0};
+    openclaw_aux_resident_pin_begin(s, slot, &j->req, &aux_pin);
+
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
     openclaw_compaction_ephemeral_reset(s, slot);
+    openclaw_aux_resident_pin_restore(s, slot, &aux_pin);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
