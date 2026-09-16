@@ -11516,6 +11516,50 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->inference_mu);
 }
 
+static int kv_cache_rebuild_anchor_target(const kv_disk_cache *kc,
+                                          int after_tokens,
+                                          int prompt_tokens) {
+    if (!kc || !kc->enabled || prompt_tokens <= 0 || after_tokens >= prompt_tokens)
+        return 0;
+    int step = kc->opt.continued_interval_tokens;
+    if (step <= 0) return 0;
+    const int align = kc->opt.boundary_align_tokens;
+    if (align > 0) {
+        step = ((step + align - 1) / align) * align;
+        if (step <= 0) step = align;
+    }
+
+    /* V4.1 cannot serialize an in-flight layer-major prefill frontier: the
+     * compressor state is complete at each chunk boundary, but checkpoint_valid
+     * stays false until the output head is finalized. Split a large cold rebuild
+     * at sparse, step-aligned frontiers so server_session_sync() finalizes a real
+     * checkpoint and the existing continued-store callback can persist it.
+     *
+     * With the OpenClaw production step=4096 this yields:
+     *   8k, 16k, 24k, 32k, 64k, 96k, 128k, 192k, ...
+     * Dense early anchors protect against tool/system-prompt edits; farther out
+     * the spacing widens to bound SSD writes and output-head overhead. */
+    int64_t base = (int64_t)step * 2;
+    if (base < 8192) base = 8192;
+    if (align > 0) base = ((base + align - 1) / align) * align;
+    const int64_t near_limit = base * 4;
+    const int64_t mid_limit = base * 16;
+    const int64_t mid_step = base * 4;
+    const int64_t far_step = base * 8;
+    const int64_t after = after_tokens < 0 ? 0 : after_tokens;
+
+    int64_t target;
+    if (after < near_limit) {
+        target = ((after / base) + 1) * base;
+    } else if (after < mid_limit) {
+        target = ((after / mid_step) + 1) * mid_step;
+    } else {
+        target = ((after / far_step) + 1) * far_step;
+    }
+    if (target <= after || target >= prompt_tokens || target > INT_MAX) return 0;
+    return (int)target;
+}
+
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot || slot->openclaw_compaction_ephemeral) return;
     kv_disk_cache *kc = &s->kv;
@@ -12948,6 +12992,29 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
            DS4_SESSION_SYNC_INTERRUPTED : 0;
 }
 
+static int kv_cache_seed_v41_rebuild_anchors(server *s, server_slot *slot,
+                                               const ds4_tokens *prompt,
+                                               char *err, size_t errlen) {
+    if (!s || !slot || !prompt || !s->kv.enabled ||
+        !ds4_engine_is_deepseek41(s->engine)) return 0;
+
+    int after = ds4_session_pos(slot->session);
+    for (;;) {
+        const int target = kv_cache_rebuild_anchor_target(&s->kv, after, prompt->len);
+        if (target == 0) break;
+        ds4_tokens prefix = {0};
+        tokens_copy_prefix(&prefix, prompt, target);
+        const int rc = server_session_sync(s, slot, &prefix, err, errlen);
+        ds4_tokens_free(&prefix);
+        if (rc != 0) return rc;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: V4.1 rebuild anchor finalized tokens=%d prompt=%d",
+                   target, prompt->len);
+        after = target;
+    }
+    return 0;
+}
+
 static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    const char *suffix,
                                                    int *tokens_appended,
@@ -14236,6 +14303,32 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * a later continued write can still try. */
         suppressed_continued_last =
             kv_cache_slot_suppress_continued(s, slot, cold_store_len);
+    }
+
+    const bool seed_v41_rebuild_anchors =
+        !multimodal && cached == 0 && s->kv.enabled &&
+        !slot->openclaw_compaction_ephemeral &&
+        ds4_engine_is_deepseek41(s->engine) &&
+        s->kv.opt.cold_max_tokens > 0 &&
+        prompt_for_sync->len > s->kv.opt.cold_max_tokens;
+    if (seed_v41_rebuild_anchors) {
+        const int seed_rc = kv_cache_seed_v41_rebuild_anchors(
+            s, slot, prompt_for_sync, err, sizeof(err));
+        if (seed_rc != 0) {
+            ds4_tokens_free(&effective_prompt);
+            ds4_session_set_progress(slot->session, NULL, NULL);
+            ds4_session_set_display_progress(slot->session, NULL, NULL);
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            free(disk_cache_path);
+            if (job_cancelled(j)) {
+                request_live_state_clear(s, slot);
+                trace_event(s, trace_id, "cancelled during V4.1 rebuild anchor prefill");
+                return;
+            }
+            trace_event(s, trace_id, "V4.1 rebuild anchor prefill failed: %s", err);
+            send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            return;
+        }
     }
 
     if (s->kv.enabled &&
@@ -21854,6 +21947,27 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
 }
 
 
+static void test_kv_cache_v41_rebuild_anchor_targets(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    kc.opt.continued_interval_tokens = 4096;
+    kc.opt.boundary_align_tokens = 2048;
+
+    const int prompt = 146120;
+    const int expected[] = {8192, 16384, 24576, 32768, 65536, 98304, 131072};
+    int after = 0;
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        const int got = kv_cache_rebuild_anchor_target(&kc, after, prompt);
+        TEST_ASSERT(got == expected[i]);
+        after = got;
+    }
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, after, prompt) == 0);
+
+    kc.opt.continued_interval_tokens = 0;
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 0, prompt) == 0);
+}
+
 static void test_kv_cache_eviction_keeps_stair_step_compaction_anchors(void) {
     /*
      * Regression for a real OpenClaw compaction shape:
@@ -23017,6 +23131,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
+    test_kv_cache_v41_rebuild_anchor_targets();
     test_kv_cache_eviction_keeps_stair_step_compaction_anchors();
     test_kv_cache_eviction_ignores_shared_fixed_overhead();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
