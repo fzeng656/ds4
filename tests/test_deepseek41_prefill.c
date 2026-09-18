@@ -70,6 +70,36 @@ static int check_dispatch(void) {
     CHECK(ds41_prefill_count(&g, 255) == 1);
     CHECK(ds41_short_prefill_count(&g, &weights, 255) == 0);
     CHECK(unsetenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL") == 0);
+#ifdef __APPLE__
+    /* V4.1 Metal SSD selected-address continuation keeps tiny appends scalar,
+     * batches the measured 10..800 crossover window, and leaves larger warm
+     * appends on the established full-layer policy. */
+    g.tp_world = 1;
+    g.streaming = true;
+    g.pos = 1;
+    ds4_gpu_set_streaming_expert_cache_budget(half);
+    CHECK(setenv("DS4_METAL_ENABLE_V41_STREAMING_SELECTED_BATCH", "1", 1) == 0);
+    CHECK(!ds41_streaming_selected_batch_requested(&g, 8));
+    CHECK(!ds41_streaming_selected_batch_requested(&g, 9));
+    CHECK(ds41_streaming_selected_batch_requested(&g, 10));
+    CHECK(ds41_streaming_selected_batch_requested(&g, 255));
+    CHECK(ds41_streaming_selected_batch_requested(&g, 800));
+    CHECK(!ds41_streaming_selected_batch_requested(&g, 801));
+    CHECK(ds41_continued_prefill_count(&g, 8, true) == 1);
+    CHECK(ds41_continued_prefill_count(&g, 9, true) == 1);
+    CHECK(ds41_continued_prefill_count(&g, 10, true) == 10);
+    CHECK(ds41_continued_prefill_count(&g, 12, true) == 12);
+    CHECK(ds41_continued_prefill_count(&g, 255, true) == 255);
+    CHECK(ds41_continued_prefill_count(&g, 256, true) == 256);
+    CHECK(ds41_continued_prefill_count(&g, 800, true) == 800);
+    CHECK(ds41_continued_prefill_count(&g, 801, true) == 1);
+    CHECK(ds41_continued_prefill_count(&g, 1024, true) == 1024);
+    CHECK(ds41_continued_prefill_count(&g, 255, false) == 1);
+    CHECK(unsetenv("DS4_METAL_ENABLE_V41_STREAMING_SELECTED_BATCH") == 0);
+    g.tp_world = 2;
+    g.streaming = false;
+    g.pos = 0;
+#endif
     const char *ablations[] = {"DS4_METAL_DISABLE_V41_BATCH_ATTN",
         "DS4_METAL_DISABLE_V41_BATCH_CORE", "DS4_METAL_DISABLE_V41_BATCH_MOE",
         "DS4_METAL_DISABLE_V41_BATCH_HC", "DS4_METAL_DISABLE_V41_LAYER_PREFILL"};
@@ -109,7 +139,7 @@ typedef struct {
     ds4_session *session;
     int target, current, frontier;
     unsigned callbacks, scalar, batches, short_batches, deferred, displays;
-    bool partial_checked, final_checked;
+    bool partial_checked, final_checked, selected_batch_allowed;
     double begin, first_display;
 } prefill_progress;
 
@@ -135,10 +165,19 @@ static void progress_note(void *ud, const char *event, int current, int total) {
             const int count = current - p->frontier;
             ds41_gpu_graph before = s->ds41_graph;
             before.pos = (uint32_t)p->frontier;
-            const uint32_t small = ds41_short_prefill_count(&before, &s->engine->weights,
-                (uint32_t)(total - p->frontier));
-            assert((uint32_t)count == (small ? small : ds41_prefill_count(&before,
-                (uint32_t)(total - p->frontier))));
+            const uint32_t small = p->selected_batch_allowed ?
+                ds41_short_prefill_count(&before, &s->engine->weights,
+                    (uint32_t)(total - p->frontier)) : 0u;
+            const uint32_t remaining = (uint32_t)(total - p->frontier);
+            const bool allow_selected = p->selected_batch_allowed &&
+                getenv("DS4_METAL_ENABLE_V41_STREAMING_SELECTED_BATCH") != NULL &&
+                getenv("DS4_METAL_DISABLE_V41_STREAMING_SELECTED_BATCH") == NULL;
+            const uint32_t expected_count = small ? small :
+                ds41_continued_prefill_count(&before, remaining, allow_selected);
+            if ((uint32_t)count != expected_count)
+                fprintf(stderr, "progress dispatch mismatch frontier=%d current=%d count=%d remaining=%u small=%u allow_selected=%d expected=%u before_pos=%u\n",
+                    p->frontier, current, count, remaining, small, allow_selected, expected_count, before.pos);
+            assert((uint32_t)count == expected_count);
             if (count == 1) p->scalar++;
             else if (small) p->short_batches++;
             else p->batches++;
@@ -156,7 +195,65 @@ static bool cancel_after_display(void *ud) {
     return ((prefill_progress *)ud)->displays >= 2;
 }
 
+static bool state_equivalent_selected(ds4_session *a, ds4_session *b) {
+    if (!a->checkpoint_valid || !b->checkpoint_valid ||
+        !a->ds41_graph.valid || !b->ds41_graph.valid ||
+        ds4_session_pos(a) != ds4_session_pos(b) ||
+        memcmp(&a->ds41_graph.history, &b->ds41_graph.history,
+            sizeof(a->ds41_graph.history))) return false;
+    ds41_state_span sa[64], sb[64];
+    uint32_t n = ds41_state_spans(&a->ds41_graph, a->ds41_graph.pos, sa);
+    if (n != ds41_state_spans(&b->ds41_graph, b->ds41_graph.pos, sb)) return false;
+    double state_sq = 0.0;
+    uint64_t state_count = 0, state_different = 0;
+    float state_max = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const size_t bytes = (size_t)sa[i].bytes;
+        if (bytes != (size_t)sb[i].bytes || bytes % sizeof(float)) return false;
+        float *left = malloc(bytes), *right = malloc(bytes);
+        const bool readable = left && right &&
+            ds4_gpu_tensor_read(sa[i].tensor, 0, left, bytes) &&
+            ds4_gpu_tensor_read(sb[i].tensor, 0, right, bytes);
+        if (!readable) { free(left); free(right); return false; }
+        const size_t nf = bytes / sizeof(float);
+        for (size_t j = 0; j < nf; j++) {
+            if (!isfinite(left[j]) || !isfinite(right[j])) {
+                free(left); free(right); return false;
+            }
+            const float d = fabsf(left[j] - right[j]);
+            if (d != 0.0f) state_different++;
+            if (d > state_max) state_max = d;
+            state_sq += (double)d * d;
+        }
+        state_count += nf;
+        free(left); free(right);
+    }
+    double logit_sq = 0.0;
+    float logit_max = 0.0f;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (!isfinite(a->logits[i]) || !isfinite(b->logits[i])) return false;
+        const float d = fabsf(a->logits[i] - b->logits[i]);
+        if (d > logit_max) logit_max = d;
+        logit_sq += (double)d * d;
+    }
+    const double state_rms = state_count ? sqrt(state_sq / (double)state_count) : 0.0;
+    const double logit_rms = sqrt(logit_sq / (double)DS4_N_VOCAB);
+    const int atop = ds4_session_argmax(a), btop = ds4_session_argmax(b);
+    fprintf(stderr,
+        "selected AB frontier=%d state_diff=%llu state_rms=%.6g state_max=%.6g "
+        "logit_rms=%.6g logit_max=%.6g top=%d/%d\n",
+        ds4_session_pos(a), (unsigned long long)state_different,
+        state_rms, state_max, logit_rms, logit_max, atop, btop);
+    const bool diag = getenv("DS4_TEST_V41_SELECTED_BATCH_DIAG") != NULL;
+    const float state_max_limit = diag ? 8.0f : 0.08f;
+    const double state_rms_limit = diag ? 0.10 : 0.02;
+    return state_max <= state_max_limit && state_rms <= state_rms_limit &&
+        logit_rms <= 4.0 && logit_max <= 12.0f && atop == btop;
+}
+
 static bool state_equal(ds4_session *a, ds4_session *b) {
+    if (getenv("DS4_TEST_V41_SELECTED_BATCH_AB") != NULL)
+        return state_equivalent_selected(a, b);
     if (!a->checkpoint_valid || !b->checkpoint_valid ||
         !a->ds41_graph.valid || !b->ds41_graph.valid ||
         ds4_session_pos(a) != ds4_session_pos(b) ||
@@ -213,6 +310,10 @@ static int check_mixed(const char *model, const char *prompt_path,
     const bool cuda_long = mode == PREFILL_CUDA_LONG || mode == PREFILL_CUDA_DEFERRED;
     const bool deferred_only = mode == PREFILL_CUDA_DEFERRED;
     const bool cuda_small = mode == PREFILL_CUDA_SMALL;
+    const bool selected_ab_mode = !cuda && !tp_opt &&
+        getenv("DS4_TEST_V41_SELECTED_BATCH_AB") != NULL;
+    const bool short_ab_mode = !cuda && !tp_opt &&
+        getenv("DS4_TEST_V41_SHORT_BATCH_AB") != NULL;
     ds4_engine *engine = NULL;
     ds4_tp *tp = NULL;
     ds4_session *control = NULL, *mixed = NULL;
@@ -250,10 +351,17 @@ static int check_mixed(const char *model, const char *prompt_path,
     CHECK(ds4_session_create(&mixed, engine, opt.context_size) == 0);
     const int ordinary_appends[] = {127, 1, 255, 256, 257, 1023, 1024, 4095, 4096,
         8191, 8192, 16383, 16384, 49153, 129, 4096, 16383};
+    const int selected_ab_appends[] = {127, 1, 1024, 2048};
+    const int short_ab_appends[] = {127, 1, 2, 4, 8, 8, 8};
     const int small_appends[] = {7, 1, 8, 9, 15, 16, 17, 31, 1, 32, 63, 64, 65, 127, 128, 129,
         255, 256, 257, 511, 512, 513, 1023, 1024};
-    const int *appends = cuda_small ? small_appends : ordinary_appends;
-    const size_t n_appends = cuda_small ? sizeof(small_appends) / sizeof(*small_appends) :
+    const int *appends = short_ab_mode ? short_ab_appends :
+        selected_ab_mode ? selected_ab_appends :
+        cuda_small ? small_appends : ordinary_appends;
+    const size_t n_appends = short_ab_mode ?
+        sizeof(short_ab_appends) / sizeof(*short_ab_appends) :
+        selected_ab_mode ? sizeof(selected_ab_appends) / sizeof(*selected_ab_appends) :
+        cuda_small ? sizeof(small_appends) / sizeof(*small_appends) :
         cuda ? (cuda_long ? 14u : 9u) :
         sizeof(ordinary_appends) / sizeof(*ordinary_appends) - (resident ? 0u : 1u);
     unsigned scalar = 0, batches = 0, deferred = 0;
@@ -272,6 +380,13 @@ static int check_mixed(const char *model, const char *prompt_path,
             "DS4_METAL_DISABLE_V41_DEFER_DECODER";
         CHECK(setenv(ablation, "1", 1) == 0);
         if (cuda && !tp) CHECK(setenv("DS4_CUDA_SESSION_BATCH_MOE", "0", 1) == 0);
+        const bool selected_ab = selected_ab_mode;
+        const bool short_ab = short_ab_mode;
+        if (selected_ab)
+            CHECK(setenv("DS4_METAL_DISABLE_V41_STREAMING_SELECTED_BATCH", "1", 1) == 0);
+        if (short_ab)
+            CHECK(unsetenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == 0 ||
+                  getenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == NULL);
         if (cuda && tp && appends[i] < 256) {
             /* Mirror scalar control execution on the worker too. */
             ds4_tokens prefix = tokens;
@@ -280,10 +395,15 @@ static int check_mixed(const char *model, const char *prompt_path,
         } else {
             CHECK(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
         }
+        if (selected_ab)
+            CHECK(unsetenv("DS4_METAL_DISABLE_V41_STREAMING_SELECTED_BATCH") == 0);
+        if (short_ab)
+            CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
         if (cuda && !tp) CHECK(unsetenv("DS4_CUDA_SESSION_BATCH_MOE") == 0);
         CHECK(unsetenv(ablation) == 0);
         prefill_progress p = {.session = mixed, .frontier = start,
-            .current = start, .target = tokens.len, .begin = now_sec()};
+            .current = start, .target = tokens.len, .begin = now_sec(),
+            .selected_batch_allowed = start > 0};
         ds4_session_set_progress(mixed, progress_note, &p);
         CHECK(ds4_session_sync(mixed, &tokens, err, sizeof(err)) == 0);
         const double seconds = now_sec() - p.begin;
@@ -319,6 +439,20 @@ static int check_mixed(const char *model, const char *prompt_path,
             puts("TP snapshot rebuild, both-rank replay and next decode: PASS");
         }
         ds4_session_snapshot_free(&snap);
+        if ((selected_ab_mode || short_ab_mode) && i + 1 == n_appends) {
+            int matched = 0, first_mismatch = -1;
+            for (int gstep = 0; gstep < 64; gstep++) {
+                const int ca = ds4_session_argmax(control);
+                const int cb = ds4_session_argmax(mixed);
+                if (ca != cb) { first_mismatch = gstep; break; }
+                matched++;
+                CHECK(ds4_session_eval(control, ca, err, sizeof(err)) == 0);
+                CHECK(ds4_session_eval(mixed, cb, err, sizeof(err)) == 0);
+            }
+            fprintf(stderr, "selected AB greedy matched=%d/64 first_mismatch=%d\n",
+                matched, first_mismatch);
+            CHECK(first_mismatch < 0);
+        }
         fprintf(stderr, "mixed start=%d append=%d scalar=%u batches=%u short_batches=%u deferred=%u "
             "display=%u first_display=%.3fs time=%.3fs rate=%.2f: exact state/decode PASS\n",
             start, appends[i], p.scalar, p.batches, p.short_batches, p.deferred, p.displays,
@@ -354,7 +488,9 @@ static int check_mixed(const char *model, const char *prompt_path,
             puts("V4.1 cancelled layer prefill, restore and next decode: exact PASS");
         }
     }
-    CHECK(scalar && batches && ((cuda && !cuda_long) || deferred));
+    CHECK(short_ab_mode ? (scalar && batches) :
+        selected_ab_mode ? (scalar && batches) :
+        (scalar && batches && ((cuda && !cuda_long) || deferred)));
     puts(deferred_only ? "V4.1 deferred decoder, progress and restore: PASS" :
         "V4.1 mixed small/large continued prefill, dispatch, progress and restore: PASS");
     rc = 0;

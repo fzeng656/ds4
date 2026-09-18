@@ -683,6 +683,8 @@ static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
+static id<MTLBuffer> g_v41_selected_stage_buffer;
+static NSUInteger g_v41_selected_stage_bytes;
 static id<MTLBuffer> g_moe_id_map_buffer;
 static id<MTLBuffer> g_moe_packed_rhs_buffer;
 static NSUInteger g_moe_packed_rhs_bytes;
@@ -11763,6 +11765,8 @@ void ds4_gpu_cleanup(void) {
         g_raw_store_round_buffer = nil;
         g_moe_gate_scratch_buffer = nil;
         g_moe_down_scratch_buffer = nil;
+        g_v41_selected_stage_buffer = nil;
+        g_v41_selected_stage_bytes = 0;
         g_moe_id_map_buffer = nil;
         g_moe_packed_rhs_buffer = nil;
         g_moe_packed_rhs_bytes = 0;
@@ -35946,12 +35950,31 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             return 0;
         }
 
-        const bool force_scalar = g_quality_mode;
+        /* DS4_METAL_V41_INDEX_SCALAR=1 keeps every decode-sized call on the
+         * scalar kernel (the tiled one sums in a different order). */
+        static int scalar_env = -1;
+        if (scalar_env < 0) scalar_env = getenv("DS4_METAL_V41_INDEX_SCALAR") != NULL;
+        const bool force_scalar = g_quality_mode || (scalar_env && n_tokens < 8u);
         const bool use_tiled_f32 = tiled_f32;
-        const bool use_tiled = !force_scalar && n_tokens >= 8u &&
+        /* The scalar kernel runs one 32-thread threadgroup per (row, token)
+         * and re-reads the token's whole q per row: at 125k tokens of V4.1
+         * context that is 6 ms per call, 49 ms per decode step, and it grows
+         * with the context. The tiled kernel pads a decode's few tokens to
+         * its 8-token tile and is ~100x cheaper on a long context, so it
+         * takes any wide enough row range, not only the prefill's batches. */
+        const bool use_tiled = !force_scalar && (n_tokens >= 8u || n_rows >= 1024u) &&
                                n_head == 32u && head_dim == 128u;
+        /* A decode step over a long context: the token's q sits in
+         * threadgroup memory and each simdgroup streams its rows of the key
+         * cache once, instead of one threadgroup per row re-reading q. */
+        const bool use_decode = use_tiled && use_tiled_f32 && n_tokens <= 8u &&
+                                !getenv("DS4_METAL_DISABLE_V41_INDEX_DECODE");
         id<MTLComputePipelineState> pipeline =
-            use_tiled
+            use_decode
+                ? ds4_gpu_get_pipeline(getenv("DS4_METAL_V41_INDEX_DECODE_ROWS") ?
+                                       "kernel_dsv41_indexer_scores_decode_rows" :
+                                       "kernel_dsv41_indexer_scores_decode")
+                : use_tiled
                 ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
                                                      : g_glm_indexer_scores_tiled_pipeline,
                                        use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
@@ -35988,7 +36011,31 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
         [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
         [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-        if (use_tiled) {
+        if (use_decode) {
+            /* One dispatch per token; 8 simdgroups per threadgroup, each
+             * streaming rows_per_sg rows, sized so ~2k threadgroups cover
+             * the context. */
+            uint32_t rows_per_sg = (n_rows + 8191u) / 8192u;
+            rows_per_sg = (rows_per_sg + 7u) & ~7u;
+            if (rows_per_sg < 8u) rows_per_sg = 8u;
+            const NSUInteger groups = ((NSUInteger)n_rows + (NSUInteger)rows_per_sg * 8u - 1u) /
+                                      ((NSUInteger)rows_per_sg * 8u);
+            [enc setThreadgroupMemoryLength:(32u * 128u + 32u + 8u * 256u) * sizeof(float) atIndex:0];
+            for (uint32_t t = 0; t < n_tokens; t++) {
+                const struct {
+                    uint32_t n_rows, token, pos0, row_group_size, rows_per_sg, n_head;
+                    uint64_t q_token_stride, weights_token_stride, score_token_stride;
+                    float scale;
+                } dargs = {
+                    n_rows, t, pos0, row_group_size, rows_per_sg, n_head,
+                    args.q_token_stride, args.weights_token_stride, args.score_token_stride,
+                    scale,
+                };
+                [enc setBytes:&dargs length:sizeof(dargs) atIndex:0];
+                [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            }
+        } else if (use_tiled) {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;
@@ -36013,6 +36060,60 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexer batch scores")) return 0;
+
+        /* DS4_METAL_V41_INDEX_CHECK: rerun the scalar kernel and report the
+         * largest disagreement, to validate the decode kernel's numerics. */
+        if (use_decode && getenv("DS4_METAL_V41_INDEX_CHECK") != NULL) {
+            static int checks;
+            if (checks < 8) {
+                checks++;
+                if (!ds4_gpu_end_commands()) return 0;
+                float *mine = malloc(score_bytes);
+                ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(score_bytes);
+                if (mine && ref && ds4_gpu_tensor_read(scores, 0, mine, score_bytes)) {
+                    id<MTLComputePipelineState> scalar =
+                        ds4_gpu_hot_pipeline(g_glm_indexer_scores_batch_pipeline,
+                                             "kernel_glm_indexer_scores_batch");
+                    if (scalar && ds4_gpu_begin_commands()) {
+                        int o2 = 0;
+                        id<MTLCommandBuffer> cb2 = ds4_gpu_command_buffer(&o2);
+                        id<MTLComputeCommandEncoder> e2 = ds4_gpu_compute_encoder(cb2);
+                        [e2 setComputePipelineState:scalar];
+                        [e2 setBytes:&args length:sizeof(args) atIndex:0];
+                        [e2 setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+                        [e2 setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
+                        [e2 setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
+                        [e2 setBuffer:ds4_gpu_tensor_buffer(ref) offset:0 atIndex:4];
+                        [e2 setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
+                        [e2 dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, (NSUInteger)n_tokens, 1)
+                             threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+                        ds4_gpu_end_compute_encoder(cb2, e2);
+                        (void)ds4_gpu_finish_command_buffer(cb2, o2, "index check");
+                        if (ds4_gpu_end_commands()) {
+                            float *theirs = malloc(score_bytes);
+                            if (theirs && ds4_gpu_tensor_read(ref, 0, theirs, score_bytes)) {
+                                double worst = 0.0, worst_ref = 0.0; uint64_t worst_i = 0, ninf_mismatch = 0;
+                                const uint64_t n = (uint64_t)n_rows * n_tokens;
+                                for (uint64_t i = 0; i < n; i++) {
+                                    const float a = mine[i], b = theirs[i];
+                                    if (isinf(a) != isinf(b)) { ninf_mismatch++; continue; }
+                                    if (isinf(a)) continue;
+                                    const double d = fabs((double)a - (double)b);
+                                    if (d > worst) { worst = d; worst_ref = b; worst_i = i; }
+                                }
+                                fprintf(stderr, "ds4: index check rows=%u tokens=%u worst |diff|=%.3e at %llu (ref %.5f) inf-mismatch=%llu\n",
+                                        n_rows, n_tokens, worst, (unsigned long long)worst_i, worst_ref,
+                                        (unsigned long long)ninf_mismatch);
+                            }
+                            free(theirs);
+                        }
+                        (void)ds4_gpu_begin_commands();
+                    }
+                }
+                free(mine);
+                ds4_gpu_tensor_free(ref);
+            }
+        }
     }
 
     return 1;
@@ -42857,6 +42958,94 @@ int ds4_gpu_routed_moe_one_tensor(
     return 1;
 }
 
+static int ds4_gpu_v41_stage_selected_experts(
+        id<MTLCommandBuffer> cb,
+        uint32_t layer_index,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t n_total_expert,
+        ds4_gpu_stream_expert_cache_entry * const *resources,
+        uint32_t resource_count,
+        uint32_t unique_count,
+        id<MTLBuffer> *buffer_out,
+        uint64_t *gate_inner_out,
+        uint64_t *up_inner_out,
+        uint64_t *down_inner_out) {
+    if (!cb || !buffer_out || !gate_inner_out || !up_inner_out || !down_inner_out ||
+        !resources || resource_count == 0 || resource_count != unique_count ||
+        n_total_expert == 0 || gate_expert_bytes == 0 || down_expert_bytes == 0) {
+        return 0;
+    }
+    if ((uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) return 0;
+    const uint64_t gate_tensor_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_tensor_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_tensor_bytes > (UINT64_MAX - down_tensor_bytes) / 2u) return 0;
+    const uint64_t total_bytes = gate_tensor_bytes * 2u + down_tensor_bytes;
+    if (total_bytes > (uint64_t)NSUIntegerMax) return 0;
+    if (!ds4_gpu_ensure_scratch_buffer(&g_v41_selected_stage_buffer,
+                                       &g_v41_selected_stage_bytes,
+                                       (NSUInteger)total_bytes,
+                                       "ds4_v41_selected_expert_stage")) return 0;
+
+    ds4_gpu_close_batch_encoder();
+    id<MTLBlitCommandEncoder> blit =
+        ds4_gpu_blit_encoder(cb, "v41_selected_expert_stage", resource_count * 3u);
+    if (!blit) return 0;
+    uint64_t copied = 0;
+    for (uint32_t i = 0; i < resource_count; i++) {
+        ds4_gpu_stream_expert_cache_entry *entry = resources[i];
+        if (!entry || !entry->valid || !entry->gate_buffer || !entry->up_buffer ||
+            !entry->down_buffer || entry->gate_abs_offset < gate_offset ||
+            entry->up_abs_offset < up_offset || entry->down_abs_offset < down_offset) {
+            [blit endEncoding];
+            return 0;
+        }
+        const uint64_t gate_rel = entry->gate_abs_offset - gate_offset;
+        const uint64_t up_rel = entry->up_abs_offset - up_offset;
+        const uint64_t down_rel = entry->down_abs_offset - down_offset;
+        if (gate_rel % gate_expert_bytes || up_rel % gate_expert_bytes ||
+            down_rel % down_expert_bytes) {
+            [blit endEncoding];
+            return 0;
+        }
+        const uint64_t expert = gate_rel / gate_expert_bytes;
+        if (expert >= n_total_expert || up_rel / gate_expert_bytes != expert ||
+            down_rel / down_expert_bytes != expert) {
+            [blit endEncoding];
+            return 0;
+        }
+        const NSUInteger gate_dst = (NSUInteger)(expert * gate_expert_bytes);
+        const NSUInteger up_dst = (NSUInteger)(gate_tensor_bytes + expert * gate_expert_bytes);
+        const NSUInteger down_dst = (NSUInteger)(gate_tensor_bytes * 2u + expert * down_expert_bytes);
+        [blit copyFromBuffer:entry->gate_buffer sourceOffset:entry->gate_inner
+                    toBuffer:g_v41_selected_stage_buffer destinationOffset:gate_dst
+                        size:(NSUInteger)gate_expert_bytes];
+        [blit copyFromBuffer:entry->up_buffer sourceOffset:entry->up_inner
+                    toBuffer:g_v41_selected_stage_buffer destinationOffset:up_dst
+                        size:(NSUInteger)gate_expert_bytes];
+        [blit copyFromBuffer:entry->down_buffer sourceOffset:entry->down_inner
+                    toBuffer:g_v41_selected_stage_buffer destinationOffset:down_dst
+                        size:(NSUInteger)down_expert_bytes];
+        copied += gate_expert_bytes * 2u + down_expert_bytes;
+    }
+    [blit endEncoding];
+    g_batch_has_work = YES;
+    *buffer_out = g_v41_selected_stage_buffer;
+    *gate_inner_out = 0;
+    *up_inner_out = gate_tensor_bytes;
+    *down_inner_out = gate_tensor_bytes * 2u;
+    if (getenv("DS4_METAL_V41_SELECTED_STAGE_PROFILE") != NULL) {
+        fprintf(stderr,
+                "ds4: V4.1 selected staging layer=%u experts=%u copied=%.2f GiB stage=%.2f GiB\n",
+                layer_index, resource_count, ds4_gpu_gib(copied), ds4_gpu_gib(total_bytes));
+    }
+    return 1;
+}
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -43124,6 +43313,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil;
         /* Small full-GLM appends reuse cached bytes with the same MV/MM
          * arithmetic. Large prefills retain sequential whole-layer reads. */
+        const bool use_v41_selected_stage_mm =
+            use_iq2_batch_selected_addr &&
+            getenv("DS4_METAL_ENABLE_V41_STREAMING_SELECTED_STAGE_MM") != NULL &&
+            getenv("DS4_METAL_DISABLE_V41_STREAMING_SELECTED_STAGE_MM") == NULL &&
+            n_total_expert == 384u && n_expert == 6u && n_tokens >= 32u &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K;
         const bool use_iq2_cached_batch =
             g_ssd_streaming_mode && !force_resident && g_tp_split_world == 1 &&
             !ds4_gpu_glm_streaming_prefill_full_layer_active() &&
@@ -43196,7 +43392,7 @@ int ds4_gpu_routed_moe_batch_tensor(
              ds4_gpu_q4_table_model_residency_enabled());
         const bool use_mm_id =
             !use_q4_batch_expert_table &&
-            !use_iq2_batch_selected_addr &&
+            (!use_iq2_batch_selected_addr || use_v41_selected_stage_mm) &&
             n_tokens >= 32u &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /* Reuse half activations across gate/up and all output tiles. V4.1
@@ -43208,7 +43404,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             expert_mid_dim == 2304u;
         const uint64_t packed_limit = (v41_packed ? UINT64_C(512) : UINT64_C(256)) << 20;
         const bool use_packed_mpp = use_mm_id && !g_quality_mode &&
-            (!g_ssd_streaming_mode || force_resident) && n_tokens >= 512u &&
+            (!g_ssd_streaming_mode || force_resident || use_v41_selected_stage_mm) && n_tokens >= 512u &&
             n_tokens <= (v41_packed ? 8192u : 4096u) &&
             n_expert == 6u && n_total_expert <= 384u &&
             expert_in_dim <= 5120u && expert_mid_dim <= 4096u &&
@@ -43286,7 +43482,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const bool request_mid_f16 =
             !g_quality_mode &&
             !use_q4_batch_expert_table &&
-            !use_iq2_batch_selected_addr;
+            (!use_iq2_batch_selected_addr || use_v41_selected_stage_mm);
         /*
          * Fused gate+up grouped matmul with the SwiGLU epilogue. Both IQ2 and
          * Q4_K use the compact expert work list, the same MMA accumulation
@@ -43699,6 +43895,21 @@ int ds4_gpu_routed_moe_batch_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
+        if (use_v41_selected_stage_mm) {
+            id<MTLBuffer> stage = nil;
+            uint64_t stage_gate = 0, stage_up = 0, stage_down = 0;
+            if (!ds4_gpu_v41_stage_selected_experts(cb, layer_index,
+                    gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes,
+                    n_total_expert, stream_resources, stream_resource_count, stream_unique,
+                    &stage, &stage_gate, &stage_up, &stage_down)) {
+                ds4_gpu_stream_expert_cache_clear_layer(layer_index);
+                return 0;
+            }
+            gate_buf = up_buf = down_buf = stage;
+            gate_inner = stage_gate;
+            up_inner = stage_up;
+            down_inner = stage_down;
+        }
         if (use_q4_batch_expert_table && !ds4_gpu_use_model_residency_set(cb)) {
             return 0;
         }
@@ -43715,6 +43926,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const char *moe_stage_filter = getenv("DS4_METAL_MOE_STAGE_PROFILE_FILTER");
         const char *moe_path =
             use_q4_batch_expert_table ? "q4_table_pair_swiglu" :
+            use_v41_selected_stage_mm ? "v41_selected_stage_mm" :
             use_iq2_batch_selected_addr ? "iq2_batch_stream_addr" :
             use_iq2_cached_batch ? (use_mm_id ? "iq2_cached_mm" : "iq2_cached_mv") :
             use_mm_id_pair_swiglu ? "mm_id_pair_swiglu" :
@@ -43789,7 +44001,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             (n_tokens <= 4u || v41_decode_batch || use_tp_mxfp4_static_batch) &&
             down_sum6_pipeline != nil;
         int ok = 0;
-        if (use_iq2_batch_selected_addr) {
+        if (use_iq2_batch_selected_addr && !use_v41_selected_stage_mm) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
                 .rows = pair_rows,
@@ -44064,7 +44276,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_fused_activation &&
             request_mid_f16;
         if (mid_is_f16) *mid_is_f16 = use_mid_f16;
-        if (ok && use_iq2_batch_selected_addr) {
+        if (ok && use_iq2_batch_selected_addr && !use_v41_selected_stage_mm) {
             /* The address-table pair kernel already wrote weighted SwiGLU rows into mid. */
         } else if (ok && use_q4_batch_expert_table) {
             /* The table pair kernel already wrote weighted SwiGLU rows into mid. */
@@ -44166,7 +44378,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         NSUInteger down_dst_off = n_expert == 1 ? ds4_gpu_tensor_offset(out) :
             (expertsbuf ? ds4_gpu_tensor_offset(experts) : 0);
         if (ok) {
-            if (use_iq2_batch_selected_addr) {
+            if (use_iq2_batch_selected_addr && !use_v41_selected_stage_mm) {
                 ok = ds4_gpu_encode_mul_mv_addr_q2_sum6(
                         cb,
                         g_moe_mul_mv_addr_q2_k_sum6_pipeline,
@@ -44267,7 +44479,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_expert > 1 &&
             !direct_down_sum &&
             !use_q4_batch_expert_table &&
-            !use_iq2_batch_selected_addr) {
+            (!use_iq2_batch_selected_addr || use_v41_selected_stage_mm)) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
                                                        down_dst,
                                                        down_dst_off,
