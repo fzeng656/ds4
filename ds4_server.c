@@ -13591,13 +13591,44 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
+
+    /*
+     * OpenClaw long-agent histories commonly differ only in a rewritten tail
+     * after compaction/tool-history normalization.  When the shared token
+     * prefix is still large, an older disk checkpoint near that frontier is
+     * more valuable for this request than persisting the newer live tail first.
+     *
+     * The normal store-before-load order can evict that older checkpoint under
+     * a tight disk budget.  Defer the live store for this narrow case, try the
+     * existing disk set first, and only persist the current live state if the
+     * disk lookup misses.  A hit is allowed to replace the live session exactly
+     * as in the normal path; a miss leaves the live session untouched, so the
+     * deferred store is still safe.
+     */
+    const bool defer_live_store_for_common_rebuild =
+        !multimodal &&
+        s->kv.enabled &&
+        cached == 0 &&
+        j->req.kind == REQ_CHAT &&
+        j->req.has_tools &&
+        old_pos >= s->kv.opt.min_tokens &&
+        common >= 2048 &&
+        common < old_pos &&
+        common < j->req.prompt.len;
+
     if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
+        old_pos >= s->kv.opt.min_tokens &&
+        !defer_live_store_for_common_rebuild) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
+    } else if (defer_live_store_for_common_rebuild) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: deferring live checkpoint store before large-common disk recovery common=%d old=%d prompt=%d",
+                   common, old_pos, j->req.prompt.len);
     }
+
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
@@ -13606,6 +13637,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+        } else if (defer_live_store_for_common_rebuild) {
+            /* Disk lookup is non-destructive on a miss.  Preserve the newer
+             * live frontier now that it can no longer evict the checkpoint we
+             * were trying to recover for this request. */
+            kv_cache_store_current(s, slot, "evict-after-disk-miss");
         }
     }
     const bool responses_reasoning_state_preserved =
