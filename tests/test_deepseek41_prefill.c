@@ -36,7 +36,15 @@ static int check_dispatch(void) {
             for (size_t i = 0; i < sizeof(remaining) / sizeof(*remaining); i++) {
                 uint32_t expected = cold[i];
 #ifdef __APPLE__
-                if (warm && cache == half && remaining[i] < 1024) expected = 1;
+                const uint32_t minimum = warm && cache == half ? 1024u : 256u;
+                if (remaining[i] < minimum) {
+                    expected = 1;
+                } else if (remaining[i] >= 3072u) {
+                    const uint32_t count = remaining[i] < g.carry_cap ? remaining[i] : g.carry_cap;
+                    const uint32_t tail = count % 2048u;
+                    expected = remaining[i] < 8192u && (!tail || tail >= minimum) ?
+                        count : count - tail;
+                }
 #elif !defined(DS4_ROCM_BUILD)
                 if (remaining[i] > 2048 && remaining[i] < 8192 && remaining[i] % 2048 >= 256)
                     expected = remaining[i];
