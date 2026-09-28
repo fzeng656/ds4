@@ -259,7 +259,7 @@ done:
 
 static int check_address_batch(const void *model, uint64_t bytes,
                                uint64_t up_off, uint64_t down_off) {
-    enum { T = 512 };
+    enum { T = 800 };
     FILE *source = tmpfile();
     const uint64_t xb = T * INPUT * sizeof(float), ob = T * OUTPUT * sizeof(float);
     const uint64_t mb = T * SELECTED * MID * sizeof(float), ib = T * SELECTED * sizeof(int32_t);
@@ -285,7 +285,7 @@ static int check_address_batch(const void *model, uint64_t bytes,
         2u * MID * sizeof(iq2_block) + OUTPUT * 2u * sizeof(q2_block));
     ok = ds4_gpu_tensor_write(xt, 0, x, xb) && ds4_gpu_tensor_write(it, 0, ids, ib) &&
          ds4_gpu_tensor_write(wt, 0, weights, ib);
-    const uint32_t sizes[] = {169, 170, 171, 257, 512};
+    const uint32_t sizes[] = {169, 170, 171, 257, 512, 704, 760};
     for (unsigned c = 0; ok && c < sizeof(sizes) / sizeof(*sizes); c++) {
         for (int split = 1; split >= 0 && ok; split--) {
             for (uint32_t start = 0; start < sizes[c] && ok;) {

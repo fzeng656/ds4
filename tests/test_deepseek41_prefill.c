@@ -55,6 +55,26 @@ static int check_dispatch(void) {
             }
         }
     }
+#ifdef __APPLE__
+    /* Metal SSD tiny continued-prefill remains opt-in.  Once enabled, 8..255
+     * token suffixes are consumed as exact 8-row microbatches; 1..7 stay scalar. */
+    g.pos = 1;
+    g.valid = true;
+    g.tp_world = 1;
+    g.streaming = true;
+    CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
+    g.valid = false;
+    CHECK(ds41_short_prefill_count(&g, &weights, 64) == 0);
+    g.valid = true;
+    CHECK(ds41_short_prefill_count(&g, &weights, 7) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 8) == 8);
+    CHECK(ds41_short_prefill_count(&g, &weights, 9) == 8);
+    CHECK(ds41_short_prefill_count(&g, &weights, 64) == 8);
+    CHECK(ds41_short_prefill_count(&g, &weights, 128) == 8);
+    CHECK(ds41_short_prefill_count(&g, &weights, 255) == 8);
+    CHECK(ds41_short_prefill_count(&g, &weights, 256) == 0);
+    CHECK(unsetenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == 0);
+#endif
     g.pos = 0;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     CHECK(ds41_prefill_count(&g, 2303) == 2048);
@@ -170,7 +190,65 @@ static bool cancel_after_display(void *ud) {
     return ((prefill_progress *)ud)->displays >= 2;
 }
 
+
+static bool state_equivalent_short(ds4_session *a, ds4_session *b) {
+    if (!a->checkpoint_valid || !b->checkpoint_valid ||
+        !a->ds41_graph.valid || !b->ds41_graph.valid ||
+        ds4_session_pos(a) != ds4_session_pos(b) ||
+        memcmp(&a->ds41_graph.history, &b->ds41_graph.history,
+               sizeof(a->ds41_graph.history))) return false;
+    ds41_state_span sa[64], sb[64];
+    uint32_t n = ds41_state_spans(&a->ds41_graph, a->ds41_graph.pos, sa);
+    if (n != ds41_state_spans(&b->ds41_graph, b->ds41_graph.pos, sb)) return false;
+    uint64_t state_count = 0, state_different = 0;
+    double state_sq = 0.0;
+    float state_max = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const size_t bytes = (size_t)sa[i].bytes;
+        float *left = malloc(bytes), *right = malloc(bytes);
+        const bool readable = left && right && sa[i].bytes == sb[i].bytes &&
+            ds4_gpu_tensor_read(sa[i].tensor, 0, left, bytes) &&
+            ds4_gpu_tensor_read(sb[i].tensor, 0, right, bytes);
+        if (!readable) { free(left); free(right); return false; }
+        const size_t nf = bytes / sizeof(float);
+        for (size_t j = 0; j < nf; j++) {
+            if (!isfinite(left[j]) || !isfinite(right[j])) {
+                free(left); free(right); return false;
+            }
+            const float d = fabsf(left[j] - right[j]);
+            if (d != 0.0f) state_different++;
+            if (d > state_max) state_max = d;
+            state_sq += (double)d * d;
+        }
+        state_count += nf;
+        free(left); free(right);
+    }
+    double logit_sq = 0.0;
+    float logit_max = 0.0f;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (!isfinite(a->logits[i]) || !isfinite(b->logits[i])) return false;
+        const float d = fabsf(a->logits[i] - b->logits[i]);
+        if (d > logit_max) logit_max = d;
+        logit_sq += (double)d * d;
+    }
+    const double state_rms = state_count ? sqrt(state_sq / (double)state_count) : 0.0;
+    const double logit_rms = sqrt(logit_sq / (double)DS4_N_VOCAB);
+    const int atop = ds4_session_argmax(a), btop = ds4_session_argmax(b);
+    fprintf(stderr,
+        "short AB frontier=%d state_diff=%llu state_rms=%.6g state_max=%.6g "
+        "logit_rms=%.6g logit_max=%.6g top=%d/%d\\n",
+        ds4_session_pos(a), (unsigned long long)state_different,
+        state_rms, state_max, logit_rms, logit_max, atop, btop);
+    const bool medium_expand_ab =
+        getenv("DS4_TEST_V41_MEDIUM_EXPAND_AB") != NULL;
+    return state_max <= (medium_expand_ab ? 8.0f : 0.08f) &&
+        state_rms <= (medium_expand_ab ? 1.0 : 0.02) &&
+        logit_rms <= 4.0 && logit_max <= 12.0f && atop == btop;
+}
+
 static bool state_equal(ds4_session *a, ds4_session *b) {
+    if (getenv("DS4_TEST_V41_SHORT_BATCH_RELAXED") != NULL)
+        return state_equivalent_short(a, b);
     if (!a->checkpoint_valid || !b->checkpoint_valid ||
         !a->ds41_graph.valid || !b->ds41_graph.valid ||
         ds4_session_pos(a) != ds4_session_pos(b) ||
@@ -227,6 +305,8 @@ static int check_mixed(const char *model, const char *prompt_path,
     const bool cuda_long = mode == PREFILL_CUDA_LONG || mode == PREFILL_CUDA_DEFERRED;
     const bool deferred_only = mode == PREFILL_CUDA_DEFERRED;
     const bool cuda_small = mode == PREFILL_CUDA_SMALL;
+    const bool short_ab_mode = !cuda && !tp_opt &&
+        getenv("DS4_TEST_V41_SHORT_BATCH_AB") != NULL;
     ds4_engine *engine = NULL;
     ds4_tp *tp = NULL;
     ds4_session *control = NULL, *mixed = NULL;
@@ -239,7 +319,7 @@ static int check_mixed(const char *model, const char *prompt_path,
         .backend = cuda ? DS4_BACKEND_CUDA : DS4_BACKEND_METAL,
         .context_size = cuda ? (cuda_long ? 65536 : 16384) : 131072, .power_percent = 100,
         .ssd_streaming = !tp_opt && !resident,
-        .ssd_streaming_cache_bytes = tp_opt || resident ? 0 : UINT64_C(64) << 30};
+        .ssd_streaming_cache_bytes = tp_opt || resident ? 0 : UINT64_C(48) << 30};
     if (tp_opt) opt.tp = *tp_opt;
     CHECK(imatrix_read_text_file(prompt_path, &prompt, &bytes));
     CHECK(ds4_engine_open(&engine, &opt) == 0);
@@ -264,13 +344,35 @@ static int check_mixed(const char *model, const char *prompt_path,
     CHECK(ds4_session_create(&mixed, engine, opt.context_size) == 0);
     const int ordinary_appends[] = {127, 1, 255, 256, 257, 1023, 1024, 4095, 4096,
         8191, 8192, 16383, 16384, 49153, 129, 4096, 16383};
+    const int short_ab_appends[] = {1, 7, 8, 16, 32, 64, 100, 128, 255, 256};
     const int small_appends[] = {7, 1, 8, 9, 15, 16, 17, 31, 1, 32, 63, 64, 65, 127, 128, 129,
         255, 256, 257, 511, 512, 513, 1023, 1024};
-    const int *appends = cuda_small ? small_appends : ordinary_appends;
-    const size_t n_appends = cuda_small ? sizeof(small_appends) / sizeof(*small_appends) :
+    int short_one_append = 0;
+    const char *short_one_env = short_ab_mode ? getenv("DS4_TEST_V41_SHORT_APPEND") : NULL;
+    if (short_one_env && short_one_env[0]) short_one_append = atoi(short_one_env);
+    const int *appends = short_ab_mode && short_one_append > 0 ? &short_one_append :
+        short_ab_mode ? short_ab_appends :
+        cuda_small ? small_appends : ordinary_appends;
+    const size_t n_appends = short_ab_mode && short_one_append > 0 ? 1u :
+        short_ab_mode ? sizeof(short_ab_appends) / sizeof(*short_ab_appends) :
+        cuda_small ? sizeof(small_appends) / sizeof(*small_appends) :
         cuda ? (cuda_long ? 14u : 9u) :
         sizeof(ordinary_appends) / sizeof(*ordinary_appends) - (resident ? 0u : 1u);
     unsigned scalar = 0, batches = 0, deferred = 0;
+    if (short_ab_mode) {
+        /* Build one canonical cold prefix, then fork it by snapshot so the
+         * A/B starts from byte-identical graph/KV state.  Two independent cold
+         * streaming sessions can otherwise differ before the short path runs. */
+        tokens.len = 128;
+        CHECK(unsetenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == 0 ||
+              getenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == NULL);
+        CHECK(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
+        CHECK(ds4_session_save_snapshot(control, &snap, err, sizeof(err)) == 0);
+        CHECK(ds4_session_load_snapshot(mixed, &snap, err, sizeof(err)) == 0);
+        CHECK(state_equal(control, mixed));
+        ds4_session_snapshot_free(&snap);
+        fprintf(stderr, "short AB canonical prefix=128: snapshot fork exact PASS\n");
+    }
     for (size_t i = deferred_only ? 13u : 0u; i < n_appends; i++) {
         /* A single 49K append crosses the deferred-decoder threshold. Reset
          * both sessions to cover it without allocating two 128K graphs. */
@@ -285,6 +387,45 @@ static int check_mixed(const char *model, const char *prompt_path,
         const char *ablation = tp ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE" :
             "DS4_METAL_DISABLE_V41_DEFER_DECODER";
         CHECK(setenv(ablation, "1", 1) == 0);
+        if (short_ab_mode) {
+            CHECK(unsetenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == 0 ||
+                  getenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == NULL);
+            if (getenv("DS4_TEST_V41_APPEND_MIN_AB") != NULL)
+                CHECK(setenv("DS4_METAL_V41_STREAMING_APPEND_MIN", "256", 1) == 0);
+            if (getenv("DS4_TEST_V41_APPEND_MIN_PROD_AB") != NULL) {
+                CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_STREAMING_APPEND_MIN", "256", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_SELECTED_ADDR", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_DECODE_MAP", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_MEDIUM_PREFILL_MAX", "8191", 1) == 0);
+                CHECK(unsetenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP") == 0 ||
+                      getenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP") == NULL);
+            }
+            if (getenv("DS4_TEST_V41_MEDIUM_TAIL_SWEEP_AB") != NULL) {
+                CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_STREAMING_APPEND_MIN", "8", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_SELECTED_ADDR", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_DECODE_MAP", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_MEDIUM_PREFILL_MAX", "8191", 1) == 0);
+                CHECK(unsetenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP") == 0 ||
+                      getenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP") == NULL);
+            }
+            CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_SELECTED_ADDR", "1", 1) == 0);
+            CHECK(unsetenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_DECODE_MAP") == 0 ||
+                  getenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_DECODE_MAP") == NULL);
+            if (getenv("DS4_TEST_V41_MEDIUM_EXPAND_AB") != NULL ||
+                getenv("DS4_TEST_V41_MEDIUM_CACHED_MPP_AB") != NULL) {
+                CHECK(setenv("DS4_METAL_V41_MEDIUM_PREFILL_MAX", "800", 1) == 0);
+                CHECK(setenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX", "800", 1) == 0);
+            }
+            if (getenv("DS4_TEST_V41_MEDIUM_CACHED_MPP_AB") != NULL) {
+                CHECK(unsetenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM") == 0 ||
+                      getenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM") == NULL);
+            }
+        }
+        const double control_t0 = now_sec();
         if (cuda && !tp) {
             CHECK(setenv("DS4_CUDA_SESSION_BATCH_MOE", "0", 1) == 0);
             CHECK(setenv("DS4_CUDA_DISABLE_SSD_PREFETCH", "1", 1) == 0);
@@ -297,6 +438,48 @@ static int check_mixed(const char *model, const char *prompt_path,
                 CHECK(ds4_session_sync(control, &prefix, err, sizeof(err)) == 0);
         } else {
             CHECK(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
+        }
+        const double control_seconds = now_sec() - control_t0;
+        if (short_ab_mode) {
+            CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
+            if (getenv("DS4_TEST_V41_APPEND_MIN_AB") != NULL) {
+                const char *append_min = getenv("DS4_TEST_V41_APPEND_MIN");
+                if (!append_min || !append_min[0]) append_min = "64";
+                CHECK(setenv("DS4_METAL_V41_STREAMING_APPEND_MIN", append_min, 1) == 0);
+            }
+            if (getenv("DS4_TEST_V41_APPEND_MIN_PROD_AB") != NULL) {
+                CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_STREAMING_APPEND_MIN", "8", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_SELECTED_ADDR", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_DECODE_MAP", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_MEDIUM_PREFILL_MAX", "8191", 1) == 0);
+                CHECK(unsetenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP") == 0 ||
+                      getenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP") == NULL);
+            }
+            CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_SELECTED_ADDR", "1", 1) == 0);
+            if (getenv("DS4_TEST_V41_MEDIUM_EXPAND_AB") != NULL ||
+                getenv("DS4_TEST_V41_MEDIUM_CACHED_MPP_AB") != NULL) {
+                const char *expand_max = getenv("DS4_TEST_V41_MEDIUM_EXPAND_MAX");
+                if (!expand_max || !expand_max[0]) expand_max = "2048";
+                CHECK(setenv("DS4_METAL_V41_MEDIUM_PREFILL_MAX", expand_max, 1) == 0);
+                if (getenv("DS4_TEST_V41_MEDIUM_CACHED_MPP_AB") != NULL) {
+                    /* Keep the old MV selected-address path capped at 800.
+                     * Only the new cached-MPP path expands beyond it. */
+                    CHECK(setenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX", "800", 1) == 0);
+                    CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM", "1", 1) == 0);
+                } else {
+                    CHECK(setenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_MAX", expand_max, 1) == 0);
+                }
+            }
+            CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_DECODE_MAP", "1", 1) == 0);
+            if (getenv("DS4_TEST_V41_MEDIUM_TAIL_SWEEP_AB") != NULL) {
+                CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_STREAMING_APPEND_MIN", "8", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM", "1", 1) == 0);
+                CHECK(setenv("DS4_METAL_V41_MEDIUM_PREFILL_MAX", "8191", 1) == 0);
+                CHECK(setenv("DS4_METAL_ENABLE_V41_MEDIUM_TAIL_SWEEP", "1", 1) == 0);
+            }
         }
         if (cuda && !tp) {
             CHECK(unsetenv("DS4_CUDA_SESSION_BATCH_MOE") == 0);
@@ -341,10 +524,26 @@ static int check_mixed(const char *model, const char *prompt_path,
             puts("TP snapshot rebuild, both-rank replay and next decode: PASS");
         }
         ds4_session_snapshot_free(&snap);
+        if (short_ab_mode && i + 1 == n_appends) {
+            int matched = 0, first_mismatch = -1;
+            for (int gstep = 0; gstep < 64; gstep++) {
+                const int ca = ds4_session_argmax(control);
+                const int cb = ds4_session_argmax(mixed);
+                if (ca != cb) { first_mismatch = gstep; break; }
+                matched++;
+                CHECK(ds4_session_eval(control, ca, err, sizeof(err)) == 0);
+                CHECK(ds4_session_eval(mixed, cb, err, sizeof(err)) == 0);
+            }
+            fprintf(stderr, "short AB greedy matched=%d/64 first_mismatch=%d\n",
+                    matched, first_mismatch);
+            CHECK(first_mismatch < 0);
+        }
         fprintf(stderr, "mixed start=%d append=%d scalar=%u batches=%u short_batches=%u deferred=%u "
-            "display=%u first_display=%.3fs time=%.3fs rate=%.2f: exact state/decode PASS\n",
+            "display=%u first_display=%.3fs control=%.3fs mixed=%.3fs speedup=%.2fx rate=%.2f: exact state/decode PASS\n",
             start, appends[i], p.scalar, p.batches, p.short_batches, p.deferred, p.displays,
-            p.first_display, seconds, appends[i] / seconds);
+            p.first_display, control_seconds, seconds,
+            control_seconds > 0.0 ? control_seconds / seconds : 0.0,
+            appends[i] / seconds);
         if (cuda && i == 3) {
             CHECK(ds4_session_save_snapshot(mixed, &snap, err, sizeof(err)) == 0);
             const int frontier = ds4_session_pos(mixed);
@@ -376,8 +575,11 @@ static int check_mixed(const char *model, const char *prompt_path,
             puts("V4.1 cancelled layer prefill, restore and next decode: exact PASS");
         }
     }
-    CHECK(scalar && batches && ((cuda && !cuda_long) || deferred));
-    puts(deferred_only ? "V4.1 deferred decoder, progress and restore: PASS" :
+    if (!(short_ab_mode && short_one_append > 0))
+        CHECK(short_ab_mode ? (scalar && batches) :
+            (scalar && batches && ((cuda && !cuda_long) || deferred)));
+    puts(short_ab_mode ? "V4.1 Metal SSD short continued-prefill A/B: exact PASS" :
+        deferred_only ? "V4.1 deferred decoder, progress and restore: PASS" :
         "V4.1 mixed small/large continued prefill, dispatch, progress and restore: PASS");
     rc = 0;
 done:

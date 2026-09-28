@@ -58,11 +58,14 @@ typedef struct {
     float p_min;                 /* per-position confidence floor (GLM's 0.75) */
     uint32_t min_draft;          /* admitted prefix below this declines the cycle */
     bool loss_budget;            /* bounded cumulative loss before backoff */
+    uint32_t cold_decline_bypass;/* pre-verify declines before serial-only remainder; 0 disables */
+    float hard_loss_serial;      /* one verified loss >= N serial steps => request bypass; 0 disables */
+    uint32_t backoff_base;       /* serial tokens skipped after first losing window; doubles on repeats */
 } ds41_adapt_config;
 
 typedef struct {
     ds41_adapt_config config;
-    bool active, invalid, engaged, reasoning;
+    bool active, invalid, engaged, reasoning, cold_bypass;
     uint32_t bad_run, skip_remaining, window_calls;
     double window_net_ms;
     double loss_debt_ms;         /* unrepaid window losses; wins repay, never bank credit */
@@ -133,6 +136,7 @@ static inline bool ds41_adapt_skip(const ds41_dspark_adaptive *a) {
 static inline bool ds41_adapt_admit(const ds41_dspark_adaptive *a) {
     if (!a->active || a->invalid) return false;
     if (!a->config.enabled) return true;
+    if (a->cold_bypass) return false;
     if (a->config.reasoning_serial && a->reasoning) return false;
     return !ds41_adapt_entry_wait(a) && !ds41_adapt_skip(a);
 }
@@ -145,6 +149,7 @@ static inline void ds41_adapt_reasoning(ds41_dspark_adaptive *a, bool inside) {
         a->window_net_ms = 0.0;
         a->loss_debt_ms = 0.0;
         a->engaged = false;
+        a->cold_bypass = false;
     }
     a->reasoning = inside;
 }
@@ -211,7 +216,9 @@ static inline void ds41_adapt_window_feedback(ds41_dspark_adaptive *a, uint32_t 
     } else {
         a->engaged = false;
         if (a->bad_run < DS41_ADAPT_BACKOFF_MAX) a->bad_run++;
-        a->skip_remaining = DS41_ADAPT_BACKOFF_BASE << (a->bad_run - 1u);
+        const uint32_t base = a->config.backoff_base ?
+            a->config.backoff_base : DS41_ADAPT_BACKOFF_BASE;
+        a->skip_remaining = base << (a->bad_run - 1u);
         a->backoffs++;
         a->loss_debt_ms = 0.0;
     }
@@ -234,10 +241,28 @@ static inline void ds41_adapt_record_decline(ds41_dspark_adaptive *a, double wal
     a->declines++;
     a->serial_consumed += rows;
     ds41_adapt_window_feedback(a, rows, wall_ms, false);
+    if (a->config.cold_decline_bypass != 0u && !a->attempts &&
+        a->declines >= a->config.cold_decline_bypass) {
+        a->cold_bypass = true;
+    }
 }
 
 /* One decode step has finished.  `rows` is what it produced, `drafted` says
  * whether it was a verify cycle or an ordinary serial token. */
+static inline bool ds41_adapt_hard_loss(ds41_dspark_adaptive *a, double wall_ms,
+                                        uint32_t rows) {
+    if (!a->active || a->config.hard_loss_serial <= 0.0f ||
+        a->serial_ms <= 0.0 || !rows || !ds41_adapt_timing(wall_ms)) return false;
+    const double net_ms = wall_ms - (double)rows * a->serial_ms;
+    if (net_ms < (double)a->config.hard_loss_serial * a->serial_ms) return false;
+    a->cold_bypass = true;
+    a->window_calls = 0u;
+    a->window_net_ms = 0.0;
+    a->loss_debt_ms = 0.0;
+    a->engaged = false;
+    return true;
+}
+
 static inline void ds41_adapt_record(ds41_dspark_adaptive *a, double wall_ms,
                                      uint32_t rows, bool drafted) {
     if (!a->active) return;

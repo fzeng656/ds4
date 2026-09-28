@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
+#include "ds4_gpu.h"
 #include "ds4_help.h"
 #include "ds4_tp.h"
 
@@ -833,6 +834,8 @@ int main(int argc, char **argv) {
         }
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
+        if (getenv("DS4_BENCH_STREAMING_EXPERT_TIMING_BASELINE") != NULL)
+            ds4_gpu_print_memory_report("bench post-prefill timing baseline");
         if (getenv("DS4_METAL_CB_TIMES"))
             fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
                     prefill_t0 * 1e3, prefill_t1 * 1e3);

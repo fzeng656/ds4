@@ -18,7 +18,8 @@ static void decline(ds41_dspark_adaptive *a, double ms) {
 }
 
 int main(void) {
-    const ds41_adapt_config c = {16u, true, true, 0.75f, 3u, false};
+    const ds41_adapt_config c = {16u, true, true, 0.75f, 3u, false, 0u, 0.0f,
+                                   DS41_ADAPT_BACKOFF_BASE};
     ds41_dspark_adaptive a;
     ds41_adapt_begin(&a, c);
     assert(a.active && !a.invalid && !a.engaged);
@@ -60,6 +61,20 @@ int main(void) {
     for (unsigned i = 0; i < 16; i++) { assert(!ds41_adapt_admit(&a)); serial(&a, 32.0); }
     assert(!a.skip_remaining && ds41_adapt_admit(&a) && a.skipped_steps == 16);
 
+    /* Runtime backoff base lets cheap verifiers probe again sooner without
+     * changing the default 16/32/64/128 policy. */
+    ds41_adapt_config short_backoff = c;
+    short_backoff.min_serial_tokens = 0;
+    short_backoff.backoff_base = 4u;
+    ds41_dspark_adaptive sb;
+    ds41_adapt_begin(&sb, short_backoff);
+    serial(&sb, 32.0);
+    for (unsigned i = 0; i < 3; i++) cycle(&sb, 400.0, 2u);
+    assert(sb.skip_remaining == 4u);
+    sb.skip_remaining = 0;
+    for (unsigned i = 0; i < 3; i++) cycle(&sb, 400.0, 2u);
+    assert(sb.skip_remaining == 8u);
+
     /* Reasoning spans decode serially, and leaving one clears the cooldown. */
     a.skip_remaining = 128; a.bad_run = 3; a.window_calls = 2;
     ds41_adapt_reasoning(&a, true);
@@ -88,6 +103,29 @@ int main(void) {
     decline(&g, 40.0);
     assert(g.skip_remaining == 16 && g.backoffs == 1 && g.declines == 3);
     assert(!g.attempts && !g.losing_cycles && g.serial_consumed == 19);
+
+    /* Optional cold-decline bypass: hostile content can stop probing for the
+     * remainder of the answer before any verify has ever paid off. */
+    ds41_adapt_config cold = c; cold.min_serial_tokens = 0; cold.cold_decline_bypass = 2u;
+    ds41_dspark_adaptive cb;
+    ds41_adapt_begin(&cb, cold);
+    decline(&cb, 40.0);
+    assert(!cb.cold_bypass && ds41_adapt_admit(&cb));
+    decline(&cb, 40.0);
+    assert(cb.cold_bypass && !ds41_adapt_admit(&cb));
+    ds41_adapt_begin(&cb, cold);
+    cycle(&cb, 80.0, 4u);
+    decline(&cb, 40.0); decline(&cb, 40.0);
+    assert(cb.attempts == 1 && !cb.cold_bypass);
+
+    ds41_adapt_config hard = c; hard.min_serial_tokens = 0; hard.hard_loss_serial = 3.0f;
+    ds41_dspark_adaptive hb;
+    ds41_adapt_begin(&hb, hard);
+    serial(&hb, 50.0);
+    assert(!ds41_adapt_hard_loss(&hb, 250.0, 4u));
+    assert(!hb.cold_bypass);
+    assert(ds41_adapt_hard_loss(&hb, 400.0, 4u));
+    assert(hb.cold_bypass && !ds41_adapt_admit(&hb));
 
     /* With the controller off every eligible position is proposed. */
     ds41_adapt_config off = c; off.enabled = false;

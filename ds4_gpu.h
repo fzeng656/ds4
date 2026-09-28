@@ -83,6 +83,30 @@ int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
 void ds4_gpu_parallel_ffn_abort(void);
+
+/* Opt-in V4.1 verifier rows schedule: the request is armed before the routed
+ * batch performs its selected-expert readback, then activated by the Metal
+ * backend only after cache preparation is complete. */
+int ds4_gpu_v41_verify_parallel_ffn_arm(
+        ds4_gpu_tensor       *shared_mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        ds4_gpu_tensor       *x,
+        float                 clamp,
+        uint32_t              rows,
+        uint32_t              layer);
+void ds4_gpu_v41_verify_parallel_ffn_disarm(void);
+int ds4_gpu_v41_predict_prefetch_launch(uint32_t layer);
+int ds4_gpu_v41_predict_prefetch_join(uint32_t layer);
+int ds4_gpu_v41_exact_selected_warm(uint32_t layer,
+                                    const int32_t *expert_ids,
+                                    uint32_t n_experts);
 int ds4_gpu_parallel_ffn_start(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -365,6 +389,10 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+#if defined(__APPLE__)
+int ds4_gpu_stream_expert_queue_residency_prepare(void);
+int ds4_gpu_stream_expert_queue_residency_retarget(uint32_t max_slabs);
+#endif
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;
@@ -809,6 +837,9 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+/* Temporarily force the non-MMA exact-row path for V4.1 short continued prefill.
+ * The scope only affects CPU-side kernel selection while commands are encoded. */
+void ds4_gpu_v41_rows_mma_scope_off(int disabled);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
