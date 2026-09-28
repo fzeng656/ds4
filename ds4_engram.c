@@ -192,8 +192,11 @@ static int request_order(const void *a, const void *b) {
 
 #ifdef __APPLE__
 enum { ENGRAM_READERS = 32 };
+enum { ENGRAM_PARALLEL_MIN_ROWS = 8 };
 #else
 enum { ENGRAM_READERS = 16 };
+/* Unlike dispatch's shared pool, this path creates threads for each batch. */
+enum { ENGRAM_PARALLEL_MIN_ROWS = 256 };
 #endif
 
 typedef struct {
@@ -273,9 +276,9 @@ bool ds4_engram_read_batch(const ds4_engram_table *t, const uint32_t *rows,
             .out = out + start * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM, .readers = 1};
         /* Fixed concurrency hides random-read latency without caching the table.
          * Each worker owns disjoint output rows; all finish before GPU use. */
-        if (count >= 2) {
-            /* The public fork's 32 readers versus the parent 16. Capture
-             * per batch; output ownership and join ordering are unchanged. */
+        if (count >= ENGRAM_PARALLEL_MIN_ROWS) {
+            /* Keep the V4.1 fork's 32-reader Apple path while retaining the
+             * upstream low-row threshold and an opt-out for A/B testing. */
             const size_t limit = getenv("DS4_DISABLE_V41_ENGRAM_READERS32") ? 16u : ENGRAM_READERS;
             batch.readers = count < limit ? count : limit;
 #ifdef __APPLE__
