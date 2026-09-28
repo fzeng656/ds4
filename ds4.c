@@ -42884,8 +42884,12 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     if (g->carry_cap && remaining >= (ds41_short_sweep_off() ? 4096u : 3072u) &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
         const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
-        /* a short sweep keeps its final partial tile instead of a second decoder pass */
-        return remaining < 8192u && !ds41_short_sweep_off() ? count : count - count % 2048u;
+        /* A short sweep keeps its final partial tile instead of a second
+         * decoder pass, unless that tail is below the active row-sweep
+         * minimum and would fall back to token-major work anyway. */
+        const uint32_t tail = count % 2048u;
+        return remaining < 8192u && !ds41_short_sweep_off() &&
+               (!tail || tail >= minimum) ? count : count - tail;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
     return remaining < tail_cap ? remaining : tail_cap;

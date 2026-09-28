@@ -26,7 +26,7 @@ static int check_dispatch(void) {
         16383, 16384, 16385, 32767, 32768, 32769, 65536};
     const uint32_t cold[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1, 1, 256, 257, 511, 512, 513, 1023, 1024,
-        2047, 2048, 2048, 2048, 4096, 4096, 6144, 8192, 8192,
+        2047, 2048, 2048, 4095, 4096, 4096, 8191, 8192, 8192,
         14336, 16384, 16384, 30720, 32768, 32768, 32768};
     _Static_assert(sizeof(remaining) == sizeof(cold), "prefill dispatch table sizes");
     for (uint32_t cache = half - 1; cache <= half; cache++) {
