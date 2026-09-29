@@ -12940,6 +12940,7 @@ typedef struct {
     double t0;
     double last_t;
     int last_current;
+    int last_display_current;
     bool seen;
     /* SSE keepalive during long prefill: send HTTP/SSE headers ahead of
      * generation and emit a `:` comment line every few seconds so HTTP/TCP
@@ -13540,6 +13541,38 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+/* Map engine progress onto the range shown in the prefill log.
+ *
+ * `current` arrives in the engine's own coordinate system: absolute prompt
+ * positions for most backends.  When it starts below `cached_tokens` the
+ * backend is rebuilding a prefix the server counted as cached (e.g. a Qwen3.8
+ * recurrent graph reset by a rewind), so report that replay against the whole
+ * prompt instead of clamping every chunk to 0.  The displayed value doubles as
+ * the duplicate key so a replayed prefix prints one line per real chunk. */
+static void prefill_progress_display(const server_prefill_progress *p,
+                                     int current, int total,
+                                     int *display_current,
+                                     int *display_total) {
+    const int suffix = p->prompt_tokens - p->cached_tokens;
+    int start = p->cached_tokens;
+    if (start < 0 || start > p->prompt_tokens) start = 0;
+    int span = p->prompt_tokens - start;
+    if (suffix > 0 && total == suffix) {
+        /* The engine already reports suffix-relative coordinates. */
+        start = 0;
+        span = total;
+    } else if (span <= 0 || current < start) {
+        /* No suffix to subtract, or the engine restarted at position 0. */
+        start = 0;
+        span = p->prompt_tokens > total ? p->prompt_tokens : total;
+    }
+    int shown = current - start;
+    if (shown < 0) shown = 0;
+    if (shown > span) shown = span;
+    *display_current = shown;
+    *display_total = span;
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
@@ -13576,23 +13609,17 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     }
     if (is_display) return;
     double elapsed = now - p->t0;
-    if (p->seen && current == p->last_current) {
+    int display_current = 0;
+    int display_total = 0;
+    prefill_progress_display(p, current, total, &display_current,
+                             &display_total);
+    if (p->seen && display_current == p->last_display_current) {
         if (p->srv && p->slot && !p->slot->openclaw_aux_ephemeral &&
             current > p->cached_tokens) {
             kv_cache_maybe_store_continued(p->srv, p->slot);
         }
         return;
     }
-    int display_start = p->cached_tokens;
-    if (display_start < 0 || display_start > p->prompt_tokens) display_start = 0;
-    int display_total = p->prompt_tokens - display_start;
-    if (display_total <= 0) {
-        display_start = 0;
-        display_total = p->prompt_tokens > total ? p->prompt_tokens : total;
-    }
-    int display_current = current - display_start;
-    if (display_current < 0) display_current = 0;
-    if (display_current > display_total) display_current = display_total;
     double pct = display_total > 0 ? 100.0 * (double)display_current / (double)display_total : 100.0;
     double avg_tps = elapsed > 0.0 ? (double)display_current / elapsed : 0.0;
     int interval_tokens = p->seen ? current - p->last_current : 0;
@@ -13600,6 +13627,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double interval_s = p->seen ? now - p->last_t : 0.0;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
     p->last_current = current;
+    p->last_display_current = display_current;
     p->last_t = now;
     p->seen = true;
     char flags[64];
@@ -22879,6 +22907,83 @@ static void test_cancelled_progress_callback_is_inert(void) {
     test_cancel_job_destroy(&j);
 }
 
+static void test_prefill_progress_display_ranges(void) {
+    int cur = 0;
+    int tot = 0;
+
+    /* Live hit: progress is relative to the cached suffix. */
+    server_prefill_progress hit = {
+        .prompt_tokens = 100,
+        .cached_tokens = 90,
+    };
+    prefill_progress_display(&hit, 90, 100, &cur, &tot);
+    TEST_ASSERT(cur == 0 && tot == 10);
+    prefill_progress_display(&hit, 95, 100, &cur, &tot);
+    TEST_ASSERT(cur == 5 && tot == 10);
+    prefill_progress_display(&hit, 100, 100, &cur, &tot);
+    TEST_ASSERT(cur == 10 && tot == 10);
+
+    /* Backend rebuilt from position 0: show the whole prompt, not 0/10. */
+    prefill_progress_display(&hit, 8, 100, &cur, &tot);
+    TEST_ASSERT(cur == 8 && tot == 100);
+    prefill_progress_display(&hit, 64, 100, &cur, &tot);
+    TEST_ASSERT(cur == 64 && tot == 100);
+
+    /* Suffix-relative engine coordinates (some GLM paths). */
+    prefill_progress_display(&hit, 4, 10, &cur, &tot);
+    TEST_ASSERT(cur == 4 && tot == 10);
+
+    /* Cold prompt. */
+    server_prefill_progress cold = {
+        .prompt_tokens = 100,
+        .cached_tokens = 0,
+    };
+    prefill_progress_display(&cold, 30, 100, &cur, &tot);
+    TEST_ASSERT(cur == 30 && tot == 100);
+
+    /* Cached prefix equals the prompt: fall back to the engine total. */
+    server_prefill_progress full = {
+        .prompt_tokens = 100,
+        .cached_tokens = 100,
+    };
+    prefill_progress_display(&full, 0, 100, &cur, &tot);
+    TEST_ASSERT(cur == 0 && tot == 100);
+}
+
+static void test_progress_callback_logs_each_replay_chunk(void) {
+    job j;
+    test_cancel_job_init(&j);
+    server_prefill_progress replay = {
+        .request_job = &j,
+        .prompt_tokens = 100,
+        .cached_tokens = 90,
+    };
+    /* A replay chunk below the cached frontier must not be suppressed as a
+     * duplicate: it now advances the displayed full-prompt progress. */
+    server_progress_cb(&replay, "prefill_chunk", 8, 100);
+    TEST_ASSERT(replay.seen);
+    TEST_ASSERT(replay.last_display_current == 8);
+    server_progress_cb(&replay, "prefill_chunk", 16, 100);
+    TEST_ASSERT(replay.last_display_current == 16);
+
+    /* Clamped display states are deduplicated. */
+    server_prefill_progress clamp = {
+        .request_job = &j,
+        .prompt_tokens = 100,
+        .cached_tokens = 90,
+    };
+    server_progress_cb(&clamp, "prefill_chunk", 95, 100);
+    TEST_ASSERT(clamp.seen);
+    TEST_ASSERT(clamp.last_display_current == 5);
+    server_progress_cb(&clamp, "prefill_chunk", 105, 100);
+    TEST_ASSERT(clamp.last_display_current == 10);
+    const double logged_t = clamp.last_t;
+    server_progress_cb(&clamp, "prefill_chunk", 115, 100);
+    TEST_ASSERT(clamp.last_t == logged_t);
+    TEST_ASSERT(clamp.last_current == 105);
+    test_cancel_job_destroy(&j);
+}
+
 static void test_cancel_server_init(server *s) {
     memset(s, 0, sizeof(*s));
     pthread_mutex_init(&s->mu, NULL);
@@ -25547,6 +25652,8 @@ static void ds4_server_unit_tests_run(void) {
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
+    test_prefill_progress_display_ranges();
+    test_progress_callback_logs_each_replay_chunk();
     test_waiting_job_cancels_on_client_close();
     test_cancel_unlinks_queued_jobs();
     test_cancel_detaches_assigned_job();
