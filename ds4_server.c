@@ -12419,6 +12419,11 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
     if (!s || !slot || !slot->session || !req) return pr;
     if (!ds4_session_checkpoint_valid(slot->session)) return pr;
+    /* A backend rewind can reset recurrent state while the token checkpoint
+     * stays valid (e.g. Qwen3.8 verify rewinds).  No live tier may reuse a
+     * checkpoint the backend cannot continue from: the next sync would
+     * silently rebuild the whole prefix while the server reports a hit. */
+    if (!ds4_session_prefix_reusable(slot->session)) return pr;
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || live->len <= 0) return pr;
     const int live_pos = live->len;
@@ -12628,6 +12633,7 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
 
 typedef struct {
     bool valid;
+    bool backend_stale;
     int old_pos;
     int prompt_len;
     int common;
@@ -12674,6 +12680,7 @@ static void trace_cache_capture(
 static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
+    if (d->backend_stale) return "backend-state-reset";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
@@ -12681,7 +12688,7 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
 }
 
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
-    return d && d->valid &&
+    return d && d->valid && !d->backend_stale &&
            (d->rewind_to >= 0 ||
             (d->old_pos > 0 && d->common == d->old_pos &&
              d->prompt_len >= d->old_pos));
@@ -14313,6 +14320,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
+    cache_diag.backend_stale = !ds4_session_prefix_reusable(slot->session);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;

@@ -64678,13 +64678,23 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
 
+bool ds4_session_prefix_reusable(ds4_session *s) {
+    if (!s || !s->checkpoint_valid) return false;
+#ifdef DS4_HAS_QWEN4_GPU
+    if (ds4_session_is_qwen4(s)) {
+        return s->qwen4_graph_ready && !s->qwen4_rewound &&
+               s->qwen4_graph.pos == (uint32_t)s->checkpoint.len;
+    }
+#endif
+    return true;
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
 #else
-        if (!s->qwen4_graph_ready || !s->checkpoint_valid) return 0;
-        if (s->qwen4_rewound || s->qwen4_graph.pos != (uint32_t)s->checkpoint.len) return 0;
+        if (!ds4_session_prefix_reusable(s)) return 0;
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
