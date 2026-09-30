@@ -481,6 +481,8 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
 void ds4_session_free_test_checkpoint(ds4_session *s);
+/* Make a test checkpoint report ds4_session_prefix_reusable() == false. */
+void ds4_session_set_test_backend_stale(ds4_session *s, bool stale);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
