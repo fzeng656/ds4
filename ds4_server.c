@@ -1,3 +1,4 @@
+#include "ds4_host_memory.h"
 #include "ds4.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
@@ -6903,13 +6904,14 @@ static void append_cors_headers(buf *h) {
         "Access-Control-Allow-Headers: *\r\n");
 }
 
-static bool http_response(int fd, bool enable_cors, int code, const char *type, const char *body) {
+static bool http_response_extra(int fd, bool enable_cors, int code, const char *type, const char *body, const char *extra) {
     const char *reason = code == 200 ? "OK" :
                          code == 204 ? "No Content" :
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
-                         code == 500 ? "Internal Server Error" : "Error";
+                         code == 500 ? "Internal Server Error" :
+                         code == 503 ? "Service Unavailable" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
     buf_printf(&h,
@@ -6922,11 +6924,36 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
         buf_puts(&h, "\r\n");
     }
     if (enable_cors) append_cors_headers(&h);
+    if (extra) buf_puts(&h,extra);
     buf_puts(&h, "Connection: close\r\n\r\n");
     bool ok = send_all(fd, h.ptr, h.len);
     if (ok && body_len) ok = send_all(fd, body, body_len);
     buf_free(&h);
     return ok;
+}
+
+static bool http_response(int fd, bool cors, int code, const char *type, const char *body) {
+    return http_response_extra(fd,cors,code,type,body,NULL);
+}
+
+#ifdef DS4_SERVER_TEST
+static int server_test_memory_pressure = -1;
+#endif
+static ds4_host_pressure server_memory_pressure(void) {
+    const char *ignore = getenv("DS4_SERVER_IGNORE_MEMORY_PRESSURE");
+    if (ignore && !strcmp(ignore,"1")) return DS4_HOST_PRESSURE_UNKNOWN;
+#ifdef DS4_SERVER_TEST
+    if (server_test_memory_pressure >= 0) return (ds4_host_pressure)server_test_memory_pressure;
+#endif
+    return ds4_host_memory_pressure();
+}
+
+static bool server_reject_memory_pressure(int fd, bool cors) {
+    if (server_memory_pressure() != DS4_HOST_PRESSURE_CRITICAL) return false;
+    http_response_extra(fd,cors,503,"application/json",
+        "{\"error\":{\"message\":\"server under memory pressure\",\"type\":\"server_error\"}}\n",
+        "Retry-After: 5\r\n");
+    return true;
 }
 
 static bool http_error(int fd, bool enable_cors, int code, const char *msg) {
@@ -9931,6 +9958,7 @@ typedef struct {
     size_t max_bytes;
     uint64_t clock;
     uint64_t scan_clock;
+    uint64_t last_scan_steps;
 } tool_memory;
 
 /* Image markers have request-local nonces. Normalize only actual marker spans
@@ -9961,6 +9989,166 @@ static char *visible_prompt_key(const request *req, const char *text,
         cursor = marker + len;
     }
     return key;
+}
+
+/* OpenClaw appends a request-local runtime-context carrier to the current user
+ * turn. That carrier is intentionally replaced on the next turn, so a
+ * checkpoint taken after it is not a durable text prefix even when nearly all
+ * surrounding conversation bytes are unchanged. Return the byte boundary
+ * immediately before the carrier's separating newlines. */
+static size_t openclaw_runtime_stable_prefix_bytes(const char *text) {
+    static const char dynamic[] = "<!-- openclaw:attempt:DYNAMIC -->";
+    static const char begin[] = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+    static const char end[] = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    static const char signature[] = "openclaw:ctx";
+    if (!text) return 0;
+
+    /* OpenClaw explicitly marks the point where request-local material starts.
+     * Prefer that boundary over the later runtime-context carrier.  Things in
+     * the DYNAMIC section (notably Temporal Context / Current date) can change
+     * between otherwise identical turns, including at local midnight.  A disk
+     * checkpoint keyed past this marker is therefore not a durable prefix. */
+    const char *dynamic_at = strstr(text, dynamic);
+    if (dynamic_at) {
+        /* Keep the newline that terminates the STABLE section.  Dropping it
+         * can move the cut into the middle of a tokenizer merge (for example
+         * the full prompt may encode "-->\n" as one token), making the
+         * truncated tokenization fail the strict-prefix safety check. */
+        return (size_t)(dynamic_at - text);
+    }
+
+    const char *scan = text;
+    const char *best = NULL;
+    while ((scan = strstr(scan, begin)) != NULL) {
+        const char *close = strstr(scan + sizeof(begin) - 1, end);
+        const char *sig = strstr(scan + sizeof(begin) - 1, signature);
+        if (close && sig && sig < close) best = scan;
+        scan += sizeof(begin) - 1;
+    }
+    if (!best) return 0;
+
+    const char *boundary = best;
+    if (boundary - text >= 2 && boundary[-1] == '\n' && boundary[-2] == '\n')
+        boundary -= 2;
+    return (size_t)(boundary - text);
+}
+
+/* A truncated byte string is a safe DS4 checkpoint frontier only when its
+ * tokenization is also an exact prefix of the full rendered prompt. */
+
+static bool openclaw_stable_boundary_fragments_wide_prefill(
+        int cached, int prompt_tokens, int stable_tokens) {
+    const int full_suffix = prompt_tokens - cached;
+    const int before_boundary = stable_tokens - cached;
+    const int after_boundary = prompt_tokens - stable_tokens;
+    return cached > 0 && full_suffix >= 3072 &&
+           before_boundary > 0 && after_boundary > 0 &&
+           (before_boundary < 3072 || after_boundary < 3072);
+}
+
+static bool openclaw_runtime_stable_prefix(ds4_engine *engine,
+                                           const request *req,
+                                           ds4_tokens *out,
+                                           size_t *text_bytes_out) {
+    if (text_bytes_out) *text_bytes_out = 0;
+    if (!engine || !req || !req->prompt_text || !out) return false;
+    const size_t n = openclaw_runtime_stable_prefix_bytes(req->prompt_text);
+    if (n == 0) return false;
+
+    char *prefix_text = xstrndup(req->prompt_text, n);
+    ds4_tokens prefix = {0};
+    ds4_tokenize_rendered_chat(engine, prefix_text, &prefix);
+    free(prefix_text);
+
+    const bool ok = prefix.len > 0 && prefix.len < req->prompt.len &&
+                    ds4_tokens_starts_with(&req->prompt, &prefix);
+    if (!ok) {
+        ds4_tokens_free(&prefix);
+        return false;
+    }
+    ds4_tokens_free(out);
+    *out = prefix;
+    if (text_bytes_out) *text_bytes_out = n;
+    return true;
+}
+
+
+/* Return the byte frontier immediately before OpenClaw's transient runtime
+ * user carrier for the current turn.  This frontier advances with the
+ * conversation while excluding request-local runtime data. */
+static size_t openclaw_runtime_turn_prefix_bytes(const request *req) {
+    if (!req || !req->prompt_text || !req->prompt_text[0]) return 0;
+    const char *user_tag = NULL, *assistant_tag = NULL;
+    switch (req->model_syntax) {
+    case SERVER_MODEL_SYNTAX_GLM:
+        user_tag = "<|user|>";
+        assistant_tag = "<|assistant|>";
+        break;
+    case SERVER_MODEL_SYNTAX_DEEPSEEK:
+        user_tag = "<｜User｜>";
+        assistant_tag = "<｜Assistant｜>";
+        break;
+    default:
+        return 0;
+    }
+
+    static const char begin[] = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+    static const char end[] = "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const char *prompt = req->prompt_text;
+    const size_t user_len = strlen(user_tag);
+
+    const char *last_begin = NULL;
+    const char *scan = prompt;
+    while ((scan = strstr(scan, begin)) != NULL) {
+        last_begin = scan;
+        scan += sizeof(begin) - 1;
+    }
+    if (!last_begin) return 0;
+
+    const char *runtime_user = NULL;
+    scan = prompt;
+    while ((scan = strstr(scan, user_tag)) != NULL && scan < last_begin) {
+        runtime_user = scan;
+        scan += user_len;
+    }
+    if (!runtime_user || runtime_user + user_len != last_begin) return 0;
+
+    const char *finish = strstr(last_begin + sizeof(begin) - 1, end);
+    if (!finish) return 0;
+    finish += sizeof(end) - 1;
+
+    const char *assistant = strstr(finish, assistant_tag);
+    if (!assistant) return 0;
+    const char *next_user = strstr(runtime_user + user_len, user_tag);
+    if (next_user && next_user < assistant) return 0;
+
+    return (size_t)(runtime_user - prompt);
+}
+
+static bool openclaw_runtime_turn_prefix(ds4_engine *engine,
+                                         const request *req,
+                                         ds4_tokens *out,
+                                         size_t *text_bytes_out) {
+    if (text_bytes_out) *text_bytes_out = 0;
+    if (!engine || !req || !req->prompt_text || !out) return false;
+    const size_t n = openclaw_runtime_turn_prefix_bytes(req);
+    if (n == 0) return false;
+
+    char *prefix_text = xstrndup(req->prompt_text, n);
+    ds4_tokens prefix = {0};
+    ds4_tokenize_rendered_chat(engine, prefix_text, &prefix);
+    free(prefix_text);
+
+    const bool ok = prefix.len > 0 && prefix.len < req->prompt.len &&
+                    ds4_tokens_starts_with(&req->prompt, &prefix);
+    if (!ok) {
+        ds4_tokens_free(&prefix);
+        return false;
+    }
+    ds4_tokens_free(out);
+    *out = prefix;
+    if (text_bytes_out) *text_bytes_out = n;
+    return true;
 }
 
 static bool visible_image_prefix_matches(const visible_image_key *incoming,
@@ -10014,6 +10202,9 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* Recognized OpenClaw utility requests run ephemerally and must not
+     * replace the authoritative resident main-session frontier. */
+    bool openclaw_aux_ephemeral;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
     time_t last_used;
@@ -10069,6 +10260,10 @@ static void server_image_cache_clear(server_image_cache *cache) {
     for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++)
         server_image_cache_remove(cache, &cache->entries[i]);
     cache->clock = 0;
+}
+
+static void server_memory_release_images(server_image_cache *cache) {
+    if (server_memory_pressure() >= DS4_HOST_PRESSURE_WARN) server_image_cache_clear(cache);
 }
 
 static bool server_image_cache_get(server_image_cache *cache,
@@ -10475,6 +10670,184 @@ static void visible_live_free(visible_live_state *st) {
     if (!st) return;
     visible_live_clear_locked(st);
     memset(st, 0, sizeof(*st));
+}
+
+static void request_live_state_clear(server *s, server_slot *slot);
+
+static bool request_is_openclaw_aux(const request *r) {
+    if (!r || !r->raw_body) return false;
+
+    /*
+     * Skill Workshop post-run review is an OpenClaw-owned internal request
+     * built from a snapshot of the main transcript.  Unlike status/narrator
+     * helpers it is intentionally large, tool-enabled, and may request the
+     * normal model output budget.  It must therefore be recognized before the
+     * small-utility shape gate below.  Require both internal identifiers so a
+     * normal user turn that merely mentions Workshop cannot steal the resident
+     * main-session slot.
+     */
+    const bool skill_workshop_review =
+        strstr(r->raw_body,
+               "session=agent:ds4:internal-session-effects:skill-workshop-review_") != NULL &&
+        strstr(r->raw_body,
+               "sessionId=internal-session-effects-skill-workshop-review_") != NULL;
+    if (skill_workshop_review)
+        return true;
+
+    /* Keep the legacy utility classifier deliberately narrow. These are
+     * OpenClaw-owned utility prompts, all tool-less and small; requiring the
+     * request shape prevents a user who merely quotes one of the strings in a
+     * normal agent turn from stealing the resident main-session slot. */
+    if (r->has_tools || r->prompt.len <= 0 || r->prompt.len > 4096 ||
+        r->max_tokens <= 0 || r->max_tokens > 512)
+        return false;
+    return strstr(r->raw_body,
+                  "You write the live status line for an AI assistant") != NULL ||
+           strstr(r->raw_body,
+                  "You judge the trajectory of a running AI agent session") != NULL ||
+           strstr(r->raw_body,
+                  "Write an Activity recap for someone scanning their tasks") != NULL;
+}
+
+typedef struct {
+    bool recognized;
+    bool active;
+    int live_tokens;
+    ds4_session_snapshot snapshot;
+    live_tool_state responses_live;
+    live_tool_state anthropic_live;
+    visible_live_state thinking_live;
+    int continued_last_store_tokens;
+} openclaw_aux_resident_pin;
+
+static void live_tool_state_clone(live_tool_state *dst,
+                                  const live_tool_state *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->valid = src->valid;
+    dst->live_tokens = src->live_tokens;
+    dst->visible_text = src->visible_text ? xstrdup(src->visible_text) : NULL;
+    dst->visible_len = src->visible_len;
+    dst->images = src->images;
+    for (int i = 0; i < src->call_ids.len; i++)
+        id_list_push_unique(&dst->call_ids, src->call_ids.v[i]);
+}
+
+static void visible_live_state_clone(visible_live_state *dst,
+                                     const visible_live_state *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->valid = src->valid;
+    dst->live_tokens = src->live_tokens;
+    dst->visible_text = src->visible_text ? xstrdup(src->visible_text) : NULL;
+    dst->visible_len = src->visible_len;
+    dst->images = src->images;
+    dst->token_text_disk_key = src->token_text_disk_key;
+}
+
+static void openclaw_aux_resident_pin_free(openclaw_aux_resident_pin *pin) {
+    if (!pin) return;
+    ds4_session_snapshot_free(&pin->snapshot);
+    live_tool_state_free(&pin->responses_live);
+    live_tool_state_free(&pin->anthropic_live);
+    visible_live_free(&pin->thinking_live);
+    memset(pin, 0, sizeof(*pin));
+}
+
+static void openclaw_aux_resident_pin_begin(server *s, server_slot *slot,
+                                            const request *r,
+                                            openclaw_aux_resident_pin *pin) {
+    memset(pin, 0, sizeof(*pin));
+    if (!s || !slot || !request_is_openclaw_aux(r)) return;
+    pin->recognized = true;
+
+    const int live_tokens = ds4_session_pos(slot->session);
+    /* With no substantial resident main session there is nothing worth
+     * snapshotting. Still mark the utility request ephemeral so its KV will be
+     * invalidated when it finishes instead of becoming the next live session. */
+    if (live_tokens < 2048) {
+        slot->openclaw_aux_ephemeral = true;
+        return;
+    }
+
+    char err[160] = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    const int rc = ds4_session_save_snapshot(slot->session, &pin->snapshot,
+                                             err, sizeof(err));
+    pthread_mutex_unlock(&s->inference_mu);
+    if (rc != 0) {
+        /* Fall back to the ordinary cache path rather than risk destroying an
+         * unsaved main frontier. */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: OpenClaw aux resident pin snapshot failed live=%d error=%s",
+                   live_tokens, err[0] ? err : "unknown");
+        return;
+    }
+
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clone(&pin->responses_live, &slot->responses_live);
+    live_tool_state_clone(&pin->anthropic_live, &slot->anthropic_live);
+    visible_live_state_clone(&pin->thinking_live, &slot->thinking_live);
+    pthread_mutex_unlock(&s->tool_mu);
+
+    pin->continued_last_store_tokens = slot->continued_last_store_tokens;
+    pin->live_tokens = live_tokens;
+    pin->active = true;
+    slot->openclaw_aux_ephemeral = true;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: OpenClaw aux resident pin saved live=%d snapshot=%.2f MiB",
+               live_tokens, (double)pin->snapshot.len / (1024.0 * 1024.0));
+}
+
+static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
+                                              openclaw_aux_resident_pin *pin) {
+    if (!s || !slot || !pin || !pin->recognized) {
+        if (pin) openclaw_aux_resident_pin_free(pin);
+        return;
+    }
+
+    if (pin->active) {
+        char err[160] = {0};
+        pthread_mutex_lock(&s->inference_mu);
+        const int rc = ds4_session_load_snapshot(slot->session, &pin->snapshot,
+                                                 err, sizeof(err));
+        pthread_mutex_unlock(&s->inference_mu);
+        if (rc == 0) {
+            pthread_mutex_lock(&s->tool_mu);
+            live_tool_state_free(&slot->responses_live);
+            live_tool_state_free(&slot->anthropic_live);
+            visible_live_free(&slot->thinking_live);
+            slot->responses_live = pin->responses_live;
+            slot->anthropic_live = pin->anthropic_live;
+            slot->thinking_live = pin->thinking_live;
+            memset(&pin->responses_live, 0, sizeof(pin->responses_live));
+            memset(&pin->anthropic_live, 0, sizeof(pin->anthropic_live));
+            memset(&pin->thinking_live, 0, sizeof(pin->thinking_live));
+            pthread_mutex_unlock(&s->tool_mu);
+            slot->continued_last_store_tokens =
+                pin->continued_last_store_tokens;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: OpenClaw aux resident pin restored live=%d snapshot=%.2f MiB",
+                       pin->live_tokens,
+                       (double)pin->snapshot.len / (1024.0 * 1024.0));
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: OpenClaw aux resident pin restore failed live=%d error=%s",
+                       pin->live_tokens, err[0] ? err : "unknown");
+        }
+    } else if (slot->openclaw_aux_ephemeral) {
+        /* No resident main session existed when the utility request arrived.
+         * Explicitly discard the utility frontier so it never becomes cache
+         * ancestry for a later main request. */
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        request_live_state_clear(s, slot);
+        slot->continued_last_store_tokens = 0;
+    }
+
+    slot->openclaw_aux_ephemeral = false;
+    openclaw_aux_resident_pin_free(pin);
 }
 
 static void thinking_live_clear(server *s, server_slot *slot) {
@@ -10904,33 +11277,57 @@ static char *path_join(const char *dir, const char *name) {
 
 
 
-static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
-    struct block_form {
-        const char *start;
-        const char *end;
-    } forms[] = {
-        {"\n\n" DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
-        {DS41_TOOL_CALLS_START, DS41_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {"\n\n<tool_calls>", "</tool_calls>"},
-        {"<tool_calls>", "</tool_calls>"},
-    };
+static bool tool_memory_block_boundary_matches(const char *text,
+                                               const char *limit,
+                                               const char *start,
+                                               const tool_memory_block *block) {
+    const char *raw = block->dsml;
+    size_t len = block->len;
+    if (len < 2) return false;
+    if (raw[0] == '<' && start >= text + 2 &&
+        start[-2] == '\n' && start[-1] == '\n') return false;
 
-    const char *best = NULL;
-    const char *best_end = NULL;
-    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
-        const char *s = strstr(p, forms[i].start);
-        if (!s || (best && s >= best)) continue;
-        const char *e = strstr(s, forms[i].end);
-        if (!e) continue;
-        best = s;
-        best_end = e + strlen(forms[i].end);
+    if (len >= 2 && raw[0] == '\n' && raw[1] == '\n') {
+        raw += 2;
+        len -= 2;
     }
-    if (end_out) *end_out = best_end;
-    return best;
+    if (len < sizeof("<tool_call>") - 1 ||
+        memcmp(raw, "<tool_call>", sizeof("<tool_call>") - 1)) return true;
+
+    const char *end = start + block->len;
+    if (end < limit && isspace((unsigned char)*end)) return false;
+    return (size_t)(limit - end) < sizeof("<tool_call>") - 1 ||
+           memcmp(end, "<tool_call>", sizeof("<tool_call>") - 1);
+}
+
+static const char *find_next_tool_memory_block(tool_memory *memory,
+                                                const char *text,
+                                                const char *p,
+                                                const char *limit,
+                                                tool_memory_block **block_out,
+                                                uint64_t *steps) {
+    if (block_out) *block_out = NULL;
+    if (!memory->by_block) return NULL;
+    for (; p < limit; p++) {
+        if (steps) (*steps)++;
+        if (*p != '<' &&
+            !(*p == '\n' && limit - p >= 3 && p[1] == '\n' && p[2] == '<')) {
+            continue;
+        }
+        size_t matched = 0;
+        size_t examined = 0;
+        void *value = raxFindLongestPrefix(
+            memory->by_block, (unsigned char *)p, (size_t)(limit - p),
+            &matched, &examined);
+        if (steps) *steps += examined;
+        if (value == raxNotFound || matched == 0) continue;
+        tool_memory_block *block = value;
+        if (matched != block->len ||
+            !tool_memory_block_boundary_matches(text, limit, p, block)) continue;
+        if (block_out) *block_out = block;
+        return p;
+    }
+    return NULL;
 }
 
 
@@ -10941,29 +11338,36 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
     uint64_t bytes = KV_TOOL_MAP_HEADER;
     uint64_t scan = ++s->tool_mem.scan_clock;
     const char *p = text;
+    const char *limit = text + strlen(text);
+    uint64_t steps = 0;
     for (;;) {
-        const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
-        if (!start || !end) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        tool_memory_block *b = NULL;
+        const char *start = find_next_tool_memory_block(
+            &s->tool_mem, text, p, limit, &b, &steps);
+        if (!start || !b) break;
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
                 size_t id_len = strlen(e->id);
                 size_t dsml_len = b->len;
                 if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
-                if (count == UINT32_MAX) return false;
+                if (count == UINT32_MAX) {
+                    s->tool_mem.last_scan_steps = steps;
+                    return false;
+                }
                 if (UINT64_MAX - bytes < 8u ||
                     UINT64_MAX - bytes - 8u < (uint64_t)id_len ||
-                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len)
+                    UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len) {
+                    s->tool_mem.last_scan_steps = steps;
                     return false;
+                }
                 count++;
                 bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
             }
         }
-        p = end;
+        p = start + b->len;
     }
+    s->tool_mem.last_scan_steps = steps;
     if (count == 0) bytes = 0;
     if (count_out) *count_out = count;
     if (bytes_out) *bytes_out = bytes;
@@ -11009,12 +11413,13 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
 
     uint64_t scan = ++s->tool_mem.scan_clock;
     const char *p = text;
+    const char *limit = text + strlen(text);
+    uint64_t steps = 0;
     for (;;) {
-        const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
-        if (!start || !end || !ok) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+        tool_memory_block *b = NULL;
+        const char *start = find_next_tool_memory_block(
+            &s->tool_mem, text, p, limit, &b, &steps);
+        if (!start || !b || !ok) break;
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -11029,8 +11434,9 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
                      fwrite(b->dsml, 1, dsml_len, fp) == dsml_len;
             }
         }
-        p = end;
+        p = start + b->len;
     }
+    s->tool_mem.last_scan_steps = steps;
     pthread_mutex_unlock(&s->tool_mu);
 
     if (ok && written_bytes) *written_bytes = bytes;
@@ -11261,6 +11667,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key) {
+    if (slot && slot->openclaw_aux_ephemeral) return false;
+
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -11296,6 +11704,8 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
 
 static void kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
+    if (slot && slot->openclaw_aux_ephemeral) return;
+
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -11426,10 +11836,14 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
+                                  uint32_t *loaded_text_bytes_out,
                                   bool responses_protocol) {
+    if (slot && slot->openclaw_aux_ephemeral) return 0;
+
     if (!s || !slot) return 0;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (loaded_text_bytes_out) *loaded_text_bytes_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
@@ -11448,6 +11862,7 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+        if (loaded_text_bytes_out) *loaded_text_bytes_out = lr.text_bytes;
     }
     ds4_kvstore_load_result_free(&lr);
     return loaded;
@@ -11456,12 +11871,95 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
 static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
-                             uint8_t *loaded_ext_flags_out) {
+                             uint8_t *loaded_ext_flags_out,
+                             uint32_t *loaded_text_bytes_out) {
     return kv_cache_try_load_text(s, slot, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
+                                  loaded_text_bytes_out,
                                   req && req->api == API_RESPONSES);
+}
+
+/* Return true only when the disk store already has a checkpoint whose key is
+ * exactly this rendered byte prefix and whose token frontier matches it.  A
+ * longer same-session checkpoint must not count: it can become unusable as soon
+ * as OpenClaw rewrites the following DYNAMIC section. */
+static bool kv_cache_has_exact_text_checkpoint(server *s, server_slot *slot,
+                                               const char *text, size_t text_bytes,
+                                               int tokens) {
+    if (!s || !slot || !text || !text_bytes || tokens <= 0 || !s->kv.enabled)
+        return false;
+    const int model_id = ds4_engine_model_id(s->engine);
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    const int ctx_size = ds4_session_ctx(slot->session);
+    bool exact = false;
+    pthread_mutex_lock(&s->kv_mu);
+    int idx = ds4_kvstore_find_text_prefix(&s->kv, text, model_id, quant_bits,
+                                           ctx_size);
+    if (idx >= 0 && idx < s->kv.len) {
+        const ds4_kvstore_entry *e = &s->kv.entry[idx];
+        exact = e->text_bytes == text_bytes && e->tokens == (uint32_t)tokens;
+    }
+    pthread_mutex_unlock(&s->kv_mu);
+    return exact;
+}
+
+static int server_session_sync(server *s, server_slot *slot,
+                               const ds4_tokens *prompt, char *err, size_t err_len);
+
+/* Seed OpenClaw's explicitly stable system-prefix once, before ordinary disk
+ * recovery.  This is the fallback anchor for request-local DYNAMIC changes
+ * (for example Current date rolling over at midnight).  DeepSeek V4.1 cannot
+ * cheaply rewind compressor state to an arbitrary old row, so proactively
+ * materializing this short durable prefix is what prevents a later replay from
+ * falling all the way back to token 0. */
+static void kv_cache_seed_openclaw_stable_prefix(server *s, server_slot *slot,
+                                                  const request *req) {
+    if (!s || !slot || !req || req->api != API_RESPONSES ||
+        !req->prompt_text || !s->kv.enabled || slot->openclaw_aux_ephemeral)
+        return;
+
+    ds4_tokens stable = {0};
+    size_t stable_text_bytes = 0;
+    if (!openclaw_runtime_stable_prefix(s->engine, req, &stable,
+                                        &stable_text_bytes) ||
+        stable.len < s->kv.opt.min_tokens || stable.len >= req->prompt.len) {
+        ds4_tokens_free(&stable);
+        return;
+    }
+
+    char *stable_text = xstrndup(req->prompt_text, stable_text_bytes);
+    if (kv_cache_has_exact_text_checkpoint(s, slot, stable_text,
+                                           stable_text_bytes, stable.len)) {
+        free(stable_text);
+        ds4_tokens_free(&stable);
+        return;
+    }
+
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: OpenClaw stable prefix seed start tokens=%d bytes=%zu",
+               stable.len, stable_text_bytes);
+    char err[160] = {0};
+    if (server_session_sync(s, slot, &stable, err, sizeof(err)) == 0) {
+        if (kv_cache_store_live_prefix_text(s, slot, &stable, stable.len,
+                                            "agent-system", stable_text, 0,
+                                            "openclaw-stable")) {
+            kv_cache_slot_note_store(slot, stable.len);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: OpenClaw stable prefix seeded tokens=%d bytes=%zu",
+                       stable.len, stable_text_bytes);
+        }
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: OpenClaw stable prefix seed failed tokens=%d error=%s",
+                   stable.len, err[0] ? err : "unknown");
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+    }
+    free(stable_text);
+    ds4_tokens_free(&stable);
 }
 
 /* A text-only suffix tokenizer would turn image markers into literal text.
@@ -11516,6 +12014,82 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
 }
 
 
+
+static bool openclaw_runtime_stable_prefix_from_live(
+        server *s, server_slot *slot, const request *req,
+        size_t visible_prefix_bytes, const ds4_tokens *effective_prompt,
+        ds4_tokens *out, size_t *stable_text_bytes_out) {
+    if (stable_text_bytes_out) *stable_text_bytes_out = 0;
+    if (!s || !slot || !req || !req->prompt_text || !effective_prompt || !out)
+        return false;
+
+    const size_t stable_bytes =
+        openclaw_runtime_stable_prefix_bytes(req->prompt_text);
+    const size_t prompt_bytes = strlen(req->prompt_text);
+    if (stable_bytes <= visible_prefix_bytes || stable_bytes > prompt_bytes)
+        return false;
+
+    char *suffix = xstrndup(req->prompt_text + visible_prefix_bytes,
+                            stable_bytes - visible_prefix_bytes);
+    ds4_tokens stable = {0};
+    const bool built = build_live_prompt_suffix(s, slot, req, suffix, &stable);
+    free(suffix);
+    if (!built) {
+        ds4_tokens_free(&stable);
+        return false;
+    }
+
+    const int live = ds4_session_pos(slot->session);
+    const bool ok = stable.len > live &&
+                    stable.len < effective_prompt->len &&
+                    ds4_tokens_starts_with(effective_prompt, &stable);
+    if (!ok) {
+        ds4_tokens_free(&stable);
+        return false;
+    }
+    ds4_tokens_free(out);
+    *out = stable;
+    if (stable_text_bytes_out) *stable_text_bytes_out = stable_bytes;
+    return true;
+}
+
+
+static bool openclaw_runtime_turn_prefix_from_live(
+        server *s, server_slot *slot, const request *req,
+        size_t visible_prefix_bytes, const ds4_tokens *effective_prompt,
+        ds4_tokens *out, size_t *text_bytes_out) {
+    if (text_bytes_out) *text_bytes_out = 0;
+    if (!s || !slot || !req || !req->prompt_text || !effective_prompt || !out)
+        return false;
+
+    const size_t target_bytes = openclaw_runtime_turn_prefix_bytes(req);
+    const size_t prompt_bytes = strlen(req->prompt_text);
+    if (target_bytes <= visible_prefix_bytes || target_bytes > prompt_bytes)
+        return false;
+
+    char *suffix = xstrndup(req->prompt_text + visible_prefix_bytes,
+                            target_bytes - visible_prefix_bytes);
+    ds4_tokens target = {0};
+    const bool built = build_live_prompt_suffix(s, slot, req, suffix, &target);
+    free(suffix);
+    if (!built) {
+        ds4_tokens_free(&target);
+        return false;
+    }
+
+    const int live = ds4_session_pos(slot->session);
+    const bool ok = target.len > live &&
+                    target.len < effective_prompt->len &&
+                    ds4_tokens_starts_with(effective_prompt, &target);
+    if (!ok) {
+        ds4_tokens_free(&target);
+        return false;
+    }
+    ds4_tokens_free(out);
+    *out = target;
+    if (text_bytes_out) *text_bytes_out = target_bytes;
+    return true;
+}
 
 /* =========================================================================
  * Live-state reuse probe.
@@ -13038,7 +13612,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, slot,
                                             rendered.ptr ? rendered.ptr : "",
-                                            &effective, &path, NULL, false);
+                                            &effective, &path, NULL, NULL, false);
         if (loaded == 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_invalidate(slot->session);
@@ -13394,6 +13968,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     err[0] = '\0';
     const bool multimodal = j->req.image_count != 0;
     pthread_mutex_lock(&s->inference_mu);
+    // Drop only disposable images. Invalidation would leave KV allocations
+    // resident while discarding a useful continuation.
+    server_memory_release_images(&s->image_cache);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     const bool live_vision_match =
@@ -13577,6 +14154,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
+    uint32_t disk_cache_text_bytes = 0;
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d vision=%s reason=%s",
@@ -13591,21 +14169,41 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
+
+    const bool defer_live_store_for_common_rebuild =
+        !multimodal && s->kv.enabled && cached == 0 &&
+        j->req.kind == REQ_CHAT && j->req.has_tools &&
+        old_pos >= s->kv.opt.min_tokens &&
+        common >= 2048 && common < old_pos &&
+        common < j->req.prompt.len;
+
     if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
-        /* Loading a disk snapshot replaces the live Metal session.  Persist the
-         * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
+        old_pos >= s->kv.opt.min_tokens &&
+        !defer_live_store_for_common_rebuild) {
+        /* Loading a disk snapshot replaces the live Metal session. Persist the
+         * current visible checkpoint first unless a large common prefix makes
+         * an advancing OpenClaw turn-anchor lookup preferable. */
         kv_cache_store_current(s, slot, "evict");
+    } else if (defer_live_store_for_common_rebuild) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: deferring live checkpoint store before large-common turn-anchor recovery common=%d old=%d prompt=%d",
+                   common, old_pos, j->req.prompt.len);
     }
+
     if (!multimodal && cached == 0) {
+        kv_cache_seed_openclaw_stable_prefix(s, slot, &j->req);
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
-                                        &disk_cache_ext_flags);
+                                        &disk_cache_ext_flags,
+                                        &disk_cache_text_bytes);
         if (disk_cached > 0) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+        } else if (defer_live_store_for_common_rebuild) {
+            /* A lookup miss is non-destructive, so preserve the live frontier
+             * only after we know no reusable advancing checkpoint exists. */
+            kv_cache_store_current(s, slot, "evict-after-disk-miss");
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -13706,6 +14304,96 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
+    char *boundary_store_text = NULL;
+    const char *boundary_store_reason = "cold";
+    if (!multimodal && s->kv.enabled && responses_protocol &&
+        j->req.prompt_text)
+    {
+        ds4_tokens boundary = {0};
+        size_t boundary_text_bytes = 0;
+        bool boundary_ok = false;
+        const char *boundary_kind = NULL;
+
+        if (cached == 0) {
+            boundary_ok = openclaw_runtime_turn_prefix(
+                s->engine, &j->req, &boundary, &boundary_text_bytes);
+        } else if (!strcmp(cache_source, "disk-text") &&
+                   disk_cache_text_bytes > 0) {
+            boundary_ok = openclaw_runtime_turn_prefix_from_live(
+                s, slot, &j->req, disk_cache_text_bytes,
+                prompt_for_sync, &boundary, &boundary_text_bytes);
+        } else if (!strcmp(cache_source, "responses-visible")) {
+            size_t visible_bytes = 0;
+            pthread_mutex_lock(&s->tool_mu);
+            if (slot->responses_live.valid &&
+                slot->responses_live.live_tokens == cached) {
+                visible_bytes = slot->responses_live.visible_len;
+            }
+            pthread_mutex_unlock(&s->tool_mu);
+            if (visible_bytes > 0) {
+                boundary_ok = openclaw_runtime_turn_prefix_from_live(
+                    s, slot, &j->req, visible_bytes,
+                    prompt_for_sync, &boundary, &boundary_text_bytes);
+            }
+        }
+        if (boundary_ok) boundary_kind = "turn";
+
+        if (!boundary_ok) {
+            ds4_tokens_free(&boundary);
+            boundary_text_bytes = 0;
+            if (cached == 0) {
+                boundary_ok = openclaw_runtime_stable_prefix(
+                    s->engine, &j->req, &boundary, &boundary_text_bytes);
+            } else if (!strcmp(cache_source, "disk-text") &&
+                       disk_cache_text_bytes > 0) {
+                boundary_ok = openclaw_runtime_stable_prefix_from_live(
+                    s, slot, &j->req, disk_cache_text_bytes,
+                    prompt_for_sync, &boundary, &boundary_text_bytes);
+            } else if (!strcmp(cache_source, "responses-visible")) {
+                size_t visible_bytes = 0;
+                pthread_mutex_lock(&s->tool_mu);
+                if (slot->responses_live.valid &&
+                    slot->responses_live.live_tokens == cached) {
+                    visible_bytes = slot->responses_live.visible_len;
+                }
+                pthread_mutex_unlock(&s->tool_mu);
+                if (visible_bytes > 0) {
+                    boundary_ok = openclaw_runtime_stable_prefix_from_live(
+                        s, slot, &j->req, visible_bytes,
+                        prompt_for_sync, &boundary, &boundary_text_bytes);
+                }
+            }
+            if (boundary_ok) boundary_kind = "stable";
+        }
+
+        if (boundary_ok && boundary.len >= s->kv.opt.min_tokens &&
+            boundary.len < prompt_for_sync->len &&
+            boundary.len > cached)
+        {
+            const bool fragments_wide_sweep =
+                boundary_kind && !strcmp(boundary_kind, "stable") &&
+                openclaw_stable_boundary_fragments_wide_prefill(
+                    cached, prompt_for_sync->len, boundary.len);
+            if (!fragments_wide_sweep) {
+                cold_store_len = boundary.len;
+                boundary_store_text = xstrndup(j->req.prompt_text,
+                                               boundary_text_bytes);
+                boundary_store_reason = "agent-session";
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: OpenClaw %s prefix selected source=%s cached=%d tokens=%d prompt=%d bytes=%zu",
+                           boundary_kind ? boundary_kind : "session",
+                           cache_source, cached, cold_store_len,
+                           prompt_for_sync->len, boundary_text_bytes);
+            } else {
+                trace_event(s, trace_id,
+                            "OpenClaw stable prefix refresh skipped source=%s cached=%d stable=%d prompt=%d reason=avoid-small-prefill-fragment",
+                            cache_source, cached, boundary.len,
+                            prompt_for_sync->len);
+            }
+        }
+        ds4_tokens_free(&boundary);
+    }
+
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
@@ -13733,6 +14421,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
             kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
             free(disk_cache_path);
+            free(boundary_store_text);
+            boundary_store_text = NULL;
             if (job_cancelled(j)) {
                 request_live_state_clear(s, slot);
                 trace_event(s, trace_id, "cancelled during prefill");
@@ -13742,8 +14432,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
         }
-        if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
-                                       cold_store_len, "cold")) {
+        bool boundary_stored = boundary_store_text ?
+            kv_cache_store_live_prefix_text(s, slot, prompt_for_sync,
+                                            cold_store_len,
+                                            boundary_store_reason,
+                                            boundary_store_text, 0, NULL) :
+            kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+                                       cold_store_len,
+                                       boundary_store_reason);
+        if (boundary_stored) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
         } else {
@@ -13751,6 +14448,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
             suppressed_continued_last = -1;
         }
+        free(boundary_store_text);
+        boundary_store_text = NULL;
         ds4_tokens_free(&prefix);
     }
 
@@ -14745,9 +15444,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
 
+    openclaw_aux_resident_pin aux_pin = {0};
+    openclaw_aux_resident_pin_begin(s, slot, &j->req, &aux_pin);
+
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+
+    openclaw_aux_resident_pin_restore(s, slot, &aux_pin);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -15346,6 +16050,12 @@ static void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
+    if (server_reject_memory_pressure(fd,s->enable_cors)) {
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        request_free(&j.req);
+        goto done;
+    }
     if (!enqueue(s, &j)) {
         http_error(fd, s->enable_cors, 503, "server shutting down");
         pthread_cond_destroy(&j.cv);
@@ -15976,6 +16686,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    const uint64_t available_bytes = ds4_host_available_bytes();
+    if (available_bytes) server_log(DS4_LOG_DEFAULT,
+        "ds4-server: host reclaimable memory after session allocation %.2f GiB (pressure=%d)",
+        (double)available_bytes/(1024.0*1024.0*1024.0), (int)server_memory_pressure());
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
@@ -21687,6 +22401,128 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
 }
 
+/* Preserve the pre-scan search as an executable oracle, including directory
+ * order and equal-length token tie-breaking. */
+static int test_kv_lookup_reference(ds4_kvstore *kc, const char *text,
+                                     int model, int quant, int ctx) {
+    const size_t bytes = strlen(text);
+    int best = -1;
+    for (int i = 0; i < kc->len; ++i) {
+        const ds4_kvstore_entry *e = &kc->entry[i];
+        if (e->text_bytes > bytes || e->text_bytes > SIZE_MAX ||
+            (int)e->tokens < kc->opt.min_tokens || e->model_id != (uint8_t)model ||
+            (uint32_t)ctx < e->ctx_size ||
+            (kc->reject_different_quant && e->quant_bits != (uint8_t)quant)) continue;
+        if (best >= 0 && (e->text_bytes < kc->entry[best].text_bytes ||
+            (e->text_bytes == kc->entry[best].text_bytes && e->tokens <= kc->entry[best].tokens))) continue;
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(text, (size_t)e->text_bytes, sha);
+        if (!strcmp(sha, e->sha)) best = i;
+    }
+    return best;
+}
+
+static void test_kv_cache_lookup_hash_scan(void) {
+    const bool bench = getenv("DS4_TEST_KV_HASH_BENCH") != NULL;
+    const size_t bytes = bench ? 500000u : 4096u;
+    char *text = xmalloc(bytes + 1);
+    uint32_t rng = 71691;
+    for (size_t i = 0; i < bytes; ++i) text[i] = 'a' + i % 23;
+    text[bytes] = 0;
+    for (unsigned run = 0; run < (bench ? 3u : 30u); ++run) {
+        ds4_kvstore kc = {.len = bench ? (int[]){20,200,1000}[run] : 200,
+            .opt = {.min_tokens = 16}, .reject_different_quant = run % 2};
+        /* Disabled disk refresh allows the same generated directory order
+         * to reach both searches without filesystem ordering as a confound. */
+        kc.entry = xmalloc((size_t)kc.len * sizeof(*kc.entry));
+        memset(kc.entry, 0, (size_t)kc.len * sizeof(*kc.entry));
+        for (int i = 0; i < kc.len; ++i) {
+            rng = rng * 1664525u + 1013904223u;
+            ds4_kvstore_entry *e = &kc.entry[i];
+            e->text_bytes = rng % (bytes + 65u);
+            e->tokens = (rng >> 8) % 1024u;
+            e->model_id = i % 9 == 0 ? 2 : 1;
+            e->quant_bits = i % 7 == 0 ? 2 : 4;
+            e->ctx_size = i % 11 == 0 ? 65536 : 32768;
+            ds4_kvstore_sha1_bytes_hex(text, (size_t)e->text_bytes <= bytes ?
+                (size_t)e->text_bytes : bytes, e->sha);
+            if (i % 5) e->sha[0] = e->sha[0] == '0' ? '1' : '0';
+        }
+        /* Empty prefixes, duplicate lengths and equal SHA with different
+         * token counts also occur in the generated in-memory contract. */
+        if (!bench) {
+            kc.entry[1] = kc.entry[2]; kc.entry[1].tokens = kc.entry[2].tokens + 1;
+            kc.entry[3].text_bytes = 0;
+            ds4_kvstore_sha1_bytes_hex(text, 0, kc.entry[3].sha);
+        }
+        const double t0 = now_sec();
+        const int expected = test_kv_lookup_reference(&kc, text, 1, 4, 32768);
+        const double t1 = now_sec();
+        const int actual = ds4_kvstore_find_text_prefix(&kc, text, 1, 4, 32768);
+        const double t2 = now_sec();
+        TEST_ASSERT(actual == expected);
+        if (bench) fprintf(stderr, "KV hash scan entries=%d bytes=%zu old_ms=%.3f new_ms=%.3f match=%d\n",
+            kc.len, bytes, (t1-t0)*1000.0, (t2-t1)*1000.0, actual == expected);
+        ds4_kvstore_clear(&kc);
+    }
+    free(text);
+}
+
+/* Compare victim selection with the scalar-hash API, including repeated
+ * removals that shift the parallel score array. Headers use zero timestamps
+ * so this oracle is independent of crossing a wall-clock second. */
+static void test_kv_cache_eviction_hash_scan(void) {
+    char text[4097];
+    for (unsigned i=0;i<4096;i++) text[i]='a'+i%23;
+    text[4096]=0;
+    uint32_t rng=89125;
+    for (unsigned run=0;run<12;run++) {
+        char dir[]="/tmp/ds4-kv-eviction-scan.XXXXXX";
+        TEST_ASSERT(mkdtemp(dir)!=NULL);
+        ds4_kvstore kc={0};
+        TEST_ASSERT(ds4_kvstore_open(&kc,dir,1,run%2,ds4_kvstore_default_options(),"test",NULL,NULL));
+        for (unsigned i=0;i<40;i++) {
+            rng=rng*1664525u+1013904223u;
+            const size_t n=32u+i*97u;
+            char prefix[4097];memcpy(prefix,text,n);prefix[n]=0;
+            if (i%5==0) prefix[n-1]='Z';
+            test_kv_text_stub_file_model(dir,prefix,i%9==0?2:1,
+                i%3==0?DS4_KVSTORE_REASON_COLD:DS4_KVSTORE_REASON_CONTINUED,
+                64+(rng%2048),0);
+        }
+        (void)ds4_kvstore_find_text_prefix(&kc,text,1,4,32768);
+        uint64_t total=0;
+        for(int i=0;i<kc.len;i++) {
+            ds4_kvstore_entry *e=&kc.entry[i];
+            e->created_at=e->last_used=0;
+            FILE *fp=fopen(e->path,"r+b");TEST_ASSERT(fp!=NULL);
+            uint8_t zero[16]={0};TEST_ASSERT(fseek(fp,24,SEEK_SET)==0);
+            TEST_ASSERT(fwrite(zero,1,16,fp)==16);TEST_ASSERT(fclose(fp)==0);
+            total+=e->file_size;
+        }
+        ds4_kvstore_entry expected[40];int n=kc.len;
+        memcpy(expected,kc.entry,(size_t)n*sizeof(*expected));
+        ds4_kvstore_eviction_context incoming={.text=text,.text_len=strlen(text),
+            .model_id=1,.quant_bits=2,.ctx_size=32768,.reject_different_quant=run%2};
+        kc.budget_bytes=total/2;
+        while(total>kc.budget_bytes && n) {
+            int victim=0;
+            double score=ds4_kvstore_entry_eviction_score(&expected[0],NULL,1000,&incoming);
+            for(int i=1;i<n;i++) {
+                const double next=ds4_kvstore_entry_eviction_score(&expected[i],NULL,1000,&incoming);
+                if(next<score || (next==score && expected[i].last_used<expected[victim].last_used)) {victim=i;score=next;}
+            }
+            total-=expected[victim].file_size;
+            memmove(expected+victim,expected+victim+1,(size_t)(n-victim-1)*sizeof(*expected));n--;
+        }
+        ds4_kvstore_evict(&kc,NULL,0,&incoming);
+        TEST_ASSERT(kc.len==n);
+        for(int i=0;i<kc.len && i<n;i++) TEST_ASSERT(!strcmp(kc.entry[i].sha,expected[i].sha));
+        for(int i=0;i<kc.len;i++) TEST_ASSERT(unlink(kc.entry[i].path)==0);
+        ds4_kvstore_close(&kc);TEST_ASSERT(rmdir(dir)==0);
+    }
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -21854,6 +22690,162 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
 
     chat_msgs_free(&msgs);
     if (fp) fclose(fp);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void test_glm_kv_tool_map_roundtrip_exact_blocks(void) {
+    const char *leading[] = {"", "\n", "\n\n", "\n\n\n"};
+    const char *prefixes[] = {
+        "",
+        "<|user|>quote <tool_call> literally<|assistant|>",
+        "<|user|>quote <tool_call><arg_value> literally<|assistant|>",
+        "<|user|>quote <tool_call><arg_key> literally<|assistant|>",
+    };
+    const char *values[] = {
+        "printf café",
+        "printf '</tool_call>' café",
+        NULL, /* Calls with no arguments have no wrapper closing delimiter. */
+    };
+    for (int variant = 0; variant < 96; ++variant) {
+        const int leading_variant = variant % 4;
+        const bool multiple = ((variant / 4) % 2) != 0;
+        const int edge_variant = variant / 8;
+        buf generated = {0};
+        buf_puts(&generated, "<think>need shell</think>");
+        buf_puts(&generated, leading[leading_variant]);
+        const char *value = values[edge_variant % 3];
+        if (value) {
+            buf_puts(&generated, "<tool_call>Bash\n<arg_key>command</arg_key>"
+                                "<arg_value>");
+            buf_puts(&generated, value);
+            buf_puts(&generated, "</arg_value></tool_call>");
+        } else {
+            buf_puts(&generated, "<tool_call>Ping</tool_call>");
+        }
+        if (multiple) {
+            buf_puts(&generated, value
+                ? "\n \t<tool_call>Read\n<arg_key>file_path</arg_key>"
+                  "<arg_value>/tmp/a.py</arg_value></tool_call>"
+                : "\n \t<tool_call>Pong</tool_call>");
+        }
+        if (variant % 2) buf_puts(&generated, "\n \t");
+
+        char *content = NULL, *reasoning = NULL;
+        tool_calls sampled = {0};
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(SERVER_MODEL_SYNTAX_GLM,
+                    generated.ptr, true, &content, &reasoning, &sampled));
+        TEST_ASSERT(sampled.len == (multiple ? 2 : 1));
+        server src = {0}, dst = {0};
+        pthread_mutex_init(&src.tool_mu, NULL);
+        pthread_mutex_init(&dst.tool_mu, NULL);
+        assign_tool_call_ids(&src, &sampled, API_ANTHROPIC);
+        tool_memory_remember(&src, &sampled);
+        tool_memory_put(&src, "toolu_absent", "<tool_call>Absent</tool_call>");
+
+        chat_msgs msgs = {0};
+        chat_msg assistant = {0};
+        assistant.role = xstrdup("assistant");
+        assistant.content = xstrdup(content ? content : "");
+        assistant.reasoning = xstrdup(reasoning ? reasoning : "");
+        for (int i = 0; i < sampled.len; ++i) {
+            tool_call tc = {.id = xstrdup(sampled.v[i].id),
+                            .name = xstrdup(sampled.v[i].name),
+                            .arguments = xstrdup(sampled.v[i].arguments)};
+            tool_calls_push(&assistant.calls, tc);
+        }
+        chat_msgs_push(&msgs, assistant);
+        tool_memory_attach_to_messages(&src, &msgs, NULL);
+        char *expected = render_glm_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+        TEST_ASSERT(strstr(expected, sampled.raw_tool_text) != NULL);
+
+        /* Repetition must not serialize the same IDs twice; an unrelated block
+         * in tool memory must not leak into this checkpoint's sidecar. */
+        buf checkpoint = {0};
+        buf_puts(&checkpoint, prefixes[edge_variant / 3]);
+        buf_puts(&checkpoint, expected);
+        buf_puts(&checkpoint, "<|observation|>done");
+        buf_puts(&checkpoint, expected);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        uint64_t estimated = 0, written = 0;
+        TEST_ASSERT(kv_tool_map_serialized_size(&src, checkpoint.ptr, &estimated));
+        TEST_ASSERT(kv_tool_map_write(&src, fp, checkpoint.ptr, &written));
+        TEST_ASSERT(written > 0 && estimated == written);
+        TEST_ASSERT((uint64_t)ftell(fp) == written);
+        rewind(fp);
+        TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == sampled.len);
+        TEST_ASSERT(!tool_memory_has_id(&dst, "toolu_absent"));
+
+        /* A fresh server must replay the identical bytes, not regenerate the
+         * canonical newline or split a multi-call block into separate maps. */
+        free(msgs.v[0].calls.raw_tool_text);
+        msgs.v[0].calls.raw_tool_text = NULL;
+        tool_replay_stats stats = {0};
+        tool_memory_attach_to_messages(&dst, &msgs, &stats);
+        TEST_ASSERT(stats.disk == 1 && stats.canonical == 0 && stats.missing_ids == 0);
+        TEST_ASSERT(msgs.v[0].calls.raw_tool_text &&
+                    !strcmp(msgs.v[0].calls.raw_tool_text, sampled.raw_tool_text));
+        char *actual = render_glm_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+        TEST_ASSERT(!strcmp(expected, actual));
+
+        free(expected); free(actual); free(content); free(reasoning);
+        fclose(fp);
+        buf_free(&checkpoint); buf_free(&generated);
+        chat_msgs_free(&msgs); tool_calls_free(&sampled);
+        tool_memory_free(&src.tool_mem); tool_memory_free(&dst.tool_mem);
+        pthread_mutex_destroy(&src.tool_mu); pthread_mutex_destroy(&dst.tool_mu);
+    }
+}
+
+static void test_glm_kv_tool_map_adversarial_scan_is_bounded(void) {
+    const char *raw = "\n\n<tool_call>Ping</tool_call>";
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_memory_put(&src, "call_linear", raw);
+
+    buf checkpoint = {0};
+    buf_puts(&checkpoint, raw);
+    buf_puts(&checkpoint, "<tool_call>GroupedLiteral</tool_call>");
+    for (int i = 0; i < 4096; i++) {
+        if (i % 3 == 0) buf_puts(&checkpoint, "<tool_call>");
+        else if (i % 3 == 1) buf_puts(&checkpoint, "<tool_call><arg_key>");
+        else buf_puts(&checkpoint, "<tool_call><arg_value>");
+    }
+    buf_puts(&checkpoint, raw);
+
+    uint64_t estimated = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, checkpoint.ptr, &estimated));
+    TEST_ASSERT(estimated > 0);
+    TEST_ASSERT(src.tool_mem.last_scan_steps > 0);
+    TEST_ASSERT(src.tool_mem.last_scan_steps <= (uint64_t)checkpoint.len * 4u);
+
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t written = 0;
+    TEST_ASSERT(kv_tool_map_write(&src, fp, checkpoint.ptr, &written));
+    TEST_ASSERT(written == estimated);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call call = {.id = xstrdup("call_linear"),
+                      .name = xstrdup("Ping"),
+                      .arguments = xstrdup("{}")};
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+    tool_memory_attach_to_messages(&dst, &msgs, NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, raw));
+
+    chat_msgs_free(&msgs);
+    fclose(fp);
+    buf_free(&checkpoint);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
     pthread_mutex_destroy(&src.tool_mu);
@@ -22917,7 +23909,35 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_server_memory_pressure(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX,SOCK_STREAM,0,sv)==0);
+    server_test_memory_pressure=DS4_HOST_PRESSURE_CRITICAL;
+    TEST_ASSERT(server_reject_memory_pressure(sv[0],true));
+    char response[1024]={0};
+    const ssize_t n=recv(sv[1],response,sizeof(response)-1,0);
+    TEST_ASSERT(n>0);
+    TEST_ASSERT(strstr(response,"503 Service Unavailable")!=NULL);
+    TEST_ASSERT(strstr(response,"Retry-After: 5\r\n")!=NULL);
+    TEST_ASSERT(strstr(response,"server under memory pressure")!=NULL);
+    server_test_memory_pressure=DS4_HOST_PRESSURE_NORMAL;
+    TEST_ASSERT(!server_reject_memory_pressure(sv[0],true));
+    server_test_memory_pressure=DS4_HOST_PRESSURE_WARN;
+    TEST_ASSERT(!server_reject_memory_pressure(sv[0],true));
+    server_image_cache cache={0};
+    cache.entries[0].encoded=(uint8_t *)xstrdup("a");
+    cache.entries[0].encoded_len=1;
+    cache.entries[0].embedding.data=calloc(1,sizeof(float));
+    cache.entries[0].data_bytes=sizeof(float);
+    cache.bytes=1+sizeof(float);
+    server_memory_release_images(&cache);
+    TEST_ASSERT(cache.bytes==0 && cache.entries[0].encoded==NULL);
+    server_test_memory_pressure=-1;
+    close(sv[0]);close(sv[1]);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_server_memory_pressure();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
@@ -23034,6 +24054,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_body_escape_round_trip();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
+    test_glm_kv_tool_map_roundtrip_exact_blocks();
+    test_glm_kv_tool_map_adversarial_scan_is_bounded();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();
@@ -23076,6 +24098,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_lookup_hash_scan();
+    test_kv_cache_eviction_hash_scan();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();

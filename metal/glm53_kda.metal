@@ -286,6 +286,172 @@ kernel void kernel_glm53_kda_prefill_recurrence(
     *state_ptr = h;
 }
 
+kernel void kernel_glm53_kda_prefill_recurrence_percore120(
+        constant glm53_kda_args &args,
+        device const float   *q,
+        device const float   *k,
+        device const float   *v,
+        device const float   *decay,
+        device const float   *raw_beta,
+        device float         *state,
+        device float         *out,
+        threadgroup float    *scratch [[threadgroup(0)]],
+        uint tg [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]]) {
+    constexpr uint D = 128u;
+    constexpr uint TB = 8u;
+    constexpr uint NTG = 120u;
+    constexpr uint MR = 70u;
+    constexpr uint ROWS_PER_GROUP = 2u;
+    constexpr uint THREADS = 280u;
+
+    const uint tid = uint(tid_u);
+    const uint total = args.n_heads * D;
+    if (tg >= NTG || total == 0u) return;
+
+    // Even boundaries guarantee a two-row register pair never straddles a
+    // 128-row head boundary.
+    const uint half_total = total / 2u;
+    const uint r0 = 2u * ((tg * half_total) / NTG);
+    const uint r1 = 2u * (((tg + 1u) * half_total) / NTG);
+    const uint nrows = r1 - r0;
+    const uint head_a = r0 / D;
+    const uint head_z = (r1 - 1u) / D;
+    const uint nh = head_z - head_a + 1u;
+
+    const uint rg = tid / 8u;
+    const uint seg = tid & 7u;
+    const uint d0 = seg * 16u;
+    const uint lr0 = rg * ROWS_PER_GROUP;
+    const uint lr1 = lr0 + 1u;
+    const bool active0 = lr0 < nrows;
+    const bool active1 = lr1 < nrows;
+    const uint fr0 = r0 + min(lr0, nrows - 1u);
+    const uint fr1 = r0 + min(lr1, nrows - 1u);
+    const uint h0 = fr0 / D;
+    const uint h1 = fr1 / D;
+    const uint v0 = fr0 % D;
+    const uint v1 = fr1 % D;
+    const uint hs0 = h0 - head_a;
+    const uint hs1 = h1 - head_a;
+
+    threadgroup float *sq = scratch;
+    threadgroup float *sk = sq + 2u * TB * D;
+    threadgroup float *sd = sk + 2u * TB * D;
+    threadgroup float *sv = sd + 2u * TB * D;
+    threadgroup float *sb = sv + TB * MR;
+
+    const uint projection = args.n_heads * D;
+
+    float4 h00=0.0f,h01=0.0f,h02=0.0f,h03=0.0f;
+    float4 h10=0.0f,h11=0.0f,h12=0.0f,h13=0.0f;
+    device float4 *s0 = nullptr;
+    device float4 *s1 = nullptr;
+    if (active0) {
+        s0 = (device float4 *)(state + (ulong)fr0 * D + d0);
+        h00=s0[0]; h01=s0[1]; h02=s0[2]; h03=s0[3];
+    }
+    if (active1) {
+        s1 = (device float4 *)(state + (ulong)fr1 * D + d0);
+        h10=s1[0]; h11=s1[1]; h12=s1[2]; h13=s1[3];
+    }
+
+    for (uint t0=0u; t0<args.n_rows; t0+=TB) {
+        const uint nt=min(TB,args.n_rows-t0);
+
+        for (uint hs=0u; hs<nh; ++hs) {
+            const uint head=head_a+hs;
+            for (uint p=tid; p<nt*D; p+=THREADS) {
+                const uint tr=p/D;
+                const uint d=p-tr*D;
+                const ulong base=(ulong)(t0+tr)*projection+(ulong)head*D;
+                const ulong dst=((ulong)hs*TB+tr)*D+d;
+                sq[dst]=q[base+d];
+                sk[dst]=k[base+d];
+                sd[dst]=decay[base+d];
+            }
+            for (uint tr=tid; tr<nt; tr+=THREADS) {
+                sb[hs*TB+tr]=1.0f/
+                    (1.0f+exp(-raw_beta[(ulong)(t0+tr)*args.n_heads+head]));
+            }
+        }
+
+        for (uint p=tid; p<nt*nrows; p+=THREADS) {
+            const uint tr=p/nrows;
+            const uint lr=p-tr*nrows;
+            const uint fr=r0+lr;
+            const uint head=fr/D;
+            const uint value=fr%D;
+            const ulong base=(ulong)(t0+tr)*projection+(ulong)head*D;
+            sv[tr*MR+lr]=v[base+value];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint tr=0u; tr<nt; ++tr) {
+            if (active0) {
+                const threadgroup float4 *q4=(const threadgroup float4 *)
+                    (sq+((ulong)hs0*TB+tr)*D+d0);
+                const threadgroup float4 *k4=(const threadgroup float4 *)
+                    (sk+((ulong)hs0*TB+tr)*D+d0);
+                const threadgroup float4 *g4=(const threadgroup float4 *)
+                    (sd+((ulong)hs0*TB+tr)*D+d0);
+                const float4 q0=q4[0],q1=q4[1],q2=q4[2],q3=q4[3];
+                const float4 k0=k4[0],k1=k4[1],k2=k4[2],k3=k4[3];
+                h00*=g4[0]; h01*=g4[1]; h02*=g4[2]; h03*=g4[3];
+                float pp=dot(h00,k0)+dot(h01,k1)+dot(h02,k2)+dot(h03,k3);
+                pp+=simd_shuffle_xor(pp,4);
+                pp+=simd_shuffle_xor(pp,2);
+                pp+=simd_shuffle_xor(pp,1);
+                const float dv=(sv[tr*MR+lr0]-pp)*sb[hs0*TB+tr];
+                h00=fma(k0,float4(dv),h00);
+                h01=fma(k1,float4(dv),h01);
+                h02=fma(k2,float4(dv),h02);
+                h03=fma(k3,float4(dv),h03);
+                float yy=dot(h00,q0)+dot(h01,q1)+dot(h02,q2)+dot(h03,q3);
+                yy+=simd_shuffle_xor(yy,4);
+                yy+=simd_shuffle_xor(yy,2);
+                yy+=simd_shuffle_xor(yy,1);
+                if (seg==0u) {
+                    const ulong base=(ulong)(t0+tr)*projection+(ulong)h0*D;
+                    out[base+v0]=yy;
+                }
+            }
+            if (active1) {
+                const threadgroup float4 *q4=(const threadgroup float4 *)
+                    (sq+((ulong)hs1*TB+tr)*D+d0);
+                const threadgroup float4 *k4=(const threadgroup float4 *)
+                    (sk+((ulong)hs1*TB+tr)*D+d0);
+                const threadgroup float4 *g4=(const threadgroup float4 *)
+                    (sd+((ulong)hs1*TB+tr)*D+d0);
+                const float4 q0=q4[0],q1=q4[1],q2=q4[2],q3=q4[3];
+                const float4 k0=k4[0],k1=k4[1],k2=k4[2],k3=k4[3];
+                h10*=g4[0]; h11*=g4[1]; h12*=g4[2]; h13*=g4[3];
+                float pp=dot(h10,k0)+dot(h11,k1)+dot(h12,k2)+dot(h13,k3);
+                pp+=simd_shuffle_xor(pp,4);
+                pp+=simd_shuffle_xor(pp,2);
+                pp+=simd_shuffle_xor(pp,1);
+                const float dv=(sv[tr*MR+lr1]-pp)*sb[hs1*TB+tr];
+                h10=fma(k0,float4(dv),h10);
+                h11=fma(k1,float4(dv),h11);
+                h12=fma(k2,float4(dv),h12);
+                h13=fma(k3,float4(dv),h13);
+                float yy=dot(h10,q0)+dot(h11,q1)+dot(h12,q2)+dot(h13,q3);
+                yy+=simd_shuffle_xor(yy,4);
+                yy+=simd_shuffle_xor(yy,2);
+                yy+=simd_shuffle_xor(yy,1);
+                if (seg==0u) {
+                    const ulong base=(ulong)(t0+tr)*projection+(ulong)h1*D;
+                    out[base+v1]=yy;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active0) { s0[0]=h00; s0[1]=h01; s0[2]=h02; s0[3]=h03; }
+    if (active1) { s1[0]=h10; s1[1]=h11; s1[2]=h12; s1[3]=h13; }
+}
+
 kernel void kernel_glm53_kda_prefill_output(
         constant glm53_kda_args &args,
         device float         *out,

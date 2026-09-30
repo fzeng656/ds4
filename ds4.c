@@ -36765,6 +36765,7 @@ typedef struct {
 } ds4_imatrix_collector;
 
 struct ds4_glm_gpu_graph;
+
 static bool imatrix_collect_glm_one(
         ds4_imatrix_collector      *c,
         struct ds4_glm_gpu_graph   *g,
@@ -45136,6 +45137,10 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    /* Experimental GLM-5.3 mHC post-layer projective steering.
+     * One direction per layer at width 4*4096 = 16384. */
+    ds4_gpu_tensor *glm53_post_steering_dirs_by_tier[DS4_MAX_GPUS];
+    float glm53_post_steering_scale;
     bool streaming_static_decode_map_current;
     /* Tensor parallelism (50/50 expert sharding): tp_world 2 means
      * this rank computes only its contiguous half of the routed experts
@@ -45263,6 +45268,84 @@ static bool glm_graph_apply_directional_steering_ffn(
     return glm_graph_apply_directional_steering(
             g, x, il, rows,
             g ? g->directional_steering_ffn_scale : 0.0f);
+}
+
+static float glm53_post_steering_env_scale(void) {
+    const char *v = getenv("DS4_GLM53_POST_STEER_SCALE");
+    if (!v || !v[0]) return 1.0f;
+    char *end = NULL;
+    errno = 0;
+    const float scale = strtof(v, &end);
+    if (end == v || errno != 0 || !isfinite(scale)) return 1.0f;
+    if (scale < -100.0f) return -100.0f;
+    if (scale > 100.0f) return 100.0f;
+    return scale;
+}
+
+static bool glm53_graph_load_post_steering(ds4_glm_gpu_graph *g) {
+    if (!g) return false;
+    const char *path = getenv("DS4_GLM53_POST_STEER_FILE");
+    if (!path || !path[0]) {
+        g->glm53_post_steering_scale = 0.0f;
+        return true;
+    }
+    if (!g->glm53) {
+        fprintf(stderr, "ds4: GLM post-layer steering requires GLM 5.3\n");
+        return false;
+    }
+
+    const uint32_t n_layers = directional_steering_layer_count();
+    const uint32_t width = DS4_N_EMBD * DS4_N_HC;
+    if (n_layers == 0 || n_layers != g->normal_layers) return false;
+    const uint64_t n = (uint64_t)n_layers * width;
+    float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
+    bool ok = read_f32_binary_file(path, dirs, n);
+    bool used_tier[DS4_MAX_GPUS] = {false};
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        const int tier = glm_graph_directional_steering_tier(g, il);
+        if (tier < 0) {
+            ok = false;
+            break;
+        }
+        used_tier[tier] = true;
+    }
+    for (int tier = 0; ok && tier < DS4_MAX_GPUS; tier++) {
+        if (!used_tier[tier]) continue;
+        g->glm53_post_steering_dirs_by_tier[tier] =
+            ds4_gpu_tensor_alloc_ptr_on(tier, n * sizeof(dirs[0]));
+        ok = g->glm53_post_steering_dirs_by_tier[tier] != NULL &&
+             ds4_gpu_tensor_write(g->glm53_post_steering_dirs_by_tier[tier],
+                                  0, dirs, n * sizeof(dirs[0])) != 0;
+    }
+    free(dirs);
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: failed to load GLM post-layer steering vectors from %s\n",
+                path);
+        return false;
+    }
+    g->glm53_post_steering_scale = glm53_post_steering_env_scale();
+    fprintf(stderr,
+            "ds4: GLM post-layer mHC steering enabled: %s scale=%g width=%u\n",
+            path, (double)g->glm53_post_steering_scale, width);
+    return true;
+}
+
+static bool glm53_graph_apply_post_steering(
+        ds4_glm_gpu_graph *g,
+        ds4_gpu_tensor    *x,
+        uint32_t           il,
+        uint32_t           rows) {
+    if (!g || !x || rows == 0 || g->glm53_post_steering_scale == 0.0f) return true;
+    const int tier = glm_graph_directional_steering_tier(g, il);
+    if (tier < 0 || !g->glm53_post_steering_dirs_by_tier[tier]) return false;
+    return ds4_gpu_directional_steering_project_tensor(
+            x,
+            g->glm53_post_steering_dirs_by_tier[tier],
+            il,
+            DS4_N_EMBD * DS4_N_HC,
+            rows,
+            g->glm53_post_steering_scale) != 0;
 }
 
 static bool imatrix_collect_glm_one(
@@ -46895,6 +46978,8 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
         ds4_gpu_tensor_free(g->directional_steering_dirs_by_tier[tier]);
         g->directional_steering_dirs_by_tier[tier] = NULL;
+        ds4_gpu_tensor_free(g->glm53_post_steering_dirs_by_tier[tier]);
+        g->glm53_post_steering_dirs_by_tier[tier] = NULL;
     }
     ds4_gpu_tensor_free(g->mtp_kv_lora_cache);
     ds4_gpu_tensor_free(g->mtp_k_rope_cache);
@@ -49447,6 +49532,14 @@ static bool glm53_graph_encode_ffn_tail_one(
                                       g->hc_comb,
                                       DS4_N_EMBD,
                                       DS4_N_HC) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm53_hc_post",
+                                          g->hc_next,
+                                          DS4_N_HC * DS4_N_EMBD,
+                                          il,
+                                          pos);
+            ok = glm53_graph_apply_post_steering(g, g->hc_next, il, 1);
+        }
     }
     return ok;
 }
@@ -53089,6 +53182,11 @@ glm53_batch_attention_done:
                         "glm53_hc_after_ffn", hc_next,
                         (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD,
                         il, pos0);
+                metal_graph_debug_dump_tensor(
+                        "glm53_hc_post", hc_next,
+                        (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD,
+                        il, pos0);
+                ok = glm53_graph_apply_post_steering(g, hc_next, il, n_tokens);
             }
             if (ok) {
                 ds4_gpu_tensor *tmp = hc_cur;
@@ -54846,6 +54944,13 @@ glm53_indexed_attention_done:
                                                 g->batch_hc_split,
                                                 DS4_N_EMBD,
                                                 DS4_N_HC) != 0;
+            if (ok) {
+                metal_graph_debug_dump_tensor(
+                        "glm53_hc_post", hc_next,
+                        (uint64_t)n_tokens * DS4_N_HC * DS4_N_EMBD,
+                        il, pos0);
+                ok = glm53_graph_apply_post_steering(g, hc_next, il, n_tokens);
+            }
             if (ok) {
                 ds4_gpu_tensor *tmp = hc_cur;
                 hc_cur = hc_next;
@@ -57189,7 +57294,8 @@ static int generate_glm_metal_argmax(
     if (!glm_graph_load_directional_steering(&g,
                                              directional_steering_file,
                                              directional_steering_attn,
-                                             directional_steering_ffn)) {
+                                             directional_steering_ffn) ||
+        !glm53_graph_load_post_steering(&g)) {
         glm_graph_free(&g);
         return 1;
     }
@@ -73026,7 +73132,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     &s->glm_graph,
                     e->directional_steering_file,
                     e->directional_steering_attn_scale,
-                    e->directional_steering_ffn_scale)) {
+                    e->directional_steering_ffn_scale) ||
+            !glm53_graph_load_post_steering(&s->glm_graph)) {
             glm_graph_free(&s->glm_graph);
             free(s);
             return 1;
@@ -78090,6 +78197,13 @@ static bool glm53_graph_encode_native_session_batch(
                                                      g->batch_hc_split,
                                                      DS4_N_EMBD,
                                                      DS4_N_HC) != 0;
+        if (ok) {
+            metal_graph_debug_dump_tensor(
+                    "glm53_hc_post", hc_next,
+                    (uint64_t)rows * DS4_N_HC * DS4_N_EMBD,
+                    il, 0);
+            ok = glm53_graph_apply_post_steering(g, hc_next, il, rows);
+        }
         if (ok) {
             ds4_gpu_tensor *tmp = hc_cur;
             hc_cur = hc_next;

@@ -6757,6 +6757,606 @@ kernel void kernel_dsv4_indexer_scores_nax(
         }
     }
 }
+
+kernel void kernel_glm53_sparse_mla_nax(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    constexpr int D = 512;
+    constexpr int BK = 128;
+
+    const int qi = int(tgpig.x);
+    const int hh = int(tgpig.y);
+    const uint sg = uint(sg_u);
+    const uint lane = uint(lane_u);
+    const uint tid = uint(tid_u);
+    const int hg = int(sg) / 4;
+    const int dq = int(sg) % 4;
+    const int head0 = hh * 32 + hg * 16;
+
+    if (qi >= int(args.n_tokens) ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != D ||
+        args.qk_rope != 0u ||
+        args.n_selected == 0u ||
+        args.n_head == 0u) {
+        return;
+    }
+
+    const short qid = short(lane >> 2);
+    const short fm = short((qid & 4) | ((lane >> 1) & 3));
+    const short fn = short(((qid & 2) | (lane & 1)) * 4);
+    const short cb = short(((qid & 2) | (lane & 1)) * 2);
+
+    threadgroup float s_tile[2 * 16 * BK];
+    threadgroup int sel[2][BK];
+    threadgroup int live[2][BK / 32];
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+
+    constexpr auto pv_desc = matmul2d_descriptor(
+        16, 32, 16, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+
+    auto pa = pv_op.template get_left_input_cooperative_tensor<float, half, float>();
+    auto pb = pv_op.template get_right_input_cooperative_tensor<float, half, float>();
+    auto o0 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o1 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o2 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o3 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+
+    for (short e = 0; e < 16; ++e) {
+        o0[e] = 0.0f;
+        o1[e] = 0.0f;
+        o2[e] = 0.0f;
+        o3[e] = 0.0f;
+    }
+
+    float m_run[2] = {-FLT_MAX, -FLT_MAX};
+    float l_run[2] = {0.0f, 0.0f};
+
+    const uint safe_h0 = min(uint(max(head0 + int(fm), 0)), args.n_head - 1u);
+    const uint safe_h1 = min(uint(max(head0 + int(fm) + 8, 0)), args.n_head - 1u);
+    const uint64_t qrow0_off =
+        ((uint64_t)qi * args.n_head + safe_h0) * D;
+    const uint64_t qrow1_off =
+        ((uint64_t)qi * args.n_head + safe_h1) * D;
+    device const float *qr0 =
+        (device const float *)qk_low + qrow0_off + fn;
+    device const float *qr1 =
+        (device const float *)qk_low + qrow1_off + fn;
+
+    device const uint32_t *idx_row =
+        selected + (uint64_t)qi * args.n_selected;
+
+    const float scale_log2 = args.scale * 1.44269504088896341f;
+    const int n_tiles = (int(args.n_selected) + BK - 1) / BK;
+
+    for (int t = 0; t < n_tiles; ++t) {
+        const int buf = t & 1;
+        const int tile_keys = min(BK, int(args.n_selected) - t * BK);
+
+        if (tid < uint(BK)) {
+            const int slot = t * BK + int(tid);
+            uint row_u = slot < int(args.n_selected) ? idx_row[slot] : UINT_MAX;
+            int kp = row_u < args.cache_cap ? int(row_u) : -1;
+            // Selection is already causal per query in DS4. Keep invalid/padded
+            // rows out of the softmax; do not reinterpret UINT_MAX as a row.
+            sel[buf][tid] = kp;
+            const bool any_live = simd_any(kp >= 0);
+            if (lane == 0) live[buf][sg] = any_live ? 1 : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if ((live[buf][0] | live[buf][1] | live[buf][2] | live[buf][3]) == 0) {
+            continue;
+        }
+
+        if (dq * 32 < uint(tile_keys)) {
+            auto qa = qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+            auto kb = qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+            auto sc = qk_op.template get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<decltype(qa)>,
+                metal::remove_addrspace_t<decltype(kb)>, float>();
+            for (short e = 0; e < 16; ++e) sc[e] = 0.0f;
+
+            device const half *kr[2][2];
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    const int key_slot = dq * 32 + tn * 16 + fm + i * 8;
+                    const int kp = key_slot < tile_keys ? sel[buf][key_slot] : -1;
+                    kr[tn][i] =
+                        (device const half *)kv_lora_cache +
+                        (uint64_t)max(kp, 0) * D + fn;
+                }
+            }
+
+            for (short kk = 0; kk < D; kk += 16) {
+                for (short j = 0; j < 4; ++j) {
+                    qa[j] = half(qr0[kk + j]);
+                    qa[4 + j] = half(qr1[kk + j]);
+                }
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short i = 0; i < 2; ++i) {
+                        for (short j = 0; j < 4; ++j) {
+                            kb[tn * 8 + i * 4 + j] = kr[tn][i][kk + j];
+                        }
+                    }
+                }
+                qk_op.run(qa, kb, sc);
+            }
+
+            threadgroup float *sp = s_tile + hg * 16 * BK + dq * 32;
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    for (short j = 0; j < 4; ++j) {
+                        sp[(fm + i * 8) * BK + tn * 16 + fn + j] =
+                            sc[tn * 8 + i * 4 + j];
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const threadgroup float *st = s_tile + hg * 16 * BK;
+        const int n_ks = (tile_keys + 15) / 16;
+        const short c4[4] = {0, 1, 8, 9};
+        float rmax[2] = {m_run[0], m_run[1]};
+
+        for (short ks = 0; ks < n_ks; ++ks) {
+            for (short j = 0; j < 4; ++j) {
+                const int key = ks * 16 + cb + c4[j];
+                if (key < tile_keys && sel[buf][key] >= 0) {
+                    for (short i = 0; i < 2; ++i) {
+                        rmax[i] = max(rmax[i],
+                                      st[(fm + i * 8) * BK + key] * scale_log2);
+                    }
+                }
+            }
+        }
+
+        float factor[2];
+        float rsum[2] = {0.0f, 0.0f};
+        for (short i = 0; i < 2; ++i) {
+            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(1)));
+            rmax[i] = max(rmax[i], simd_shuffle_xor(rmax[i], ushort(8)));
+            factor[i] = fast::exp2(m_run[i] - rmax[i]);
+            m_run[i] = rmax[i];
+        }
+
+        for (short e = 0; e < 16; ++e) {
+            const float f = factor[e >> 3];
+            o0[e] *= f;
+            o1[e] *= f;
+            o2[e] *= f;
+            o3[e] *= f;
+        }
+
+        for (short ks = 0; ks < n_ks; ++ks) {
+            for (short i = 0; i < 2; ++i) {
+                const int r = fm + i * 8;
+                for (short j = 0; j < 4; ++j) {
+                    const int key = ks * 16 + cb + c4[j];
+                    const float e =
+                        (key >= tile_keys || sel[buf][key] < 0)
+                            ? 0.0f
+                            : fast::exp2(
+                                  st[r * BK + key] * scale_log2 - rmax[i]);
+                    pa[i * 4 + j] = e;
+                    rsum[i] += e;
+                }
+            }
+
+            const int key0 = ks * 16 + fm;
+            const int key1 = ks * 16 + fm + 8;
+            const int kp0 = key0 < tile_keys ? sel[buf][key0] : -1;
+            const int kp1 = key1 < tile_keys ? sel[buf][key1] : -1;
+            device const half *v0 =
+                (device const half *)kv_lora_cache +
+                (uint64_t)max(kp0, 0) * D + dq * 128 + cb;
+            device const half *v1 =
+                (device const half *)kv_lora_cache +
+                (uint64_t)max(kp1, 0) * D + dq * 128 + cb;
+
+            for (short np = 0; np < 4; ++np) {
+                for (short tt = 0; tt < 4; ++tt) {
+                    for (short u = 0; u < 2; ++u) {
+                        pb[tt * 2 + u] = kp0 >= 0
+                            ? v0[np * 32 + tt * 8 + u] : half(0.0f);
+                        pb[8 + tt * 2 + u] = kp1 >= 0
+                            ? v1[np * 32 + tt * 8 + u] : half(0.0f);
+                    }
+                }
+                if (np == 0) pv_op.run(pa, pb, o0);
+                else if (np == 1) pv_op.run(pa, pb, o1);
+                else if (np == 2) pv_op.run(pa, pb, o2);
+                else pv_op.run(pa, pb, o3);
+            }
+        }
+
+        for (short i = 0; i < 2; ++i) {
+            rsum[i] += simd_shuffle_xor(rsum[i], ushort(1));
+            rsum[i] += simd_shuffle_xor(rsum[i], ushort(8));
+            l_run[i] = l_run[i] * factor[i] + rsum[i];
+        }
+    }
+
+    for (short i = 0; i < 2; ++i) {
+        const uint h = uint(head0 + int(fm) + i * 8);
+        if (h >= args.n_head) continue;
+        device float *orow =
+            (device float *)lora_out +
+            ((uint64_t)qi * args.n_head + h) * D + dq * 128 + cb;
+        const float denom = l_run[i] > 0.0f ? l_run[i] : 1.0f;
+        for (short tt = 0; tt < 4; ++tt) {
+            for (short u = 0; u < 2; ++u) {
+                const short e = i * 8 + tt * 2 + u;
+                orow[tt * 8 + u] = o0[e] / denom;
+                orow[32 + tt * 8 + u] = o1[e] / denom;
+                orow[64 + tt * 8 + u] = o2[e] / denom;
+                orow[96 + tt * 8 + u] = o3[e] / denom;
+            }
+        }
+    }
+
+}
+
+kernel void kernel_glm53_sparse_mla_nax_v2(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    constexpr int D = 512;
+    constexpr int BK = 128;
+
+    const int qi = int(tgpig.x);
+    const int hh = int(tgpig.y);
+    const uint sg = uint(sg_u);
+    const uint lane = uint(lane_u);
+    const uint tid = uint(tid_u);
+    const int hg = int(sg) / 4;
+    const int j4 = int(sg) % 4;
+    const int head0 = hh * 32 + hg * 16;
+
+    if (qi >= int(args.n_tokens) ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != D ||
+        args.qk_rope != 0u ||
+        args.n_selected == 0u ||
+        args.n_head == 0u) {
+        return;
+    }
+
+    const short qid = short(lane >> 2);
+    const short fm = short((qid & 4) | ((lane >> 1) & 3));
+    const short fn = short(((qid & 2) | (lane & 1)) * 4);
+    const bool row_writer = (lane & 9u) == 0u;
+
+    threadgroup int sel[2][BK];
+    threadgroup int live[2][BK / 32];
+    threadgroup float red_max[2][4][16];
+    threadgroup float red_sum[2][4][16];
+    threadgroup half p_hi[2][BK / 16][32 * 8];
+    threadgroup half p_lo[2][BK / 16][32 * 8];
+
+    constexpr auto qk_desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<qk_desc, execution_simdgroup> qk_op;
+
+    constexpr auto pv_desc = matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<pv_desc, execution_simdgroup> pv_op;
+
+    auto pa = pv_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto pm = pv_op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto pb = pv_op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto o0 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o1 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o2 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+    auto o3 = pv_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(pa)>,
+        metal::remove_addrspace_t<decltype(pb)>, float>();
+
+    for (short e = 0; e < 16; ++e) {
+        o0[e] = 0.0f;
+        o1[e] = 0.0f;
+        o2[e] = 0.0f;
+        o3[e] = 0.0f;
+    }
+
+    float m_run[2] = {-FLT_MAX, -FLT_MAX};
+    float l_run[2] = {0.0f, 0.0f};
+
+    const uint safe_h0 = min(uint(max(head0 + int(fm), 0)), args.n_head - 1u);
+    const uint safe_h1 = min(uint(max(head0 + int(fm) + 8, 0)), args.n_head - 1u);
+    device const float *qr0 =
+        (device const float *)qk_low +
+        ((uint64_t)qi * args.n_head + safe_h0) * D + fn;
+    device const float *qr1 =
+        (device const float *)qk_low +
+        ((uint64_t)qi * args.n_head + safe_h1) * D + fn;
+    device const uint32_t *idx_row =
+        selected + (uint64_t)qi * args.n_selected;
+
+    const float scale_log2 = args.scale * 1.44269504088896341f;
+
+    auto stage = [&](int t, int b) {
+        if (tid < uint(BK)) {
+            const int slot = t * BK + int(tid);
+            const uint row_u =
+                slot < int(args.n_selected) ? idx_row[slot] : UINT_MAX;
+            const int kp = row_u < args.cache_cap ? int(row_u) : -1;
+            sel[b][tid] = kp;
+            const bool any_live = simd_any(kp >= 0);
+            if (lane == 0) {
+                live[b][sg] = any_live ? 1 : 0;
+            }
+        }
+    };
+
+    const int n_tiles = (int(args.n_selected) + BK - 1) / BK;
+    stage(0, 0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int t = 0; t < n_tiles; ++t) {
+        const int buf = t & 1;
+        const int tile_keys = min(BK, int(args.n_selected) - t * BK);
+
+        if ((live[buf][0] | live[buf][1] |
+             live[buf][2] | live[buf][3]) == 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (t + 1 < n_tiles) {
+                stage(t + 1, buf ^ 1);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+
+        auto qa =
+            qk_op.template get_left_input_cooperative_tensor<half, half, float>();
+        auto kb =
+            qk_op.template get_right_input_cooperative_tensor<half, half, float>();
+        auto sc = qk_op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(qa)>,
+            metal::remove_addrspace_t<decltype(kb)>, float>();
+        for (short e = 0; e < 16; ++e) sc[e] = 0.0f;
+
+        if (j4 * 32 < tile_keys) {
+            device const half *kr[2][2];
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short i = 0; i < 2; ++i) {
+                    const int key_slot =
+                        j4 * 32 + tn * 16 + fm + i * 8;
+                    const int kp =
+                        key_slot < tile_keys ? sel[buf][key_slot] : -1;
+                    kr[tn][i] =
+                        (device const half *)kv_lora_cache +
+                        (uint64_t)max(kp, 0) * D + fn;
+                }
+            }
+
+            _Pragma("clang loop unroll_count(4)")
+            for (short kk = 0; kk < D; kk += 16) {
+                for (short j = 0; j < 4; ++j) {
+                    qa[j] = half(qr0[kk + j]);
+                    qa[4 + j] = half(qr1[kk + j]);
+                }
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short i = 0; i < 2; ++i) {
+                        for (short j = 0; j < 4; ++j) {
+                            kb[tn * 8 + i * 4 + j] =
+                                kr[tn][i][kk + j];
+                        }
+                    }
+                }
+                qk_op.run(qa, kb, sc);
+            }
+        }
+
+        bool slot_ok[2][4];
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short j = 0; j < 4; ++j) {
+                const int key = j4 * 32 + tn * 16 + fn + j;
+                slot_ok[tn][j] =
+                    key < tile_keys && sel[buf][key] >= 0;
+            }
+        }
+
+        float pmx[2];
+        for (short i = 0; i < 2; ++i) {
+            float m = -FLT_MAX;
+            for (short tn = 0; tn < 2; ++tn) {
+                for (short j = 0; j < 4; ++j) {
+                    m = slot_ok[tn][j]
+                        ? max(m, float(sc[tn * 8 + i * 4 + j]))
+                        : m;
+                }
+            }
+            m = max(m, simd_shuffle_xor(m, ushort(1)));
+            m = max(m, simd_shuffle_xor(m, ushort(8)));
+            pmx[i] = m;
+        }
+        if (row_writer) {
+            red_max[hg][j4][fm] = pmx[0];
+            red_max[hg][j4][fm + 8] = pmx[1];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t + 1 < n_tiles) {
+            stage(t + 1, buf ^ 1);
+        }
+
+        float factor[2];
+        float mnew[2];
+        for (short i = 0; i < 2; ++i) {
+            const int r = fm + i * 8;
+            const float m =
+                max(max(red_max[hg][0][r], red_max[hg][1][r]),
+                    max(red_max[hg][2][r], red_max[hg][3][r]));
+            const float cand =
+                m == -FLT_MAX ? -FLT_MAX : m * scale_log2;
+            mnew[i] = max(m_run[i], cand);
+            factor[i] = fast::exp2(m_run[i] - mnew[i]);
+            m_run[i] = mnew[i];
+        }
+
+        float rs[2] = {0.0f, 0.0f};
+        for (short tn = 0; tn < 2; ++tn) {
+            vec<half, 8> h, lo;
+            for (short i = 0; i < 2; ++i) {
+                for (short j = 0; j < 4; ++j) {
+                    const float e = slot_ok[tn][j]
+                        ? fast::exp2(
+                              float(sc[tn * 8 + i * 4 + j]) *
+                                  scale_log2 -
+                              mnew[i])
+                        : 0.0f;
+                    const half hi = half(e);
+                    h[i * 4 + j] = hi;
+                    lo[i * 4 + j] = half(e - float(hi));
+                    rs[i] += e;
+                }
+            }
+            const int ks = j4 * 2 + tn;
+            *(threadgroup vec<half, 8> *)(
+                &p_hi[hg][ks][lane * 8]) = h;
+            *(threadgroup vec<half, 8> *)(
+                &p_lo[hg][ks][lane * 8]) = lo;
+        }
+
+        for (short i = 0; i < 2; ++i) {
+            rs[i] += simd_shuffle_xor(rs[i], ushort(1));
+            rs[i] += simd_shuffle_xor(rs[i], ushort(8));
+        }
+        if (row_writer) {
+            red_sum[hg][j4][fm] = rs[0];
+            red_sum[hg][j4][fm + 8] = rs[1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (!simd_all(factor[0] == 1.0f &&
+                      factor[1] == 1.0f)) {
+            for (short e = 0; e < 16; ++e) {
+                const float f = factor[(e >> 2) & 1];
+                o0[e] *= f;
+                o1[e] *= f;
+                o2[e] *= f;
+                o3[e] *= f;
+            }
+        }
+
+        for (short i = 0; i < 2; ++i) {
+            const int r = fm + i * 8;
+            const float tsum =
+                ((red_sum[hg][0][r] + red_sum[hg][1][r]) +
+                 red_sum[hg][2][r]) +
+                red_sum[hg][3][r];
+            l_run[i] = l_run[i] * factor[i] + tsum;
+        }
+
+        const int n_ks = (tile_keys + 15) / 16;
+        for (short ks = 0; ks < n_ks; ++ks) {
+            const vec<half, 8> h =
+                *(const threadgroup vec<half, 8> *)(
+                    &p_hi[hg][ks][lane * 8]);
+            const vec<half, 8> lo =
+                *(const threadgroup vec<half, 8> *)(
+                    &p_lo[hg][ks][lane * 8]);
+            for (short e = 0; e < 8; ++e) {
+                pa[e] = h[e];
+                pm[e] = lo[e];
+            }
+
+            const int key0 = ks * 16 + fm;
+            const int key1 = ks * 16 + fm + 8;
+            const int kp0 =
+                key0 < tile_keys ? sel[buf][key0] : -1;
+            const int kp1 =
+                key1 < tile_keys ? sel[buf][key1] : -1;
+            device const half *v0 =
+                (device const half *)kv_lora_cache +
+                (uint64_t)max(kp0, 0) * D + j4 * 128 + fn;
+            device const half *v1 =
+                (device const half *)kv_lora_cache +
+                (uint64_t)max(kp1, 0) * D + j4 * 128 + fn;
+
+            for (short np = 0; np < 4; ++np) {
+                for (short tn = 0; tn < 2; ++tn) {
+                    for (short j = 0; j < 4; ++j) {
+                        pb[tn * 8 + j] =
+                            v0[np * 32 + tn * 16 + j];
+                        pb[tn * 8 + 4 + j] =
+                            v1[np * 32 + tn * 16 + j];
+                    }
+                }
+                if (np == 0) {
+                    pv_op.run(pa, pb, o0);
+                    pv_op.run(pm, pb, o0);
+                } else if (np == 1) {
+                    pv_op.run(pa, pb, o1);
+                    pv_op.run(pm, pb, o1);
+                } else if (np == 2) {
+                    pv_op.run(pa, pb, o2);
+                    pv_op.run(pm, pb, o2);
+                } else {
+                    pv_op.run(pa, pb, o3);
+                    pv_op.run(pm, pb, o3);
+                }
+            }
+        }
+    }
+
+    for (short i = 0; i < 2; ++i) {
+        const uint h = uint(head0 + int(fm) + i * 8);
+        if (h >= args.n_head) continue;
+        device float *orow =
+            (device float *)lora_out +
+            ((uint64_t)qi * args.n_head + h) * D +
+            j4 * 128 + fn;
+        const float denom =
+            l_run[i] > 0.0f ? l_run[i] : 1.0f;
+        for (short tn = 0; tn < 2; ++tn) {
+            for (short j = 0; j < 4; ++j) {
+                const short e = tn * 8 + i * 4 + j;
+                orow[tn * 16 + j] = o0[e] / denom;
+                orow[32 + tn * 16 + j] = o1[e] / denom;
+                orow[64 + tn * 16 + j] = o2[e] / denom;
+                orow[96 + tn * 16 + j] = o3[e] / denom;
+            }
+        }
+    }
+}
 #endif
 
 // Collapses per-head indexer scores into one score per compressed row using the

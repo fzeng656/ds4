@@ -37567,12 +37567,25 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             return 0;
         }
 
+        const bool use_nax_sparse =
+            cache_f16 && kv_lora_dim == 512u && qk_rope == 0u &&
+            (n_head % 32u) == 0u && n_selected >= 128u &&
+            ds4_gpu_mpp_available() &&
+            getenv("DS4_GLM53_SPARSE_MLA_NAX") != NULL;
+        const bool use_nax_sparse_v2 =
+            use_nax_sparse &&
+            getenv("DS4_GLM53_SPARSE_MLA_NAX_V2") != NULL;
         const bool use_vec_lora =
-            cache_f16 && kv_lora_dim == 512u &&
+            !use_nax_sparse && cache_f16 && kv_lora_dim == 512u &&
             (qk_rope == 0u || qk_rope == 64u);
         const bool full_head_groups = (n_head % 8u) == 0u;
         id<MTLComputePipelineState> pipeline = nil;
-        if (use_vec_lora && selected_rows_valid && full_head_groups) {
+        if (use_nax_sparse) {
+            pipeline = ds4_gpu_get_pipeline(
+                    use_nax_sparse_v2 ?
+                        "kernel_glm53_sparse_mla_nax_v2" :
+                        "kernel_glm53_sparse_mla_nax");
+        } else if (use_vec_lora && selected_rows_valid && full_head_groups) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline,
                     "kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
@@ -37631,7 +37644,12 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         [enc setBuffer:lowbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:2];
         [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:3];
         [enc setBuffer:ropecachebuf offset:ds4_gpu_tensor_offset(k_rope_cache) atIndex:4];
-        if (use_vec_lora) {
+        if (use_nax_sparse) {
+            [enc setBuffer:lowbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:1];
+            [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:2];
+            [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:3];
+            [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:4];
+        } else if (use_vec_lora) {
             [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:5];
             [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:6];
         } else {
@@ -37639,11 +37657,18 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:6];
             [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:7];
         }
-        [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
-                                              (NSUInteger)n_tokens,
-                                              1)
-             threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        if (use_nax_sparse) {
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens,
+                                                  ((NSUInteger)head_count + 31u) / 32u,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
+                                                  (NSUInteger)n_tokens,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "GLM indexed batch attention-lora")) return 0;
@@ -47671,8 +47696,12 @@ int ds4_gpu_glm53_kda_prefill(
             &norm_inner, "KDA output norm");
         id<MTLComputePipelineState> prep_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare");
+        const bool use_percore120_recurrence =
+            getenv("DS4_GLM53_KDA_PERCORE120") != NULL;
         id<MTLComputePipelineState> recurrence_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_recurrence");
+            ds4_gpu_get_pipeline(use_percore120_recurrence ?
+                "kernel_glm53_kda_prefill_recurrence_percore120" :
+                "kernel_glm53_kda_prefill_recurrence");
         id<MTLComputePipelineState> output_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_output");
         if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
@@ -47728,8 +47757,16 @@ int ds4_gpu_glm53_kda_prefill(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (use_percore120_recurrence) {
+            const NSUInteger scratch_floats =
+                3u * 2u * 8u * 128u + 8u * 70u + 2u * 8u;
+            [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(120, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(280, 1, 1)];
+        } else {
+            [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
 
         [enc setComputePipelineState:output_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];

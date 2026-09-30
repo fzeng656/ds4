@@ -1,0 +1,15 @@
+{
+  "format": "ds4-glm53-post-steering-v1",
+  "shape": [
+    45,
+    16384
+  ],
+  "hook": "residual_stream_post_layer",
+  "profile": "glm-5.3-flash",
+  "pairs": 16,
+  "pair_normalize": true,
+  "orthogonalize_control_mean": true,
+  "source_good": "/Users/mikuru/ds4-glm53-postablit-20260930/dir-steering/ourablit-glm53-post/refusal.txt",
+  "source_bad": "/Users/mikuru/ds4-glm53-postablit-20260930/dir-steering/ourablit-glm53-post/control.txt",
+  "note": "positive scale projects out refusal direction at materialized 4x4096 mHC post-layer stream"
+}
