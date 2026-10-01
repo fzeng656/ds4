@@ -24,6 +24,19 @@ static int is_stop(uint32_t id, const uint32_t *stops, uint32_t n) {
 static char *next_tok(char **save) { return strtok_r(NULL, " \t\r\n", save); }
 static double worker_ms(void) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); return (double)mach_absolute_time()*tb.numer/tb.denom/1e6; }
 static int mtp_env_enabled(void) { const char *v=getenv("QN_MTP"); return v && v[0] && v[0]!='0'; }
+static int mtp_gate_enabled(void) { const char *v=getenv("QN_MTP_GATE"); return !v || !v[0] || v[0]!='0'; }
+static uint32_t mtp_depth_cap(void) {
+    const char *v=getenv("QN_MTP_DEPTH");
+    if (!v || !*v) return 2u;
+    errno=0; char *end=NULL; unsigned long x=strtoul(v,&end,10);
+    if (errno || !end || *end || x<1 || x>5) return 2u;
+    return (uint32_t)x;
+}
+static double median_ms(const double *src, uint32_t n) {
+    double v[8]={0}; if(!n)return 0; if(n>8)n=8;
+    for(uint32_t i=0;i<n;i++){v[i]=src[i];for(uint32_t j=i;j>0&&v[j]<v[j-1];j--){double t=v[j];v[j]=v[j-1];v[j-1]=t;}}
+    return (n&1)?v[n/2]:(v[n/2-1]+v[n/2])*0.5;
+}
 
 int main(int argc, char **argv) {
     if (argc != 4) {
@@ -118,46 +131,100 @@ int main(int argc, char **argv) {
                     if (produced >= max_tokens) break; tok = cached_next;
                 }
             } else {
-                if (qn_mtp_head_reset(mtp)) { printf("FATAL mtp_reset_failed\n"); free(cached_tokens); free(line); qn_qwen4_model_close(model); return 5; }
-                qn_qwen4_model_stats mst={0}; qn_qwen4_model_get_stats(model,&mst); uint32_t mtp_base_pos=mst.position;
-                float round_stream[10240]; if (qn_qwen4_model_copy_last_stream(model,round_stream)) { printf("FATAL mtp_last_stream_missing\n"); free(cached_tokens); free(line); qn_qwen4_model_close(model); return 5; }
-                uint64_t mtp_attempts=0, mtp_accepts=0; double mtp_draft_ms=0, mtp_verify_ms=0, mtp_tail_ms=0, mtp_shadow_wait=0;
-                while (produced < max_tokens) {
-                    uint32_t remain=max_tokens-produced;
-                    /* A known stop token or a one-token tail is cheaper/safer on the regular path. */
-                    if (remain==1 || is_stop(tok,stops,nstops)) {
-                        printf("TOK %u %.3f\n",tok,decode_ms); produced++; qn_qwen4_step_output so={0};
-                        if(qn_qwen4_model_step(model,tok,NULL,&so,err,sizeof(err))){printf("FATAL decode_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
-                        decode_ms+=so.total_ms;if(cached_n>=QN_WORKER_MAX_PROMPT){printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=tok;cached_next=so.next_token;cached_next_valid=1;
-                        if(is_stop(tok,stops,nstops))stopped=1;break;
-                    }
-                    uint32_t m=remain-1; if(m>5)m=5; uint32_t off0=qn_mtp_head_seq_offset(mtp),drafts[5]={0},pred[6]={0},vin[6]={0};
-                    double round0=worker_ms(); if(qn_qwen4_model_spec_shadow_dispatch(model,err,sizeof(err))){printf("FATAL mtp_shadow_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
-                    printf("TOK %u %.3f\n",tok,decode_ms); produced++;
-                    float pstream[10240],dstream[10240];memcpy(pstream,round_stream,sizeof(pstream));uint32_t xdraft=tok;double d0=worker_ms();
-                    for(uint32_t i=0;i<m;i++){qn_mtp_head_output mo={0};if(qn_mtp_head_forward(mtp,pstream,xdraft,mtp_base_pos+off0+i,dstream,&mo,err,sizeof(err))){printf("FATAL mtp_draft_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}drafts[i]=mo.draft_token;memcpy(pstream,dstream,sizeof(pstream));xdraft=drafts[i];}
-                    mtp_draft_ms+=worker_ms()-d0; double sw=0;if(qn_qwen4_model_spec_shadow_activate(model,&sw,err,sizeof(err))){printf("FATAL mtp_shadow_activate_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}mtp_shadow_wait+=sw;
-                    vin[0]=tok;for(uint32_t i=0;i<m;i++)vin[i+1]=drafts[i];float *streams=malloc((size_t)(m+1)*10240*sizeof(float));if(!streams){printf("FATAL allocation_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 70;}
-                    qn_qwen4_prefill_output vo={0};double v0=worker_ms();if(qn_qwen4_model_verify_tokens_capture(model,vin,m+1,pred,streams,&vo,err,sizeof(err))){free(streams);printf("FATAL mtp_verify_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}mtp_verify_ms+=worker_ms()-v0;
-                    uint32_t a=0;while(a<m&&pred[a]==drafts[a])a++;mtp_attempts+=m;mtp_accepts+=a;
-                    uint32_t emit_drafts=a;int stop_in_round=0;for(uint32_t i=0;i<a;i++)if(is_stop(drafts[i],stops,nstops)){emit_drafts=i+1;stop_in_round=1;break;}
-                    if(a==m&&!stop_in_round){
-                        if(qn_qwen4_model_spec_shadow_commit(model)){free(streams);printf("FATAL mtp_shadow_commit_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
-                        if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=tok;
-                        for(uint32_t i=0;i<m;i++){printf("TOK %u %.3f\n",drafts[i],decode_ms);if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=drafts[i];produced++;}
-                        cached_next=pred[m];cached_next_valid=1;tok=cached_next;memcpy(round_stream,streams+(size_t)m*10240,sizeof(round_stream));
-                        if(produced<max_tokens){double ht=0;const float *prev=streams+(size_t)(m-1)*10240;if(qn_mtp_head_append_history(mtp,prev,vin[m],mtp_base_pos+off0+m,&ht,err,sizeof(err))){free(streams);printf("FATAL mtp_tail_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}mtp_tail_ms+=ht;}
-                    }else{
-                        if(qn_qwen4_model_spec_shadow_rollback(model,err,sizeof(err))){free(streams);printf("FATAL mtp_rollback_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
-                        uint32_t commit_len=1+emit_drafts;qn_qwen4_prefill_output rp={0};if(qn_qwen4_model_prefill_tokens(model,vin,commit_len,NULL,&rp,err,sizeof(err))){free(streams);printf("FATAL mtp_replay_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
-                        if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=tok;
-                        for(uint32_t i=0;i<emit_drafts;i++){printf("TOK %u %.3f\n",drafts[i],decode_ms);if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=drafts[i];produced++;}
-                        if(stop_in_round){stopped=1;cached_next=rp.next_token;cached_next_valid=1;free(streams);decode_ms+=worker_ms()-round0;break;}
-                        cached_next=pred[a];cached_next_valid=1;tok=cached_next;if(qn_mtp_head_reset(mtp)||qn_qwen4_model_copy_last_stream(model,round_stream)){free(streams);printf("FATAL mtp_partial_reset_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}qn_qwen4_model_get_stats(model,&mst);mtp_base_pos=mst.position;
-                    }
-                    free(streams);decode_ms+=worker_ms()-round0;if(stopped)break;
+                /*
+                 * Speculation controller, phase7a.
+                 *
+                 * A fixed width-5 verify is a loss on prose/long-context prompts when
+                 * the MTP head accepts only the first one or two draft slots.  Measure
+                 * two real autoregressive steps in this request, start at a conservative
+                 * width (default 2), then sticky-disable MTP when realized speculative
+                 * ms/token fails to beat that request-local AR baseline.
+                 */
+                const int gate_enabled=mtp_gate_enabled();
+                const uint32_t depth_cap=mtp_depth_cap();
+                double ar_probe_ms[8]={0}; uint32_t ar_samples=0; double ar_baseline_ms=0.0;
+                uint64_t mtp_attempts=0, mtp_accepts=0, mtp_rounds=0, mtp_spec_tokens=0;
+                uint64_t mtp_idx_attempts[5]={0}, mtp_idx_accepts[5]={0};
+                double mtp_draft_ms=0, mtp_verify_ms=0, mtp_tail_ms=0, mtp_shadow_wait=0, mtp_spec_ms=0;
+                int mtp_runtime_disabled=0;
+
+                /* The first decode step after a long prefill contains a large handoff
+                 * cold-start.  Eight ordinary tokens are still useful output; use their
+                 * median step time as the request-local steady AR baseline. */
+                while(produced<max_tokens && ar_samples<8){
+                    printf("TOK %u %.3f\n",tok,decode_ms); produced++; qn_qwen4_step_output so={0};
+                    if(qn_qwen4_model_step(model,tok,NULL,&so,err,sizeof(err))){printf("FATAL decode_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                    decode_ms+=so.total_ms;ar_probe_ms[ar_samples++]=so.total_ms;
+                    if(cached_n>=QN_WORKER_MAX_PROMPT){printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}
+                    cached_tokens[cached_n++]=tok;cached_next=so.next_token;cached_next_valid=1;
+                    if(is_stop(tok,stops,nstops)){stopped=1;break;}tok=cached_next;
                 }
-                fprintf(stderr,"mtp_stats attempts=%llu accepts=%llu rate=%.3f draft_ms=%.3f verify_ms=%.3f tail_ms=%.3f shadow_wait_ms=%.3f\n",(unsigned long long)mtp_attempts,(unsigned long long)mtp_accepts,mtp_attempts?(double)mtp_accepts/mtp_attempts:0.0,mtp_draft_ms,mtp_verify_ms,mtp_tail_ms,mtp_shadow_wait);
+
+                ar_baseline_ms=median_ms(ar_probe_ms,ar_samples);
+                if(!stopped && produced<max_tokens){
+                    if(qn_mtp_head_reset(mtp)){printf("FATAL mtp_reset_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                    qn_qwen4_model_stats mst={0};qn_qwen4_model_get_stats(model,&mst);uint32_t mtp_base_pos=mst.position;
+                    float round_stream[10240];if(qn_qwen4_model_copy_last_stream(model,round_stream)){printf("FATAL mtp_last_stream_missing\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                    while(produced<max_tokens){
+                        if(mtp_runtime_disabled){
+                            printf("TOK %u %.3f\n",tok,decode_ms); produced++; qn_qwen4_step_output so={0};
+                            if(qn_qwen4_model_step(model,tok,NULL,&so,err,sizeof(err))){printf("FATAL decode_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                            decode_ms+=so.total_ms;
+                            if(cached_n>=QN_WORKER_MAX_PROMPT){printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}
+                            cached_tokens[cached_n++]=tok;cached_next=so.next_token;cached_next_valid=1;
+                            if(is_stop(tok,stops,nstops)){stopped=1;break;}tok=cached_next;continue;
+                        }
+                        uint32_t remain=max_tokens-produced;
+                        if(remain==1 || is_stop(tok,stops,nstops)){
+                            printf("TOK %u %.3f\n",tok,decode_ms);produced++;qn_qwen4_step_output so={0};
+                            if(qn_qwen4_model_step(model,tok,NULL,&so,err,sizeof(err))){printf("FATAL decode_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                            decode_ms+=so.total_ms;
+                            if(cached_n>=QN_WORKER_MAX_PROMPT){printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}
+                            cached_tokens[cached_n++]=tok;cached_next=so.next_token;cached_next_valid=1;
+                            if(is_stop(tok,stops,nstops))stopped=1;break;
+                        }
+                        uint32_t m=remain-1;if(m>depth_cap)m=depth_cap;
+                        uint32_t off0=qn_mtp_head_seq_offset(mtp),drafts[5]={0},pred[6]={0},vin[6]={0};
+                        double round0=worker_ms();if(qn_qwen4_model_spec_shadow_dispatch(model,err,sizeof(err))){printf("FATAL mtp_shadow_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                        printf("TOK %u %.3f\n",tok,decode_ms);produced++;uint32_t round_emitted=1;
+                        float pstream[10240],dstream[10240];memcpy(pstream,round_stream,sizeof(pstream));uint32_t xdraft=tok;double d0=worker_ms();
+                        for(uint32_t i=0;i<m;i++){qn_mtp_head_output mo={0};if(qn_mtp_head_forward(mtp,pstream,xdraft,mtp_base_pos+off0+i,dstream,&mo,err,sizeof(err))){printf("FATAL mtp_draft_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}drafts[i]=mo.draft_token;memcpy(pstream,dstream,sizeof(pstream));xdraft=drafts[i];}
+                        mtp_draft_ms+=worker_ms()-d0;double sw=0;if(qn_qwen4_model_spec_shadow_activate(model,&sw,err,sizeof(err))){printf("FATAL mtp_shadow_activate_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}mtp_shadow_wait+=sw;
+                        vin[0]=tok;for(uint32_t i=0;i<m;i++)vin[i+1]=drafts[i];float *streams=malloc((size_t)(m+1)*10240*sizeof(float));if(!streams){printf("FATAL allocation_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 70;}
+                        qn_qwen4_prefill_output vo={0};double v0=worker_ms();if(qn_qwen4_model_verify_tokens_capture(model,vin,m+1,pred,streams,&vo,err,sizeof(err))){free(streams);printf("FATAL mtp_verify_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}mtp_verify_ms+=worker_ms()-v0;
+                        uint32_t a=0;while(a<m&&pred[a]==drafts[a])a++;mtp_attempts+=m;mtp_accepts+=a;
+                        for(uint32_t i=0;i<m;i++){mtp_idx_attempts[i]++;if(a>i)mtp_idx_accepts[i]++;}
+                        uint32_t emit_drafts=a;int stop_in_round=0;for(uint32_t i=0;i<a;i++)if(is_stop(drafts[i],stops,nstops)){emit_drafts=i+1;stop_in_round=1;break;}
+                        if(a==m&&!stop_in_round){
+                            if(qn_qwen4_model_spec_shadow_commit(model)){free(streams);printf("FATAL mtp_shadow_commit_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                            if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=tok;
+                            for(uint32_t i=0;i<m;i++){printf("TOK %u %.3f\n",drafts[i],decode_ms);if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=drafts[i];produced++;round_emitted++;}
+                            cached_next=pred[m];cached_next_valid=1;tok=cached_next;memcpy(round_stream,streams+(size_t)m*10240,sizeof(round_stream));
+                            if(produced<max_tokens){double ht=0;const float *prev=streams+(size_t)(m-1)*10240;if(qn_mtp_head_append_history(mtp,prev,vin[m],mtp_base_pos+off0+m,&ht,err,sizeof(err))){free(streams);printf("FATAL mtp_tail_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}mtp_tail_ms+=ht;}
+                        }else{
+                            if(qn_qwen4_model_spec_shadow_rollback(model,err,sizeof(err))){free(streams);printf("FATAL mtp_rollback_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                            uint32_t commit_len=1+emit_drafts;qn_qwen4_prefill_output rp={0};if(qn_qwen4_model_prefill_tokens(model,vin,commit_len,NULL,&rp,err,sizeof(err))){free(streams);printf("FATAL mtp_replay_failed %s\n",err);free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}
+                            if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=tok;
+                            for(uint32_t i=0;i<emit_drafts;i++){printf("TOK %u %.3f\n",drafts[i],decode_ms);if(cached_n>=QN_WORKER_MAX_PROMPT){free(streams);printf("FATAL cache_context_overflow\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 6;}cached_tokens[cached_n++]=drafts[i];produced++;round_emitted++;}
+                            if(stop_in_round){stopped=1;cached_next=rp.next_token;cached_next_valid=1;free(streams);double re=worker_ms()-round0;decode_ms+=re;mtp_spec_ms+=re;mtp_spec_tokens+=round_emitted;mtp_rounds++;break;}
+                            cached_next=pred[a];cached_next_valid=1;tok=cached_next;if(qn_mtp_head_reset(mtp)||qn_qwen4_model_copy_last_stream(model,round_stream)){free(streams);printf("FATAL mtp_partial_reset_failed\n");free(cached_tokens);free(line);qn_qwen4_model_close(model);return 5;}qn_qwen4_model_get_stats(model,&mst);mtp_base_pos=mst.position;
+                        }
+                        free(streams);double round_ms=worker_ms()-round0;decode_ms+=round_ms;mtp_spec_ms+=round_ms;mtp_spec_tokens+=round_emitted;mtp_rounds++;
+                        if(gate_enabled && !mtp_runtime_disabled && mtp_rounds>=3 && mtp_spec_tokens>=6 && ar_baseline_ms>0){
+                            double ar_mpt=ar_baseline_ms, spec_mpt=mtp_spec_ms/(double)mtp_spec_tokens;
+                            /* Require a small real win; otherwise preserve the proven AR path. */
+                            if(spec_mpt>=ar_mpt*0.97){
+                                mtp_runtime_disabled=1;
+                                fprintf(stderr,"mtp_gate disable rounds=%llu spec_ms_per_tok=%.3f ar_ms_per_tok=%.3f\n",(unsigned long long)mtp_rounds,spec_mpt,ar_mpt);
+                            }
+                        }
+                        if(stopped)break;
+                    }
+                }
+                fprintf(stderr,"mtp_stats depth=%u gate=%s disabled=%d rounds=%llu attempts=%llu accepts=%llu rate=%.3f idx0=%.3f idx1=%.3f idx2=%.3f draft_ms=%.3f verify_ms=%.3f spec_ms=%.3f spec_tokens=%llu ar_ms=%.3f ar_samples=%u tail_ms=%.3f shadow_wait_ms=%.3f\n",
+                    depth_cap,gate_enabled?"on":"off",mtp_runtime_disabled,(unsigned long long)mtp_rounds,(unsigned long long)mtp_attempts,(unsigned long long)mtp_accepts,mtp_attempts?(double)mtp_accepts/mtp_attempts:0.0,
+                    mtp_idx_attempts[0]?(double)mtp_idx_accepts[0]/mtp_idx_attempts[0]:0.0,mtp_idx_attempts[1]?(double)mtp_idx_accepts[1]/mtp_idx_attempts[1]:0.0,mtp_idx_attempts[2]?(double)mtp_idx_accepts[2]/mtp_idx_attempts[2]:0.0,
+                    mtp_draft_ms,mtp_verify_ms,mtp_spec_ms,(unsigned long long)mtp_spec_tokens,ar_baseline_ms,ar_samples,mtp_tail_ms,mtp_shadow_wait);
             }
             printf("END %s %u %.3f\n", stopped ? "stop" : "length", produced, decode_ms);
         }
