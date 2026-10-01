@@ -45255,11 +45255,28 @@ static bool glm_graph_apply_directional_steering_attn(
             g ? g->directional_steering_attn_scale : 0.0f);
 }
 
+static bool glm_graph_directional_steering_routed_only(void) {
+    const char *v = getenv("DS4_GLM_STEER_ROUTED_ONLY");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
 static bool glm_graph_apply_directional_steering_ffn(
         ds4_glm_gpu_graph *g,
         ds4_gpu_tensor    *x,
         uint32_t           il,
         uint32_t           rows) {
+    if (glm_graph_directional_steering_routed_only()) return true;
+    return glm_graph_apply_directional_steering(
+            g, x, il, rows,
+            g ? g->directional_steering_ffn_scale : 0.0f);
+}
+
+static bool glm_graph_apply_directional_steering_routed(
+        ds4_glm_gpu_graph *g,
+        ds4_gpu_tensor    *x,
+        uint32_t           il,
+        uint32_t           rows) {
+    if (!glm_graph_directional_steering_routed_only()) return true;
     return glm_graph_apply_directional_steering(
             g, x, il, rows,
             g ? g->directional_steering_ffn_scale : 0.0f);
@@ -49170,6 +49187,10 @@ static bool glm_graph_encode_sparse_ffn_one(
         }
         stream_t0 = now_ms;
     }
+    if (ok && g->glm53) {
+        ok = glm_graph_apply_directional_steering_routed(
+                g, ffn_out, il, 1);
+    }
     if (ok) ok = glm_graph_profile_stage(stage_profile,
                                          "glm_decode_ffn",
                                          "routed_moe",
@@ -51045,6 +51066,10 @@ static bool glm_graph_encode_ffn_batch(
     if (ok && g->tp_world == 2) {
         ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
+    }
+    if (ok && g->glm53) {
+        ok = glm_graph_apply_directional_steering_routed(
+                g, g->batch_ffn_out, il, n_tokens);
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
                                                   stage_sync,
@@ -53835,6 +53860,11 @@ static bool glm_graph_forward_indexed_tokens(
                                          g->batch_hc_mix,
                                          g->batch_hc_split,
                                          n_tokens);
+            if (ok) {
+                metal_graph_debug_dump_tensor(
+                        "glm53_attn_hc_collapsed", cur,
+                        (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+            }
         } else if (ok) {
             ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
                                                      cur,

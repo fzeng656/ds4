@@ -83,8 +83,10 @@ def run_capture(
         "--ctx", str(ctx),
         "--prompt-file", str(prompt_path),
         "-n", "1",
-        "--prefill-chunk", str(max(ctx, 1024)),
     ]
+    # GLM uses graph-selected prefill chunks and rejects --prefill-chunk.
+    if not (n_layer == 45 and n_embd == 4096):
+        cmd += ["--prefill-chunk", str(max(ctx, 1024))]
     if system:
         cmd += ["--system", system]
     cmd.append("--think" if think else "--nothink")

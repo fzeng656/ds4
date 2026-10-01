@@ -1,0 +1,17 @@
+{
+  "format": "ds4-directional-steering-v1",
+  "shape": [
+    45,
+    4096
+  ],
+  "profile": "glm-5.3-flash",
+  "component": "ffn_out",
+  "thinking": false,
+  "pair_normalize": true,
+  "orthogonalize_control_mean": true,
+  "good_file": "dir-steering/ourablit-glm53/refusal.txt",
+  "bad_file": "dir-steering/ourablit-glm53/control.txt",
+  "model": "/Users/mikuru/models/GLM-5.3-Flash-Official-Q2-ds4/GLM-5.3-Flash-Q2.gguf",
+  "source": "OurAblit GLM-5.3 refusal/control 16-pair local corpus",
+  "note": "runtime positive scale suppresses this direction; negative scale amplifies it"
+}

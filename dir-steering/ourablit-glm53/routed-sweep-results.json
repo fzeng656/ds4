@@ -1,0 +1,30 @@
+[
+  {
+    "config": "baseline",
+    "refusals": 8,
+    "total": 8,
+    "errors": 0,
+    "avg_completion_tokens": 64.0
+  },
+  {
+    "config": "R_L03-28_s050",
+    "refusals": 8,
+    "total": 8,
+    "errors": 0,
+    "avg_completion_tokens": 64.0
+  },
+  {
+    "config": "R_L03-28_s075",
+    "refusals": 8,
+    "total": 8,
+    "errors": 0,
+    "avg_completion_tokens": 64.0
+  },
+  {
+    "config": "R_L03-28_s100",
+    "refusals": 8,
+    "total": 8,
+    "errors": 0,
+    "avg_completion_tokens": 64.0
+  }
+]
