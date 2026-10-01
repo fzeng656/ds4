@@ -40,6 +40,8 @@ typedef struct {
     int ctx_max;
     int ctx_alloc;
     int step_incr;
+    int ctx_list[64];
+    int ctx_list_len;
     int gen_tokens;
     int power_percent;
     uint32_t prefill_chunk;
@@ -111,6 +113,34 @@ static int parse_nonnegative_int(const char *s, const char *opt) {
         exit(2);
     }
     return (int)v;
+}
+
+static void parse_ctx_list_arg(bench_config *c, const char *s, const char *opt) {
+    if (!c || !s || !s[0]) {
+        fprintf(stderr, "ds4-bench: %s requires a comma-separated frontier list\n", opt);
+        exit(2);
+    }
+    char *copy = strdup(s);
+    if (!copy) { fprintf(stderr, "ds4-bench: out of memory parsing %s\n", opt); exit(1); }
+    int n = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        if (n >= (int)(sizeof(c->ctx_list) / sizeof(c->ctx_list[0]))) {
+            fprintf(stderr, "ds4-bench: %s supports at most 64 frontiers\n", opt);
+            free(copy); exit(2);
+        }
+        int v = parse_int(tok, opt);
+        if (n > 0 && v <= c->ctx_list[n-1]) {
+            fprintf(stderr, "ds4-bench: %s frontiers must be strictly increasing\n", opt);
+            free(copy); exit(2);
+        }
+        c->ctx_list[n++] = v;
+    }
+    free(copy);
+    if (n == 0) { fprintf(stderr, "ds4-bench: %s list is empty\n", opt); exit(2); }
+    c->ctx_list_len = n;
+    c->ctx_start = c->ctx_list[0];
+    c->ctx_max = c->ctx_list[n-1];
 }
 
 static double parse_double_arg(const char *s, const char *opt) {
@@ -242,6 +272,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.chat_prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.system = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ctx-list")) {
+            parse_ctx_list_arg(&c, need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ctx-start")) {
             c.ctx_start = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ctx-max")) {
@@ -469,6 +501,12 @@ static int write_frontier_logits_json(
 }
 
 static int next_frontier(const bench_config *c, int cur) {
+    if (c->ctx_list_len > 0) {
+        for (int i = 0; i + 1 < c->ctx_list_len; i++) {
+            if (c->ctx_list[i] == cur) return c->ctx_list[i + 1];
+        }
+        return c->ctx_max;
+    }
     if (cur >= c->ctx_max) return c->ctx_max;
     int next;
     if (c->step_mul == 1.0) {

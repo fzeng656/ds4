@@ -636,6 +636,7 @@ typedef struct {
 } stop_list;
 
 #define OPENCLAW_COMPACTION_TAIL_BLOCKS 8
+#define OPENCLAW_COMPACTION_TAIL_MIN_BLOCKS 2
 #define OPENCLAW_COMPACTION_TURN_RING 128
 
 typedef struct {
@@ -3000,10 +3001,12 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
 }
 
 
-/* OpenClaw may append a transient runtime-context user message after a tool
- * output, even though that carrier for the same user turn is already present
- * in the live KV.  Treat only the protected, recognizable runtime carrier as
- * replay metadata; an ordinary user message must remain a real continuation. */
+/* Legacy OpenClaw compatibility only.  Older builds could append a transient
+ * runtime-context user carrier after a tool output.  Current OpenClaw places
+ * the carrier before the active user message, which is semantically safer and
+ * should flow through normal visible-prefix/common-prefix reuse unchanged.
+ * Recognize the protected legacy carrier narrowly so an ordinary user message
+ * can never be discarded as replay metadata. */
 static bool chat_msg_is_openclaw_runtime_context(const chat_msg *m) {
     if (!m || strcmp(m->role, "user") || !m->content || !m->content[0])
         return false;
@@ -3124,14 +3127,13 @@ static void responses_prepare_live_continuation(request *r,
                                                 const chat_msgs *msgs) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
-    /* OpenClaw repeats the same-turn transient runtime carrier after tool
-     * output.  The original copy is already represented by the live KV.
-     * Ignore only this final protected carrier when locating the trailing
-     * tool-output run, otherwise call-id continuation is hidden behind a
-     * synthetic user message and falls back to visible replay. */
+    /* Legacy fallback: old OpenClaw could put one protected runtime carrier
+     * after the tool-output run.  Current safe-order requests never enter this
+     * branch because their carrier precedes the active user.  Strip at most one
+     * terminal carrier so malformed/repeated user messages remain visible. */
     int tail_end = msgs->len;
-    while (tail_end > 0 &&
-           chat_msg_is_openclaw_runtime_context(&msgs->v[tail_end - 1])) {
+    if (tail_end > 0 &&
+        chat_msg_is_openclaw_runtime_context(&msgs->v[tail_end - 1])) {
         tail_end--;
     }
 
@@ -3161,8 +3163,9 @@ static void responses_prepare_live_continuation(request *r,
     }
     if (r->responses_live_call_ids.len == 0) return;
 
-    /* Render only through the tool-output run.  Do not append the duplicate
-     * OpenClaw runtime carrier: its same-turn state is already resident in KV. */
+    /* Render through the tool-output run.  For the legacy-tail case above,
+     * omit that one compatibility carrier; safe-order OpenClaw requests are
+     * already append-only here and need no special treatment. */
     chat_msgs live_tail = *msgs;
     live_tail.len = tail_end;
 
@@ -7740,6 +7743,8 @@ static bool responses_sse_stream_update(int fd, const request *r,
     return true;
 }
 
+static void server_log(ds4_log_type type, const char *fmt, ...);
+
 static bool responses_sse_finish_live(int fd, const request *r,
                                       responses_stream *st,
                                       const char *raw, size_t raw_len,
@@ -7791,17 +7796,31 @@ static bool responses_sse_finish_live(int fd, const request *r,
     bool ok = true;
     if (items && calls) {
         for (int i = 0; i < calls->len && ok; i++) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail function_call.added begin i=%d", i);
             ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
                                                    &r->tool_orders, finish, false);
-            if (ok) ok = responses_sse_function_call_arguments_done(fd, st, &calls->v[i],
-                                                                    &items[i],
-                                                                    &r->tool_orders);
-            if (ok) ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
-                                                           &r->tool_orders, finish, true);
+            server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail function_call.added end i=%d ok=%d errno=%d", i, ok ? 1 : 0, errno);
+            if (ok) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail arguments.done begin i=%d", i);
+                ok = responses_sse_function_call_arguments_done(fd, st, &calls->v[i],
+                                                                &items[i],
+                                                                &r->tool_orders);
+                server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail arguments.done end i=%d ok=%d errno=%d", i, ok ? 1 : 0, errno);
+            }
+            if (ok) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail output_item.done begin i=%d", i);
+                ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
+                                                       &r->tool_orders, finish, true);
+                server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail output_item.done end i=%d ok=%d errno=%d", i, ok ? 1 : 0, errno);
+            }
         }
     }
-    if (ok) ok = responses_sse_completed(fd, r, st, calls, items, finish,
-                                         prompt_tokens, completion_tokens, created_at);
+    if (ok) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail response.completed begin calls=%d", calls ? calls->len : 0);
+        ok = responses_sse_completed(fd, r, st, calls, items, finish,
+                                     prompt_tokens, completion_tokens, created_at);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: responses tail response.completed end ok=%d errno=%d", ok ? 1 : 0, errno);
+    }
     free(items);
     return ok;
 }
@@ -8918,6 +8937,7 @@ struct server {
     int clients;
     uint64_t seq;
     FILE *trace;
+    FILE *trace_live; /* request-id-tagged JSONL deltas for live viewers */
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
@@ -8975,7 +8995,7 @@ static int openclaw_compaction_source_slot_locked(server *s, const request *r,
     if (boundary_tokens) *boundary_tokens = 0;
     if (!s || !r || !r->openclaw_compaction ||
         r->openclaw_compaction_split_turn ||
-        r->openclaw_tail.len < OPENCLAW_COMPACTION_TAIL_BLOCKS) return -1;
+        r->openclaw_tail.len < OPENCLAW_COMPACTION_TAIL_MIN_BLOCKS) return -1;
 
     int found_slot = -1;
     int found_tokens = 0;
@@ -10457,7 +10477,7 @@ static int openclaw_compaction_boundary_from_tokens(
         const openclaw_compaction_tail *wanted, int *boundary_out) {
     if (boundary_out) *boundary_out = 0;
     if (!engine || !tokens || !wanted ||
-        wanted->len < OPENCLAW_COMPACTION_TAIL_BLOCKS) return 0;
+        wanted->len < OPENCLAW_COMPACTION_TAIL_MIN_BLOCKS) return 0;
 
     const int user_id = ds4_token_user(engine);
     const int assistant_id = ds4_token_assistant(engine);
@@ -10508,7 +10528,7 @@ static int openclaw_compaction_dynamic_source(server *s, const request *r,
     if (boundary_out) *boundary_out = 0;
     if (!s || !r || !r->openclaw_compaction ||
         r->openclaw_compaction_split_turn ||
-        r->openclaw_tail.len < OPENCLAW_COMPACTION_TAIL_BLOCKS) return -1;
+        r->openclaw_tail.len < OPENCLAW_COMPACTION_TAIL_MIN_BLOCKS) return -1;
 
     int found_slot = -1;
     int found_boundary = 0;
@@ -10978,6 +10998,22 @@ static uint64_t trace_begin(
     }
     fputs("\n--- generated text ---\n", s->trace);
     fflush(s->trace);
+    if (s->trace_live) {
+        const bool aux = j->req.raw_body &&
+            (strstr(j->req.raw_body, "You write the live status line for an AI assistant") ||
+             strstr(j->req.raw_body, "You judge the trajectory of a running AI agent session"));
+        buf b = {0};
+        buf_printf(&b, "{\"type\":\"start\",\"request_id\":%llu,\"ts\":%ld,\"model\":",
+                   (unsigned long long)id, (long)time(NULL));
+        json_escape(&b, j->req.model ? j->req.model : "");
+        buf_puts(&b, ",\"think_mode\":");
+        json_escape(&b, ds4_think_mode_name(j->req.think_mode));
+        buf_printf(&b, ",\"prompt_tokens\":%d,\"cached_tokens\":%d,\"aux\":%s}\n",
+                   j->req.prompt.len, cached, aux ? "true" : "false");
+        fwrite(b.ptr, 1, b.len, s->trace_live);
+        fflush(s->trace_live);
+        buf_free(&b);
+    }
     pthread_mutex_unlock(&s->trace_mu);
     return id;
 }
@@ -10987,6 +11023,16 @@ static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
     pthread_mutex_lock(&s->trace_mu);
     fwrite(piece, 1, len, s->trace);
     fflush(s->trace);
+    if (s->trace_live) {
+        buf b = {0};
+        buf_printf(&b, "{\"type\":\"delta\",\"request_id\":%llu,\"delta\":",
+                   (unsigned long long)id);
+        json_escape_n(&b, piece, len);
+        buf_puts(&b, "}\n");
+        fwrite(b.ptr, 1, b.len, s->trace_live);
+        fflush(s->trace_live);
+        buf_free(&b);
+    }
     pthread_mutex_unlock(&s->trace_mu);
 }
 
@@ -11047,6 +11093,12 @@ static void trace_finish(
     }
     fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
     fflush(s->trace);
+    if (s->trace_live) {
+        fprintf(s->trace_live,
+                "{\"type\":\"done\",\"request_id\":%llu,\"generated_tokens\":%d,\"elapsed\":%.3f}\n",
+                (unsigned long long)id, completion, elapsed);
+        fflush(s->trace_live);
+    }
     pthread_mutex_unlock(&s->trace_mu);
 }
 
@@ -11705,9 +11757,11 @@ static void remember_thinking_checkpoint(server *s, server_slot *slot,
  * is false for the no-tool-call case; both are non-NULL/true for a
  * completed tool call. */
 
-/* OpenClaw injects a current-turn runtime-context carrier as a trailing user
- * message. OpenClaw intentionally removes that carrier on the next replay.
- * Build the future replay base by dropping only that final internal carrier. */
+/* Legacy OpenClaw compatibility.  Older builds injected the current-turn
+ * runtime-context carrier as the final user segment immediately before the
+ * assistant prefix, then removed it on replay.  Current safe-order OpenClaw
+ * places runtime context before the active user, so this function must return
+ * false for modern requests and leave their canonical transcript untouched. */
 static bool build_openclaw_replay_checkpoint_base(const request *r, buf *out) {
     if (!r || !out || !r->prompt_text || !r->prompt_text[0]) return false;
     if (r->model_syntax != SERVER_MODEL_SYNTAX_DEEPSEEK) return false;
@@ -11717,9 +11771,8 @@ static bool build_openclaw_replay_checkpoint_base(const request *r, buf *out) {
     const char *assistant_tag = "<｜Assistant｜>";
     const size_t user_tag_len = strlen(user_tag);
 
-    /* Locate the final user message in the rendered prompt.  OpenClaw places
-     * its current-turn runtime-context carrier there, immediately before the
-     * assistant generation prefix. */
+    /* Locate the final user segment.  Only the legacy layout has the protected
+     * runtime carrier here; in the current layout this is the real active user. */
     const char *last_user = NULL;
     const char *scan = prompt;
     while ((scan = strstr(scan, user_tag)) != NULL) {
@@ -11762,10 +11815,9 @@ static bool build_openclaw_replay_checkpoint_base(const request *r, buf *out) {
     if (!has_header && !has_delimited_block) return false;
     if ((begin || finish) && !has_delimited_block) return false;
 
-    /* Future replay strips this transient <User> runtime-context carrier.
-     * Keep everything before it, then resume directly with the assistant role.
-     * build_tool_checkpoint_suffix() appends </think>, visible content, tool
-     * calls, and EOS in the exact historical-assistant form. */
+    /* Legacy replay strips this transient <User> runtime carrier.  Keep
+     * everything before it, then resume directly with the assistant role.
+     * Modern safe-order requests never reach this block. */
     buf_append(out, prompt, (size_t)(last_user - prompt));
     buf_puts(out, assistant_tag);
     return true;
@@ -14368,6 +14420,10 @@ static void server_close_resources(server *s) {
         fclose(s->trace);
         s->trace = NULL;
     }
+    if (s->trace_live) {
+        fclose(s->trace_live);
+        s->trace_live = NULL;
+    }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
     for (int i = 0; i < s->slot_count; i++) {
@@ -14752,6 +14808,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.model_mu, NULL);
     pthread_cond_init(&s.model_cv, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    s.trace_seq = ((uint64_t)time(NULL)) * 1000ULL; /* unique across restarts */
 
     for (int i = 0; i < slot_count; i++) {
         server_slot *slot = &s.slots[i];
@@ -14787,7 +14844,7 @@ int main(int argc, char **argv) {
         }
     }
     if (cfg.trace_path) {
-        s.trace = fopen(cfg.trace_path, "w");
+        s.trace = fopen(cfg.trace_path, "a");
         if (!s.trace) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
@@ -14795,6 +14852,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
+        s.trace_live = fopen("/tmp/ds4-live-trace.jsonl", "w");
+        if (s.trace_live) {
+            setvbuf(s.trace_live, NULL, _IONBF, 0);
+            server_log(DS4_LOG_DEFAULT, "ds4-server: live trace sidecar /tmp/ds4-live-trace.jsonl");
+        } else {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open live trace sidecar: %s", strerror(errno));
+        }
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
@@ -17838,6 +17902,47 @@ static void test_responses_openclaw_runtime_tail_visible_checkpoint(void) {
 }
 
 
+static void test_responses_openclaw_safe_order_preserves_runtime_context(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(
+        "<｜begin▁of▁sentence｜>"
+        "<｜User｜>"
+        "OpenClaw runtime context for the active user request in this turn.\n"
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n"
+        "{\"channel\":\"discord\"}\n"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>"
+        "<｜User｜>do the current task"
+        "<｜Assistant｜><think>");
+
+    tool_calls calls = {0};
+    tool_call tc = {0};
+    tc.id = xstrdup("call_safe_order");
+    tc.name = xstrdup("session_status");
+    tc.arguments = xstrdup("{}");
+    tool_calls_push(&calls, tc);
+
+    bool stripped = true;
+    char *visible =
+        build_responses_live_visible_text(&r, "", "hidden reasoning",
+                                          &calls, &stripped);
+
+    TEST_ASSERT(!stripped);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(strstr(visible, "OpenClaw runtime context") != NULL);
+    TEST_ASSERT(strstr(visible, "BEGIN_OPENCLAW_INTERNAL_CONTEXT") != NULL);
+    TEST_ASSERT(strstr(visible, "<｜User｜>do the current task") != NULL);
+    TEST_ASSERT(strstr(visible, "session_status") != NULL);
+    free(visible);
+
+    tool_calls_free(&calls);
+    request_free(&r);
+}
+
+
 static void test_responses_openclaw_runtime_after_tool_output_uses_live_tail(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -20356,6 +20461,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_canonicalization_gate_exact_replay();
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_openclaw_runtime_tail_visible_checkpoint();
+    test_responses_openclaw_safe_order_preserves_runtime_context();
     test_responses_openclaw_runtime_after_tool_output_uses_live_tail();
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
