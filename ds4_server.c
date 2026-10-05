@@ -850,6 +850,8 @@ typedef struct {
      * opaque reasoning state from a future implementation). */
     bool responses_requires_live_tool_state;
     bool responses_requires_live_reasoning;
+    char *responses_previous_response_id;
+    char *responses_previous_suffix_text;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
     bool anthropic_requires_live_tool_state;
@@ -1023,6 +1025,8 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->responses_previous_response_id);
+    free(r->responses_previous_suffix_text);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -3880,6 +3884,26 @@ static char *render_request_live_tool_tail(server *s, const request *r,
     return text;
 }
 
+static int previous_response_tail_start(const chat_msgs *msgs) {
+    int start = 0;
+    while (msgs && start < msgs->len && role_is_system(msgs->v[start].role))
+        start++;
+    for (int i = start; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role) || !strcmp(m->role, "assistant"))
+            return -1;
+    }
+    return start;
+}
+
+static char *render_previous_response_suffix_text(server *s, const request *r,
+                                                  const chat_msgs *msgs) {
+    const int start = previous_response_tail_start(msgs);
+    if (start < 0 || !msgs || start >= msgs->len) return NULL;
+    return render_request_live_tool_tail(s, r, msgs, start,
+                                         &r->responses_live_call_ids);
+}
+
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
     id_list_push_unique(ids, m->tool_call_id);
@@ -5301,6 +5325,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     buf loaded_tool_schemas = {0};
     char *instructions = NULL;
     char *tool_schemas = NULL;
+    bool saw_previous_response_id = false;
 
     json_ws(&p);
     if (*p != '{') goto bad;
@@ -5441,19 +5466,18 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                  * pass through as the think mode. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
             }
-        } else if (!strcmp(key, "previous_response_id") ||
-                   !strcmp(key, "conversation"))
-        {
-            /* Official Responses state can be durable:
-             *   previous_response_id chains to a stored prior response, and
-             *   conversation points at a persistent Conversations object.
-             *
-             * DS4 does not yet implement that durable store.  The supported
-             * modes are either (a) a live in-memory continuation checked by
-             * visible transcript / tool call ids, or (b) stateless replay of
-             * the full input items.  Accepting a non-null durable reference
-             * without loading the referenced items would silently truncate the
-             * prompt, so reject it explicitly. */
+        } else if (!strcmp(key, "previous_response_id")) {
+            free(r->responses_previous_response_id);
+            r->responses_previous_response_id = NULL;
+            json_ws(&p);
+            if (json_lit(&p, "null")) {
+            } else if (!json_string(&p, &r->responses_previous_response_id)) {
+                free(key);
+                goto bad;
+            } else {
+                saw_previous_response_id = true;
+            }
+        } else if (!strcmp(key, "conversation")) {
             json_ws(&p);
             if (!json_lit(&p, "null")) {
                 snprintf(err, errlen,
@@ -5534,6 +5558,35 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(s, r, &msgs);
+    if (saw_previous_response_id) {
+        if (r->image_count != 0 || previous_response_tail_start(&msgs) < 0) {
+            snprintf(err, errlen,
+                     "previous_response_id live continuation only supports append-only text/tool input; replay full input instead");
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        free(r->responses_previous_suffix_text);
+        r->responses_previous_suffix_text =
+            render_previous_response_suffix_text(s, r, &msgs);
+        if (!r->responses_previous_suffix_text ||
+            !r->responses_previous_suffix_text[0])
+        {
+            snprintf(err, errlen,
+                     "previous_response_id live continuation has no input suffix; replay full input instead");
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+    }
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -8229,10 +8282,14 @@ typedef struct {
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
 } responses_stream;
 
-static void responses_stream_init(const request *r, responses_stream *st) {
+static void responses_stream_init(const request *r, responses_stream *st,
+                                  const char *response_id) {
     memset(st, 0, sizeof(*st));
     st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
-    responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
+    if (response_id && response_id[0])
+        snprintf(st->response_id, sizeof(st->response_id), "%s", response_id);
+    else
+        responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
     st->reasoning_index = -1;
@@ -8932,9 +8989,11 @@ static bool responses_final_response(int fd, bool enable_cors,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
-    (void)id;
     char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
+    if (id && id[0])
+        snprintf(response_id, sizeof(response_id), "%s", id);
+    else
+        responses_random_id(response_id, sizeof(response_id), "resp_");
     responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
@@ -10092,6 +10151,12 @@ typedef struct {
     bool token_text_disk_key;
 } visible_live_state;
 
+typedef struct {
+    bool valid;
+    char *response_id;
+    int live_tokens;
+} responses_previous_state;
+
 struct server_slot {
     server *srv;
     int id;
@@ -10099,6 +10164,7 @@ struct server_slot {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    responses_previous_state responses_previous;
     int continued_last_store_tokens;
     /* True only while a recognized OpenClaw auxiliary request is using this
      * slot ephemerally. Such requests must not read or write the durable KV
@@ -10568,6 +10634,57 @@ static void visible_live_free(visible_live_state *st) {
     memset(st, 0, sizeof(*st));
 }
 
+static void responses_previous_state_clear_locked(responses_previous_state *st) {
+    if (!st) return;
+    free(st->response_id);
+    st->response_id = NULL;
+    st->live_tokens = 0;
+    st->valid = false;
+}
+
+static void responses_previous_state_free(responses_previous_state *st) {
+    if (!st) return;
+    responses_previous_state_clear_locked(st);
+    memset(st, 0, sizeof(*st));
+}
+
+static void responses_previous_state_clone(responses_previous_state *dst,
+                                           const responses_previous_state *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->valid = src->valid;
+    dst->live_tokens = src->live_tokens;
+    dst->response_id = src->response_id ? xstrdup(src->response_id) : NULL;
+}
+
+static void responses_previous_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    responses_previous_state_clear_locked(&slot->responses_previous);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void responses_previous_remember(server *s, server_slot *slot,
+                                        const char *response_id) {
+    if (!s || !slot || !response_id || !response_id[0]) return;
+    pthread_mutex_lock(&s->tool_mu);
+    responses_previous_state_clear_locked(&slot->responses_previous);
+    slot->responses_previous.response_id = xstrdup(response_id);
+    slot->responses_previous.live_tokens = ds4_session_pos(slot->session);
+    slot->responses_previous.valid = true;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool responses_previous_matches_locked(const server_slot *slot,
+                                              const char *response_id,
+                                              int live_tokens) {
+    return slot && response_id && response_id[0] &&
+           slot->responses_previous.valid &&
+           slot->responses_previous.live_tokens == live_tokens &&
+           slot->responses_previous.response_id &&
+           !strcmp(slot->responses_previous.response_id, response_id);
+}
+
 static void request_live_state_clear(server *s, server_slot *slot);
 
 static bool request_is_openclaw_aux(const request *r) {
@@ -10613,6 +10730,7 @@ typedef struct {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    responses_previous_state responses_previous;
     int continued_last_store_tokens;
 } openclaw_aux_resident_pin;
 
@@ -10647,6 +10765,7 @@ static void openclaw_aux_resident_pin_free(openclaw_aux_resident_pin *pin) {
     live_tool_state_free(&pin->responses_live);
     live_tool_state_free(&pin->anthropic_live);
     visible_live_free(&pin->thinking_live);
+    responses_previous_state_free(&pin->responses_previous);
     memset(pin, 0, sizeof(*pin));
 }
 
@@ -10684,6 +10803,8 @@ static void openclaw_aux_resident_pin_begin(server *s, server_slot *slot,
     live_tool_state_clone(&pin->responses_live, &slot->responses_live);
     live_tool_state_clone(&pin->anthropic_live, &slot->anthropic_live);
     visible_live_state_clone(&pin->thinking_live, &slot->thinking_live);
+    responses_previous_state_clone(&pin->responses_previous,
+                                   &slot->responses_previous);
     pthread_mutex_unlock(&s->tool_mu);
 
     pin->continued_last_store_tokens = slot->continued_last_store_tokens;
@@ -10713,12 +10834,15 @@ static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
             live_tool_state_free(&slot->responses_live);
             live_tool_state_free(&slot->anthropic_live);
             visible_live_free(&slot->thinking_live);
+            responses_previous_state_free(&slot->responses_previous);
             slot->responses_live = pin->responses_live;
             slot->anthropic_live = pin->anthropic_live;
             slot->thinking_live = pin->thinking_live;
+            slot->responses_previous = pin->responses_previous;
             memset(&pin->responses_live, 0, sizeof(pin->responses_live));
             memset(&pin->anthropic_live, 0, sizeof(pin->anthropic_live));
             memset(&pin->thinking_live, 0, sizeof(pin->thinking_live));
+            memset(&pin->responses_previous, 0, sizeof(pin->responses_previous));
             pthread_mutex_unlock(&s->tool_mu);
             slot->continued_last_store_tokens =
                 pin->continued_last_store_tokens;
@@ -10820,6 +10944,7 @@ static void request_live_state_clear(server *s, server_slot *slot) {
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
     thinking_live_clear(s, slot);
+    responses_previous_clear(s, slot);
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -12015,6 +12140,7 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
 
 typedef enum {
     REUSE_NONE = 0,
+    REUSE_RESPONSES_PREVIOUS_ID,
     REUSE_RESPONSES_VISIBLE,
     REUSE_RESPONSES_TOOL_OUTPUT,
     REUSE_ANTHROPIC_TOOL_OUTPUT,
@@ -12053,6 +12179,17 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                                        req->images,
                                                        req->image_count))
         return pr;
+    if (req->api == API_RESPONSES && req->responses_previous_response_id &&
+        req->image_count == 0 &&
+        req->responses_previous_suffix_text &&
+        responses_previous_matches_locked(slot,
+            req->responses_previous_response_id, live_pos))
+    {
+        pr.kind = REUSE_RESPONSES_PREVIOUS_ID;
+        pr.reuse_tokens = live_pos;
+        return pr;
+    }
+
     const char *ptext = req->prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
 
@@ -12184,7 +12321,9 @@ static slot_reuse slot_probe_reuse(server *s, server_slot *slot,
 static bool live_continuation_unavailable(const request *req, bool materialized) {
     if (!req || materialized) return false;
     if (req->api == API_ANTHROPIC) return req->anthropic_requires_live_tool_state;
-    if (req->api == API_RESPONSES) return req->responses_requires_live_tool_state;
+    if (req->api == API_RESPONSES)
+        return req->responses_previous_response_id != NULL ||
+               req->responses_requires_live_tool_state;
     return false;
 }
 
@@ -13910,7 +14049,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     slot_reuse reuse = slot_probe_reuse(s, slot, &j->req);
 
     if (responses_protocol &&
+        j->req.responses_previous_response_id &&
+        reuse.kind != REUSE_RESPONSES_PREVIOUS_ID)
+    {
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, s->enable_cors, 409,
+                   "previous_response_id state is not available; retry by replaying the full input history");
+        return;
+    }
+    if (responses_protocol &&
         j->req.responses_requires_live_tool_state &&
+        reuse.kind != REUSE_RESPONSES_PREVIOUS_ID &&
         reuse.kind != REUSE_RESPONSES_VISIBLE &&
         reuse.kind != REUSE_RESPONSES_TOOL_OUTPUT)
     {
@@ -13938,6 +14087,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* Whether the selected tier actually produced a reusable live prefix. */
     bool live_materialized = false;
     switch (reuse.kind) {
+    case REUSE_RESPONSES_PREVIOUS_ID:
+        if (!build_live_prompt_suffix(s, slot, &j->req,
+            j->req.responses_previous_suffix_text, &effective_prompt)) {
+            cached = 0;
+            cache_source = "none";
+            break;
+        }
+        live_materialized = true;
+        cache_source = "responses-previous-id";
+        responses_live_continuation = true;
+        responses_live_match = "previous-response-id";
+        prompt_for_sync = &effective_prompt;
+        break;
     case REUSE_RESPONSES_VISIBLE:
         if (!build_live_prompt_suffix(s, slot, &j->req,
             j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
@@ -14099,7 +14261,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
-        ((!strcmp(cache_source, "responses-visible") ||
+        ((!strcmp(cache_source, "responses-previous-id") ||
+          !strcmp(cache_source, "responses-visible") ||
           !strcmp(cache_source, "responses-tool-output")) ||
          (!strcmp(cache_source, "disk-text") &&
           (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
@@ -14379,6 +14542,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s, slot);
+    if (reuse.kind != REUSE_RESPONSES_PREVIOUS_ID)
+        responses_previous_clear(s, slot);
     if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
@@ -14404,7 +14569,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     char id[96];
     responses_random_id(id, sizeof(id),
-                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
+                        j->req.api == API_RESPONSES ? "resp_" :
+                        (j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-"));
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -14460,7 +14626,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
         if (responses_live_chat) {
-            responses_stream_init(&j->req, &responses_live);
+            responses_stream_init(&j->req, &responses_live, id);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
                 job_mark_cancelled(j);
@@ -15153,11 +15319,15 @@ decode_again:
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL, &j->req);
+            responses_previous_remember(s, slot, id);
             buf_free(&visible);
             free(visible_suffix);
         } else {
             responses_live_clear(s, slot);
+            responses_previous_clear(s, slot);
         }
+    } else {
+        responses_previous_clear(s, slot);
     }
     if (j->req.api == API_ANTHROPIC) {
         if (parsed_calls.len && strcmp(final_finish, "error") &&
@@ -15376,6 +15546,13 @@ static int job_required_slot_locked(server *s, const job *j) {
     const request *r = &j->req;
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
+        if (r->responses_previous_response_id &&
+            slot->responses_previous.valid &&
+            slot->responses_previous.response_id &&
+            !strcmp(slot->responses_previous.response_id,
+                    r->responses_previous_response_id)) {
+            return i;
+        }
         if (r->responses_requires_live_tool_state &&
             live_state_contains_all(&slot->responses_live,
                                     &r->responses_live_call_ids)) {
@@ -16114,6 +16291,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        responses_previous_state_free(&slot->responses_previous);
         free(slot->live_text);
         if (slot->session) ds4_session_free(slot->session);
     }
@@ -18266,7 +18444,7 @@ static void test_responses_usage_reports_cache_details(void) {
     }
 
     responses_stream st;
-    responses_stream_init(&r, &st);
+    responses_stream_init(&r, &st, NULL);
     TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
                                         "stop", 10, 2, 1234));
     shutdown(sv[0], SHUT_WR);
