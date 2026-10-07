@@ -14754,7 +14754,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
 
     const bool seed_v41_rebuild_anchors =
         !slot->openclaw_aux_ephemeral &&
-        !multimodal && cached == 0 && s->kv.enabled &&
+        !multimodal && s->kv.enabled &&
         ds4_engine_is_deepseek41(s->engine) &&
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len > s->kv.opt.cold_max_tokens;
@@ -23513,6 +23513,20 @@ static void test_kv_cache_v41_rebuild_anchor_schedule(void) {
     TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 24576, prompt) == 32768);
     TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 32768, prompt) == 65536);
     TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 65536, prompt) == 0);
+
+    /* A partial disk hit must continue seeding durable V4.1 anchors from the
+     * restored live frontier. Otherwise a 12k stable-prefix hit followed by a
+     * 200k rebuild leaves no large checkpoint and the next restart falls back
+     * to the same 12k prefix again. */
+    const int long_prompt = 217733;
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 12849, long_prompt) == 16384);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 16384, long_prompt) == 24576);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 24576, long_prompt) == 32768);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 32768, long_prompt) == 65536);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 65536, long_prompt) == 98304);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 98304, long_prompt) == 131072);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 131072, long_prompt) == 196608);
+    TEST_ASSERT(kv_cache_rebuild_anchor_target(&kc, 196608, long_prompt) == 0);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
