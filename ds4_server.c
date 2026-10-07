@@ -12228,7 +12228,7 @@ static void kv_cache_seed_openclaw_stable_prefix(server *s, server_slot *slot,
     if (server_session_sync(s, slot, &stable, err, sizeof(err)) == 0) {
         if (kv_cache_store_live_prefix_text(s, slot, &stable, stable.len,
                                             "agent-system", stable_text, 0,
-                                            "openclaw-stable")) {
+                                            "openclaw-stable", NULL)) {
             kv_cache_slot_note_store(slot, stable.len);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: OpenClaw stable prefix seeded tokens=%d bytes=%zu",
@@ -14813,7 +14813,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             kv_cache_store_live_prefix_text(s, slot, prompt_for_sync,
                                             cold_store_len,
                                             boundary_store_reason,
-                                            boundary_store_text, 0, NULL) :
+                                            boundary_store_text, 0, NULL, NULL) :
             kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len,
                                        boundary_store_reason);
@@ -23047,6 +23047,7 @@ static void test_slot_probe_backend_stale(void) {
         job j = {0};
         j.req.api = API_ANTHROPIC;
         j.req.anthropic_requires_live_tool_state = true;
+        j.req.tool_delta_only = true;
         j.req.anthropic_live_suffix_text = xstrdup(" result");
         id_list_push_unique(&j.req.anthropic_live_call_ids, "toolu-1");
         ds4_tokens_push(&j.req.prompt, 999);
