@@ -10946,6 +10946,22 @@ static bool request_is_openclaw_aux(const request *r) {
     if (skill_workshop_review)
         return true;
 
+    /*
+     * Activity recap is also OpenClaw-owned, tool-less, and capped to a small
+     * output budget, but its input grows with a long-running task.  Do not let
+     * the generic 4096-token utility gate turn a large recap into an ordinary
+     * request: that would let the recap replace the resident Responses
+     * continuation while the main tool loop is waiting.
+     */
+    const bool activity_recap =
+        !r->has_tools &&
+        r->prompt.len > 0 &&
+        r->max_tokens > 0 && r->max_tokens <= 512 &&
+        strstr(r->raw_body,
+               "Write an Activity recap for someone scanning their tasks") != NULL;
+    if (activity_recap)
+        return true;
+
     /* Keep the legacy utility classifier deliberately narrow. These are
      * OpenClaw-owned utility prompts, all tool-less and small; requiring the
      * request shape prevents a user who merely quotes one of the strings in a
@@ -10956,9 +10972,7 @@ static bool request_is_openclaw_aux(const request *r) {
     return strstr(r->raw_body,
                   "You write the live status line for an AI assistant") != NULL ||
            strstr(r->raw_body,
-                  "You judge the trajectory of a running AI agent session") != NULL ||
-           strstr(r->raw_body,
-                  "Write an Activity recap for someone scanning their tasks") != NULL;
+                  "You judge the trajectory of a running AI agent session") != NULL;
 }
 
 typedef struct {
@@ -25190,13 +25204,22 @@ static void test_request_is_openclaw_aux(void) {
     r.max_tokens = 240;
     TEST_ASSERT(request_is_openclaw_aux(&r));
 
+    /* Recap input can grow well past the legacy small-utility gate while the
+     * output remains small. It must still be ephemeral and preserve the main
+     * Responses continuation. */
+    r.prompt.len = 12000;
+    TEST_ASSERT(request_is_openclaw_aux(&r));
+
     r.has_tools = true;
     TEST_ASSERT(!request_is_openclaw_aux(&r));
     r.has_tools = false;
     r.prompt.len = 5000;
-    TEST_ASSERT(!request_is_openclaw_aux(&r));
-    r.prompt.len = 818;
     r.max_tokens = 8192;
+    TEST_ASSERT(!request_is_openclaw_aux(&r));
+
+    r.raw_body = "You write the live status line for an AI assistant";
+    r.prompt.len = 5000;
+    r.max_tokens = 240;
     TEST_ASSERT(!request_is_openclaw_aux(&r));
 
     /* Skill Workshop review is a large tool-enabled internal request.  Both
