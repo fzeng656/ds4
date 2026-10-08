@@ -32748,15 +32748,33 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         /* A few rows take decode's split path and score order: one token's
          * work per split keeps the GPU busy and the rows match decode steps. */
         const bool decode_rows = (n_tokens == 1u || (n_tokens <= 8u && g_v41_verify_rows)) && !g_quality_mode;
+        /* Experimental: compare the existing register-Q/shared-KV rb16
+         * path against Metal4 dual-head on actual V4.1 SSD Streaming.
+         * This is opt-in only and leaves normal production unchanged. */
+        const bool ssd_rb16_trial = g_ssd_streaming_mode &&
+            getenv("DS4_V41_EXPERIMENT_SSD_PREFILL_RB16") != NULL &&
+            getenv("DS4_METAL_DISABLE_V41_PREFILL_RB16") == NULL;
         const bool prefill_dual_heads =
-            !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
+            !ssd_rb16_trial && !decode_one_token && !g_quality_mode &&
+            ds4_gpu_mpp_available() &&
             (n_head == 64u || n_head == 32u) &&
             top_k == 512u && window == 128u && head_dim == 512u;
         const uint32_t decode_splits = decode_rows ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
         const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads &&
-            !g_quality_mode && !g_ssd_streaming_mode && !ds4_gpu_tp_world_is_two() &&
+            !g_quality_mode && (!g_ssd_streaming_mode || ssd_rb16_trial) &&
+            !ds4_gpu_tp_world_is_two() &&
             !getenv("DS4_METAL_DISABLE_V41_PREFILL_RB16");
+        if (ssd_rb16_trial && n_tokens > 8u &&
+            getenv("DS4_V41_EXPERIMENT_SSD_PREFILL_RB16_TRACE")) {
+            static bool logged_trial_dispatch;
+            if (!logged_trial_dispatch) {
+                logged_trial_dispatch = true;
+                fprintf(stderr, "ds4: SSD attention rb16 trial n_tokens=%u "
+                        "ratio=%u active_rb16=%d active_metal4_dual=%d\n",
+                        n_tokens, ratio, (int)prefill_rb16, (int)prefill_dual_heads);
+            }
+        }
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
             ds4_gpu_hot_pipeline(
