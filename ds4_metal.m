@@ -20717,6 +20717,31 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             !getenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") &&
             ds4_gpu_indexer_topk_select(selbuf, ds4_gpu_tensor_offset(selected), scorebuf,
                                         ds4_gpu_tensor_offset(scores), n_comp, n_tokens, top_k)) return 1;
+        /* One-threadgroup radix selection inspired by oMLX #4360.
+         * Causal visibility and 512 selected rows are always retained.
+         * The experiment is off by default and never bypasses output ordering. */
+        if (causal_ratio && top_k == 512u && n_comp >= 4096u &&
+            n_comp <= 131072u && n_tokens >= 32u && n_tokens <= 128u &&
+            getenv("DS4_V41_EXPERIMENT_CAUSAL_RADIX") != NULL) {
+            id<MTLComputePipelineState> one =
+                ds4_gpu_get_pipeline("kernel_ds4_v41_causal_radix_one");
+            if (!one || one.maxTotalThreadsPerThreadgroup < 256u) return 0;
+            const uint32_t one_args[4] = {n_comp, top_k, causal_start, causal_ratio};
+            int one_owned = 0;
+            id<MTLCommandBuffer> one_cb = ds4_gpu_command_buffer(&one_owned);
+            if (!one_cb) return 0;
+            id<MTLComputeCommandEncoder> one_enc = ds4_gpu_compute_encoder(one_cb);
+            if (!one_enc) return 0;
+            [one_enc setComputePipelineState:one];
+            [one_enc setBytes:one_args length:sizeof(one_args) atIndex:0];
+            [one_enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+            [one_enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [one_enc dispatchThreadgroups:MTLSizeMake(n_tokens,1,1)
+                 threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            ds4_gpu_end_compute_encoder(one_cb,one_enc);
+            return ds4_gpu_finish_command_buffer(one_cb,one_owned,
+                           "V4.1 isolated causal radix top-k");
+        }
         NSUInteger max_threads = g_argsort_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
         int32_t nth = 1;

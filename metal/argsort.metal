@@ -585,3 +585,199 @@ kernel void kernel_topk_select_sort(
     }
     for (uint i = tid; i < args.top_k; i += 1024u) out[i] = (int)ids[i];
 }
+
+// Experimental adaptation of jundot/omlx PR #4360 radix Top-K (Apache-2.0).
+// Attribution: Copyright (c) oMLX contributors; https://github.com/jundot/omlx/pull/4360
+// Adapted to DS4 causal visibility and descending ordered 512 selections.
+// Do not deploy: DS4 legacy tie order and selected tail indices can differ.
+struct ds4_v41_radix_experiment_args { uint n; uint top_k; uint start; uint ratio; };
+
+// Order-preserving key: larger scores give larger keys, and -0 equals +0.
+inline uint v41_score_key(float x) {
+    const uint u = as_type<uint>(x == 0.0f ? 0.0f : x);
+    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
+}
+
+kernel void kernel_ds4_v41_causal_radix_one(
+  constant ds4_v41_radix_experiment_args & args [[buffer(0)]],
+  device const float * scores [[buffer(1)]],
+  device int * ids [[buffer(2)]],
+  uint tidx [[thread_index_in_threadgroup]],
+  uint tgpig [[threadgroup_position_in_grid]]) {
+
+    constexpr uint CAP = 2048, BINS = 4096;
+    const uint tid = tidx;
+    const uint row = tgpig;
+    const uint n = args.n, K = args.top_k;
+    const uint valid = min(n, (args.start + row + 1u) / args.ratio);
+    const device float* s = scores + size_t(row) * n;
+    device int* out = ids + size_t(row) * K;
+    threadgroup ulong buf[CAP];
+    threadgroup atomic_uint* hist = (threadgroup atomic_uint*)buf;
+    threadgroup atomic_uint counters[2];
+    threadgroup uint part[256];
+    threadgroup uint threshold_bin, above, need;
+    for (uint b = tid; b < BINS; b += 256)
+        atomic_store_explicit(hist + b, 0, memory_order_relaxed);
+    if (tid < 2) atomic_store_explicit(counters + tid, 0, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < valid; i += 256)
+        atomic_fetch_add_explicit(
+            hist + (v41_score_key(s[i]) >> 20), 1, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Thread t owns 16 bins counted down from the top bin.
+    uint local = 0;
+    for (uint j = 0; j < 16; ++j)
+        local += atomic_load_explicit(
+            hist + (BINS - 1 - (tid * 16 + j)), memory_order_relaxed);
+    part[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint acc = 0, t = 0;
+        for (; t < 255; ++t) {
+            if (acc + part[t] >= K) break;
+            acc += part[t];
+        }
+        for (uint j = 0; j < 16; ++j) {
+            const uint bin = BINS - 1 - (t * 16 + j);
+            const uint c = atomic_load_explicit(hist + bin, memory_order_relaxed);
+            if (acc + c >= K || j == 15) {
+                threshold_bin = bin;
+                above = acc;
+                need = K - acc;
+                break;
+            }
+            acc += c;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint bin = threshold_bin;
+    for (uint i = tid; i < valid; i += 256) {
+        const uint key = v41_score_key(s[i]), high = key >> 20;
+        if (high > bin) {
+            out[atomic_fetch_add_explicit(counters, 1, memory_order_relaxed)] = int(i);
+        } else if (high == bin) {
+            const uint c = atomic_fetch_add_explicit(counters + 1, 1, memory_order_relaxed);
+            if (c < CAP) buf[c] = (ulong(key) << 32) | ulong(0xFFFFFFFFu - i);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    const uint count = atomic_load_explicit(counters + 1, memory_order_relaxed);
+    threadgroup uint prefix, remaining, greater[256], equal[256];
+    if (count <= CAP) {
+        uint size = 1;
+        while (size < count) size <<= 1;
+        for (uint i = count + tid; i < size; i += 256) buf[i] = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Bitonic sort, descending by key, then ascending by id.
+        for (uint k = 2; k <= size; k <<= 1) {
+            for (uint j = k >> 1; j > 0; j >>= 1) {
+                for (uint i = tid; i < size; i += 256) {
+                    const uint l = i ^ j;
+                    if (l > i) {
+                        const ulong a = buf[i], b = buf[l];
+                        if ((i & k) == 0 ? a < b : a > b) {
+                            buf[i] = b;
+                            buf[l] = a;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        for (uint r = tid; r < need; r += 256)
+            out[above + r] = int(0xFFFFFFFFu - uint(buf[r] & 0xFFFFFFFFul));
+    } else {
+    if (tid == 0) {
+        prefix = 0;
+        remaining = K;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        atomic_store_explicit(hist + tid, 0, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < valid; i += 256) {
+            const uint key = v41_score_key(s[i]);
+            if (shift == 24 || (key >> (shift + 8)) == prefix)
+                atomic_fetch_add_explicit(
+                    hist + ((key >> shift) & 255u), 1, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            for (int b = 255; b >= 0; --b) {
+                const uint c = atomic_load_explicit(hist + b, memory_order_relaxed);
+                if (remaining > c) {
+                    remaining -= c;
+                } else {
+                    prefix = (prefix << 8) | uint(b);
+                    break;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // prefix is now the K-th largest key. Write greater keys, then equal keys
+    // by ascending id, using per-thread ranges for a stable order.
+    const uint first = (valid * tid) / 256, last = (valid * (tid + 1)) / 256;
+    uint ng = 0, ne = 0;
+    for (uint i = first; i < last; ++i) {
+        const uint key = v41_score_key(s[i]);
+        ng += key > prefix;
+        ne += key == prefix;
+    }
+    greater[tid] = ng;
+    equal[tid] = ne;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint g = 0, e = 0;
+        for (uint t = 0; t < 256; ++t) {
+            const uint a = greater[t], b = equal[t];
+            greater[t] = g;
+            equal[t] = e;
+            g += a;
+            e += b;
+        }
+        remaining = g;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint g = greater[tid], e = equal[tid];
+    for (uint i = first; i < last; ++i) {
+        const uint key = v41_score_key(s[i]);
+        if (key > prefix) {
+            out[g++] = int(i);
+        } else if (key == prefix) {
+            if (remaining + e < K) out[remaining + e] = int(i);
+            ++e;
+        }
+    }
+
+    }
+    // #4360's primitive returns an unordered set. DS4 attention and exact
+    // test contracts expect descending score rank (ties by ascending id).
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    for (uint j = tid; j < K; j += 256u) {
+        const uint idx = (uint)out[j];
+        const ulong rank = (ulong(v41_score_key(s[idx])) << 32) |
+                           ulong(0xffffffffu - idx);
+        buf[j] = rank;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint len = 2u; len <= K; len <<= 1u) {
+        for (uint dist = len >> 1u; dist != 0u; dist >>= 1u) {
+            for (uint j = tid; j < K; j += 256u) {
+                const uint peer = j ^ dist;
+                if (peer > j) {
+                    const ulong a = buf[j], b = buf[peer];
+                    if (((j & len) == 0u) ? (a < b) : (a > b)) {
+                        buf[j] = b;
+                        buf[peer] = a;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    for (uint j = tid; j < K; j += 256u)
+        out[j] = int(0xffffffffu - uint(buf[j] & 0xfffffffful));
+
+}
