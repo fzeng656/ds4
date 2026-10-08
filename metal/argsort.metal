@@ -41,6 +41,7 @@ typedef void (argsort_t)(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
         device      int32_t * dst,
+        device const uint * fallback_mask [[buffer(3)]],
         threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
@@ -48,11 +49,12 @@ typedef void (argsort_t)(
 
 // Sort one float row into an index row. DS4 only exports the descending
 // instance because router and indexer selection both need top-k order.
-template<ds4_sort_order order, bool causal = false, bool shuffle = false>
+template<ds4_sort_order order, bool causal = false, bool shuffle = false, bool masked = false>
 kernel void kernel_argsort_f32_i32(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
         device      int32_t * dst,
+        device const uint * fallback_mask [[buffer(3)]],
         threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
@@ -63,6 +65,7 @@ kernel void kernel_argsort_f32_i32(
 
     const int i00 = ib*ntg.x;
     const int i01 = tgpig[0] % args.ne01;
+    if (masked && fallback_mask[i01] == 0u) return;
     const int i02 = tgpig[1];
     const int i03 = tgpig[2];
     const int width = causal ? min(args.ne00,
@@ -150,30 +153,34 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+template [[host_name("kernel_argsort_f32_i32_desc_causal_shuffle_mask")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true, true, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,
         device const char    * src0,
         device const int32_t * tmp,
         device       int32_t * dst,
+        device const uint * fallback_mask [[buffer(4)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]);
 
 // Merges sorted index runs produced by kernel_argsort_f32_i32. In the DS4 graph
 // this finishes top-k over router or compressed-attention score rows.
-template<ds4_sort_order order, bool causal = false, bool prefix = false>
+template<ds4_sort_order order, bool causal = false, bool prefix = false, bool masked = false>
 kernel void kernel_argsort_merge_f32_i32(
         constant   ds4_metal_args_argsort_merge & args,
         device const char    * src0,
         device const int32_t * tmp,
         device       int32_t * dst,
+        device const uint * fallback_mask [[buffer(4)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
 
     const int im  = tgpig[0] / args.ne01;
     const int i01 = tgpig[0] % args.ne01;
+    if (masked && fallback_mask[i01] == 0u) return;
     const int i02 = tgpig[1];
     const int i03 = tgpig[2];
 
@@ -318,6 +325,7 @@ kernel void kernel_argsort_merge_f32_i32(
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true>;
+template [[host_name("kernel_argsort_merge_f32_i32_desc_causal_prefix_mask")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC, true, true, true>;
 
 // ---- Whole-GPU top-k for wide score rows -----------------------------------
 //
@@ -602,6 +610,7 @@ kernel void kernel_ds4_v41_causal_radix_one(
   constant ds4_v41_radix_experiment_args & args [[buffer(0)]],
   device const float * scores [[buffer(1)]],
   device int * ids [[buffer(2)]],
+  device uint * fallback_mask [[buffer(3)]],
   uint tidx [[thread_index_in_threadgroup]],
   uint tgpig [[threadgroup_position_in_grid]]) {
 
@@ -617,13 +626,19 @@ kernel void kernel_ds4_v41_causal_radix_one(
     threadgroup atomic_uint counters[2];
     threadgroup uint part[256];
     threadgroup uint threshold_bin, above, need;
+    threadgroup uint tie_flag;
+    threadgroup atomic_uint nan_flag;
+    if (tid == 0u) { tie_flag = 0u; atomic_store_explicit(&nan_flag, 0u, memory_order_relaxed); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint b = tid; b < BINS; b += 256)
         atomic_store_explicit(hist + b, 0, memory_order_relaxed);
     if (tid < 2) atomic_store_explicit(counters + tid, 0, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < valid; i += 256)
+    for (uint i = tid; i < valid; i += 256) {
+        if (isnan(s[i])) atomic_fetch_or_explicit(&nan_flag, 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(
             hist + (v41_score_key(s[i]) >> 20), 1, memory_order_relaxed);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Thread t owns 16 bins counted down from the top bin.
     uint local = 0;
@@ -685,9 +700,13 @@ kernel void kernel_ds4_v41_causal_radix_one(
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
         }
+        if (tid == 0u && need < count &&
+            uint(buf[need - 1u] >> 32) == uint(buf[need] >> 32)) tie_flag = 1u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint r = tid; r < need; r += 256)
             out[above + r] = int(0xFFFFFFFFu - uint(buf[r] & 0xFFFFFFFFul));
     } else {
+    // Over-capacity bin is not itself a tie: the low radix bits resolve it.
     if (tid == 0) {
         prefix = 0;
         remaining = K;
@@ -737,6 +756,8 @@ kernel void kernel_ds4_v41_causal_radix_one(
             g += a;
             e += b;
         }
+        // Only an exact equality at the K-th cutoff changes the candidate set.
+        if (e > K - g) tie_flag = 1u;
         remaining = g;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -779,5 +800,14 @@ kernel void kernel_ds4_v41_causal_radix_one(
     }
     for (uint j = tid; j < K; j += 256u)
         out[j] = int(0xffffffffu - uint(buf[j] & 0xfffffffful));
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    if (tid == 0u) {
+        for (uint j = 1u; j < K; j++) {
+            const int a = out[j - 1u], b = out[j];
+            if (s[a] == s[b]) tie_flag = 1u;
+        }
+        if (atomic_load_explicit(&nan_flag, memory_order_relaxed)) tie_flag = 1u;
+        fallback_mask[row] = tie_flag;
+    }
 
 }
