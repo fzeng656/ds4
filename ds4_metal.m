@@ -20692,7 +20692,7 @@ static int ds4_gpu_indexer_topk_tensor_impl(
 
     @autoreleasepool {
         const bool radix_trial = causal_ratio && top_k == 512u &&
-            n_comp >= 8192u && n_comp <= 131072u &&
+            n_comp >= 32768u && n_comp <= 131072u &&
             n_tokens >= 32u && n_tokens <= 128u &&
             getenv("DS4_V41_EXPERIMENT_CAUSAL_RADIX") != NULL;
         if (causal_ratio && n_comp >= 3000u &&
