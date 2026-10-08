@@ -692,6 +692,8 @@ static id<MTLBuffer> g_topk_select_buffer;
 static NSUInteger g_topk_select_bytes;
 static uint32_t g_topk_select_parity;
 static id<MTLBuffer> g_indexed_topk_buffer;
+static id<MTLBuffer> g_v41_prefill_comp_f16_buffer;
+static NSUInteger g_v41_prefill_comp_f16_bytes;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_q8_prefill_scratch_buffer;
 static id<MTLBuffer> g_qwen4_conv_halo_buffer;
@@ -12307,6 +12309,8 @@ void ds4_gpu_cleanup(void) {
         g_indexer_head_scores_buffer = nil;
         g_indexer_topk_buffer = nil;
         g_indexed_topk_buffer = nil;
+        g_v41_prefill_comp_f16_buffer = nil;
+        g_v41_prefill_comp_f16_bytes = 0;
         g_stream_expert_validate_status_buffer = nil;
         g_f16_round_scratch_buffer = nil;
         g_q8_prefill_scratch_buffer = nil;
@@ -32741,6 +32745,31 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                              &sinks_inner);
         if (!sinks_buf) return 0;
 
+        /* oMLX #4360-inspired microbenchmark: stage one f16 copy of the
+         * already-decoded f32 KV rows per batch, then use existing Metal4
+         * attention without modifying its numerical row order.
+         * This is NOT deployed or enabled by default. */
+        const uint64_t comp_f16_bytes = (uint64_t)n_comp * head_dim * sizeof(uint16_t);
+        const bool stage_comp_f16 = g_ssd_streaming_mode && comp_kv_f16 == 0u &&
+            n_tokens >= 32u && n_comp >= 512u &&
+            comp_f16_bytes <= 80ull * 1024ull * 1024ull &&
+            getenv("DS4_V41_EXPERIMENT_STAGE_COMPKV_F16") != NULL;
+        NSUInteger stage_comp_off = ds4_gpu_tensor_offset(comp_kv);
+        id<MTLComputePipelineState> stage_comp_pipeline = stage_comp_f16 ?
+            ds4_gpu_get_pipeline("kernel_dsv41_cache_f32_to_f16") : nil;
+        if (stage_comp_f16) {
+            static bool stage_logged;
+            if (!stage_logged) {
+                stage_logged = true;
+                fprintf(stderr, "DS4 EXPERIMENT: comp f16 staging ACTIVE n_comp=%u n_tokens=%u bytes=%llu\n",
+                    n_comp, n_tokens, (unsigned long long)comp_f16_bytes);
+            }
+        }
+        if (stage_comp_f16 && (!stage_comp_pipeline ||
+            !ds4_gpu_ensure_scratch_buffer(
+                &g_v41_prefill_comp_f16_buffer, &g_v41_prefill_comp_f16_bytes,
+                (NSUInteger)comp_f16_bytes, "ds4_v41_prefill_comp_f16"))) return 0;
+
         id<MTLComputePipelineState> sort_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
@@ -32759,6 +32788,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_mpp_available() &&
             (n_head == 64u || n_head == 32u) &&
             top_k == 512u && window == 128u && head_dim == 512u;
+        const bool prefill_dual_rb4 = prefill_dual_heads && n_tokens > 8u &&
+            getenv("DS4_V41_EXPERIMENT_DUAL_RB4") != NULL;
         const uint32_t decode_splits = decode_rows ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
         const bool prefill_rb16 = n_tokens > 8u && ratio <= 2u && !prefill_dual_heads &&
@@ -32788,8 +32819,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
             prefill_dual_heads ?
-            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
-                                   "kernel_dsv4_indexed_mixed_attention_heads16_dual") :
+            (prefill_dual_rb4 ?
+                ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads16_dual_rb4") :
+                ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
+                    "kernel_dsv4_indexed_mixed_attention_heads16_dual")) :
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8");
         id<MTLComputePipelineState> split_reduce_pipeline = split_decode ?
@@ -32857,6 +32890,22 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = nil;
+        if (stage_comp_f16) {
+            const uint32_t elems = (uint32_t)((uint64_t)n_comp * head_dim);
+            enc = ds4_gpu_compute_encoder(cb);
+            if (!enc) return 0;
+            [enc setComputePipelineState:stage_comp_pipeline];
+            [enc setBuffer:compbuf offset:stage_comp_off atIndex:0];
+            [enc setBuffer:g_v41_prefill_comp_f16_buffer offset:0 atIndex:1];
+            [enc setBytes:&elems length:sizeof(elems) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake(elems, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            compbuf = g_v41_prefill_comp_f16_buffer;
+            stage_comp_off = 0;
+            attn_args.comp_kv_f16 = 1u;
+            attn_args.comp_row_stride = (uint64_t)head_dim * sizeof(uint16_t);
+        }
         if (!skip_decode_sort) {
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:sort_pipeline];
@@ -32889,7 +32938,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBytes:&attn_args length:sizeof(attn_args) atIndex:0];
             [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
             [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
-            [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(comp_kv) atIndex:3];
+            [enc setBuffer:compbuf offset:stage_comp_off atIndex:3];
             [enc setBuffer:skip_decode_sort ? topkbuf : g_indexed_topk_buffer
                   offset:skip_decode_sort ? ds4_gpu_tensor_offset(topk) : 0
                  atIndex:4];
@@ -32918,13 +32967,14 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBytes:&attn_args length:sizeof(attn_args) atIndex:0];
             [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
             [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
-            [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(comp_kv) atIndex:3];
+            [enc setBuffer:compbuf offset:stage_comp_off atIndex:3];
             [enc setBuffer:skip_decode_sort ? topkbuf : g_indexed_topk_buffer
                   offset:skip_decode_sort ? ds4_gpu_tensor_offset(topk) : 0
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:((decode_one_token || prefill_rb16) ? 16u : 1u) *
+            [enc setThreadgroupMemoryLength:((decode_one_token || prefill_rb16) ? 16u :
+                                          (prefill_dual_rb4 ? 4u : 1u)) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
             [enc dispatchThreadgroups:

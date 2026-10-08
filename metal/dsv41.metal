@@ -1109,3 +1109,15 @@ kernel void kernel_dsv41_markov_post_part(
         part_idx[tgpig] = bi;
     }
 }
+
+
+// Experimental: convert compressed f32 KV rows to f16 once per prefill batch.
+// Reads dense DS4 KV-cache rows (not oMLX FP8 KV); same half cast as the
+// existing attention kernel. Restricted to experimental launch flag.
+kernel void kernel_dsv41_cache_f32_to_f16(
+        device const float *src [[buffer(0)]],
+        device half *dst [[buffer(1)]],
+        constant uint &count [[buffer(2)]],
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < count) dst[gid] = (half)src[gid];
+}
