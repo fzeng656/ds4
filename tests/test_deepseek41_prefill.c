@@ -81,6 +81,18 @@ static int check_dispatch(void) {
     CHECK(ds41_short_prefill_count(&g, &weights, 128) == 8);
     CHECK(ds41_short_prefill_count(&g, &weights, 255) == 8);
     CHECK(ds41_short_prefill_count(&g, &weights, 256) == 0);
+    /* Short append crossover: 16/24/32/48-token thresholds, opt-in only.
+     * Verify that the exact 8-row path remains selected below the cutoff. */
+    const unsigned crossover_thresholds[] = {16u, 24u, 32u, 48u};
+    for (size_t ci = 0; ci < sizeof(crossover_thresholds) / sizeof(*crossover_thresholds); ci++) {
+        const unsigned cutoff = crossover_thresholds[ci];
+        char cutoff_str[16];
+        snprintf(cutoff_str, sizeof(cutoff_str), "%u", cutoff);
+        CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", cutoff_str, 1) == 0);
+        CHECK(ds41_short_prefill_count(&g, &weights, cutoff - 1u) == 8u);
+        CHECK(ds41_short_prefill_count(&g, &weights, cutoff) == 0u);
+        CHECK(ds41_short_prefill_count(&g, &weights, 63u) == 0u);
+    }
     /* Optional medium-prefill A/B cutoff must not alter default dispatch. */
     CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", "64", 1) == 0);
     CHECK(ds41_short_prefill_count(&g, &weights, 63) == 8);
