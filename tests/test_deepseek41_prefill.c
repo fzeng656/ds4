@@ -81,6 +81,20 @@ static int check_dispatch(void) {
     CHECK(ds41_short_prefill_count(&g, &weights, 128) == 8);
     CHECK(ds41_short_prefill_count(&g, &weights, 255) == 8);
     CHECK(ds41_short_prefill_count(&g, &weights, 256) == 0);
+    /* Optional medium-prefill A/B cutoff must not alter default dispatch. */
+    CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", "64", 1) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 63) == 8);
+    CHECK(ds41_short_prefill_count(&g, &weights, 64) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 135) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 255) == 0);
+    CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", "256", 1) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 135) == 8);
+    CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", "8", 1) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 135) == 8);
+    CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", "invalid", 1) == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 135) == 8);
+    CHECK(unsetenv("DS4_METAL_V41_SHORT_MEDIUM_FROM") == 0);
+    CHECK(ds41_short_prefill_count(&g, &weights, 135) == 8);
     CHECK(unsetenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == 0);
 #endif
     g.pos = 0;

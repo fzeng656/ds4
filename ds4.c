@@ -43626,6 +43626,19 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL"))
         return 0;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* An opt-in A/B lane for 64..255-token SSD-streaming appends.
+     * The 8-row exact microbatch path pays one model traversal per group.
+     * At sufficient row count the layer-major medium prefill may win.
+     * Leave production routing unchanged unless explicitly selected. */
+    const char *medium_from_env = getenv("DS4_METAL_V41_SHORT_MEDIUM_FROM");
+    if (medium_from_env && medium_from_env[0]) {
+        char *end = NULL;
+        const unsigned long threshold = strtoul(medium_from_env, &end, 10);
+        if (end != medium_from_env && *end == '\0' &&
+            threshold >= 64ul && threshold <= 255ul &&
+            remaining >= threshold)
+            return 0;
+    }
     /* Exact short continued-prefill for Metal SSD streaming.  Full 8-row
      * microbatches amortize the model traversal; 1..7-row tails remain scalar
      * because their setup cost does not reliably beat decode. */
