@@ -81,6 +81,17 @@ static int check_dispatch(void) {
     CHECK(ds41_short_prefill_count(&g, &weights, 128) == 8);
     CHECK(ds41_short_prefill_count(&g, &weights, 255) == 8);
     CHECK(ds41_short_prefill_count(&g, &weights, 256) == 0);
+    /* Experimental 16..48 cutoff must route only the intended suffixes. */
+    const uint32_t cuts[] = {16u, 24u, 32u, 48u};
+    for (size_t ci=0;ci<sizeof(cuts)/sizeof(*cuts);ci++) {
+        char text_cut[16];
+        snprintf(text_cut,sizeof(text_cut),"%u",cuts[ci]);
+        CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM",text_cut,1) == 0);
+        CHECK(ds41_short_prefill_count(&g,&weights,cuts[ci]-1u) ==
+              (cuts[ci] > 8u && cuts[ci]-1u >= 8u ? 8u : 0u));
+        CHECK(ds41_short_prefill_count(&g,&weights,cuts[ci]) == 0u);
+        CHECK(ds41_short_prefill_count(&g,&weights,63u) == 0u);
+    }
     /* Optional medium-prefill A/B cutoff must not alter default dispatch. */
     CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM", "64", 1) == 0);
     CHECK(ds41_short_prefill_count(&g, &weights, 63) == 8);
@@ -329,6 +340,8 @@ static int check_mixed(const char *model, const char *prompt_path,
     const bool cuda_small = mode == PREFILL_CUDA_SMALL;
     const bool short_ab_mode = !cuda && !tp_opt &&
         getenv("DS4_TEST_V41_SHORT_BATCH_AB") != NULL;
+    const bool short_crossover_mode =
+        short_ab_mode && getenv("DS4_TEST_V41_MEDIUM_SHORT_CROSSOVER") != NULL;
     ds4_engine *engine = NULL;
     ds4_tp *tp = NULL;
     ds4_session *control = NULL, *mixed = NULL;
@@ -341,7 +354,8 @@ static int check_mixed(const char *model, const char *prompt_path,
         .backend = cuda ? DS4_BACKEND_CUDA : DS4_BACKEND_METAL,
         .context_size = cuda ? (cuda_long ? 65536 : 16384) : 131072, .power_percent = 100,
         .ssd_streaming = !tp_opt && !resident,
-        .ssd_streaming_cache_bytes = tp_opt || resident ? 0 : UINT64_C(48) << 30};
+        .ssd_streaming_cache_bytes = tp_opt || resident ? 0 :
+            ((getenv("DS4_TEST_V41_SMALL_CACHE") != NULL ? UINT64_C(20) : UINT64_C(48)) << 30)};
     if (tp_opt) opt.tp = *tp_opt;
     CHECK(imatrix_read_text_file(prompt_path, &prompt, &bytes));
     CHECK(ds4_engine_open(&engine, &opt) == 0);
@@ -367,15 +381,18 @@ static int check_mixed(const char *model, const char *prompt_path,
     const int ordinary_appends[] = {127, 1, 255, 256, 257, 1023, 1024, 4095, 4096,
         8191, 8192, 16383, 16384, 49153, 129, 4096, 16383};
     const int short_ab_appends[] = {1, 7, 8, 16, 32, 64, 100, 128, 255, 256};
+    const int short_crossover_appends[] = {16, 24, 32, 48, 63};
     const int small_appends[] = {7, 1, 8, 9, 15, 16, 17, 31, 1, 32, 63, 64, 65, 127, 128, 129,
         255, 256, 257, 511, 512, 513, 1023, 1024};
     int short_one_append = 0;
     const char *short_one_env = short_ab_mode ? getenv("DS4_TEST_V41_SHORT_APPEND") : NULL;
     if (short_one_env && short_one_env[0]) short_one_append = atoi(short_one_env);
     const int *appends = short_ab_mode && short_one_append > 0 ? &short_one_append :
+        short_crossover_mode ? short_crossover_appends :
         short_ab_mode ? short_ab_appends :
         cuda_small ? small_appends : ordinary_appends;
     const size_t n_appends = short_ab_mode && short_one_append > 0 ? 1u :
+        short_crossover_mode ? sizeof(short_crossover_appends) / sizeof(*short_crossover_appends) :
         short_ab_mode ? sizeof(short_ab_appends) / sizeof(*short_ab_appends) :
         cuda_small ? sizeof(small_appends) / sizeof(*small_appends) :
         cuda ? (cuda_long ? 14u : 9u) :
@@ -385,7 +402,8 @@ static int check_mixed(const char *model, const char *prompt_path,
         /* Build one canonical cold prefix, then fork it by snapshot so the
          * A/B starts from byte-identical graph/KV state.  Two independent cold
          * streaming sessions can otherwise differ before the short path runs. */
-        tokens.len = 128;
+        tokens.len = short_crossover_mode &&
+            getenv("DS4_TEST_V41_LONG_PREFIX") != NULL ? 8192 : 128;
         CHECK(unsetenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == 0 ||
               getenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH") == NULL);
         CHECK(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
@@ -447,6 +465,8 @@ static int check_mixed(const char *model, const char *prompt_path,
                       getenv("DS4_METAL_ENABLE_V41_MEDIUM_PREFILL_CACHED_MM") == NULL);
             }
         }
+        if (short_crossover_mode)
+            CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM","256",1) == 0);
         const double control_t0 = now_sec();
         if (cuda && !tp) {
             CHECK(setenv("DS4_CUDA_SESSION_BATCH_MOE", "0", 1) == 0);
@@ -462,6 +482,11 @@ static int check_mixed(const char *model, const char *prompt_path,
             CHECK(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
         }
         const double control_seconds = now_sec() - control_t0;
+        if (short_crossover_mode) {
+            const char *crossover = getenv("DS4_TEST_V41_MEDIUM_SHORT_CROSSOVER");
+            CHECK(setenv("DS4_METAL_V41_SHORT_MEDIUM_FROM",
+                crossover && crossover[0] ? crossover : "16",1) == 0);
+        }
         if (short_ab_mode) {
             CHECK(setenv("DS4_METAL_ENABLE_V41_SHORT_PREFILL_BATCH", "1", 1) == 0);
             if (getenv("DS4_TEST_V41_APPEND_MIN_AB") != NULL) {
@@ -517,6 +542,31 @@ static int check_mixed(const char *model, const char *prompt_path,
         CHECK(p.current == tokens.len && p.final_checked);
         CHECK(!p.batches || (p.displays && p.partial_checked));
         scalar += p.scalar; batches += p.batches + p.short_batches; deferred += p.deferred;
+        if (short_crossover_mode && short_one_append > 0) {
+            const bool same = state_equal(control,mixed);
+            const int token_a = ds4_session_argmax(control);
+            const int token_b = ds4_session_argmax(mixed);
+            fprintf(stderr, "SHORT_CROSSOVER_DIAG append=%d threshold=%s control_8row=%.4fs medium=%.4fs speedup=%.3fx exact_KV=%d next_argmax_match=%d tokens=%d/%d\n",
+                    appends[i], getenv("DS4_TEST_V41_MEDIUM_SHORT_CROSSOVER"),
+                    control_seconds, seconds, seconds > 0 ? control_seconds/seconds : 0,
+                    same,token_a == token_b,token_a,token_b);
+            int greedies_matched=0, first_mismatch=-1, eval_fail=-1;
+            for(int j=0;j<32;j++) {
+                const int a=ds4_session_argmax(control);
+                const int b=ds4_session_argmax(mixed);
+                if(a!=b){first_mismatch=j;break;}
+                greedies_matched++;
+                if(ds4_session_eval(control,a,err,sizeof(err))!=0 ||
+                   ds4_session_eval(mixed,b,err,sizeof(err))!=0) {
+                    eval_fail=j;break;
+                }
+            }
+            fprintf(stderr,
+                "SHORT_CROSSOVER_GREEDY append=%d matched=%d/32 first_mismatch=%d eval_fail=%d\n",
+                appends[i],greedies_matched,first_mismatch,eval_fail);
+            rc = eval_fail<0 ? 0 : 1;
+            goto done;
+        }
         CHECK(state_equal(control, mixed));
         const unsigned callbacks = p.callbacks;
         CHECK(ds4_session_sync(mixed, &tokens, err, sizeof(err)) == 0);
