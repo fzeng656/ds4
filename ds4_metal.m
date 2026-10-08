@@ -689,6 +689,8 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_topk_select_buffer;
+static id<MTLBuffer> g_v41_causal_radix_fallback_buffer;
+static NSUInteger g_v41_causal_radix_fallback_bytes;
 static NSUInteger g_topk_select_bytes;
 static uint32_t g_topk_select_parity;
 static id<MTLBuffer> g_indexed_topk_buffer;
@@ -20693,11 +20695,33 @@ static int ds4_gpu_indexer_topk_tensor_impl(
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
     @autoreleasepool {
-        id<MTLComputePipelineState> sort_pipeline = causal_ratio ?
+        const bool radix_trial = causal_ratio && top_k == 512u &&
+            n_comp >= 8192u && n_comp <= 131072u &&
+            n_tokens >= 32u && n_tokens <= 128u &&
+            getenv("DS4_V41_EXPERIMENT_CAUSAL_RADIX") != NULL;
+        if (causal_ratio && n_comp >= 3000u &&
+            getenv("DS4_V41_EXPERIMENT_CAUSAL_RADIX_TRACE")) {
+            static uint32_t trace_count = 0;
+            if (trace_count < 30u) {
+                ++trace_count;
+                fprintf(stderr, "ds4: TOPK_TRACE causal width=%u rows=%u start=%u ratio=%u chosen=%d\n",
+                        n_comp, n_tokens, causal_start, causal_ratio, (int)radix_trial);
+            }
+        }
+        id<MTLComputePipelineState> radix_pipeline = radix_trial ?
+            ds4_gpu_get_pipeline("kernel_ds4_v41_causal_radix_one") : nil;
+        if (radix_trial && (!radix_pipeline ||
+            !ds4_gpu_ensure_scratch_buffer(&g_v41_causal_radix_fallback_buffer,
+                    &g_v41_causal_radix_fallback_bytes, (NSUInteger)n_tokens * sizeof(uint32_t),
+                    "ds4_v41_causal_radix_fallback"))) return 0;
+
+        id<MTLComputePipelineState> sort_pipeline = radix_trial ?
+            ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_causal_shuffle_mask") : causal_ratio ?
             ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
             g_argsort_f32_i32_desc_pipeline;
-        id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
+        id<MTLComputePipelineState> merge_pipeline = radix_trial ?
+            ds4_gpu_get_pipeline("kernel_argsort_merge_f32_i32_desc_causal_prefix_mask") : causal_ratio ?
             ds4_gpu_get_pipeline(top_k == 512u && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
                 "kernel_argsort_merge_f32_i32_desc_causal_prefix" :
                 "kernel_argsort_merge_f32_i32_desc_causal") : g_argsort_merge_f32_i32_desc_pipeline;
@@ -20717,31 +20741,6 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             !getenv("DS4_METAL_DISABLE_V41_TOPK_SELECT") &&
             ds4_gpu_indexer_topk_select(selbuf, ds4_gpu_tensor_offset(selected), scorebuf,
                                         ds4_gpu_tensor_offset(scores), n_comp, n_tokens, top_k)) return 1;
-        /* One-threadgroup radix selection inspired by oMLX #4360.
-         * Causal visibility and 512 selected rows are always retained.
-         * The experiment is off by default and never bypasses output ordering. */
-        if (causal_ratio && top_k == 512u && n_comp >= 4096u &&
-            n_comp <= 131072u && n_tokens >= 32u && n_tokens <= 128u &&
-            getenv("DS4_V41_EXPERIMENT_CAUSAL_RADIX") != NULL) {
-            id<MTLComputePipelineState> one =
-                ds4_gpu_get_pipeline("kernel_ds4_v41_causal_radix_one");
-            if (!one || one.maxTotalThreadsPerThreadgroup < 256u) return 0;
-            const uint32_t one_args[4] = {n_comp, top_k, causal_start, causal_ratio};
-            int one_owned = 0;
-            id<MTLCommandBuffer> one_cb = ds4_gpu_command_buffer(&one_owned);
-            if (!one_cb) return 0;
-            id<MTLComputeCommandEncoder> one_enc = ds4_gpu_compute_encoder(one_cb);
-            if (!one_enc) return 0;
-            [one_enc setComputePipelineState:one];
-            [one_enc setBytes:one_args length:sizeof(one_args) atIndex:0];
-            [one_enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
-            [one_enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
-            [one_enc dispatchThreadgroups:MTLSizeMake(n_tokens,1,1)
-                 threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            ds4_gpu_end_compute_encoder(one_cb,one_enc);
-            return ds4_gpu_finish_command_buffer(one_cb,one_owned,
-                           "V4.1 isolated causal radix top-k");
-        }
         NSUInteger max_threads = g_argsort_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
         int32_t nth = 1;
@@ -20795,6 +20794,20 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
+        if (radix_trial) {
+            const uint32_t radix_args[4] = {n_comp, top_k, causal_start, causal_ratio};
+            id<MTLComputeCommandEncoder> radix_enc = ds4_gpu_compute_encoder(cb);
+            if (!radix_enc) return 0;
+            [radix_enc setComputePipelineState:radix_pipeline];
+            [radix_enc setBytes:radix_args length:sizeof(radix_args) atIndex:0];
+            [radix_enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+            [radix_enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [radix_enc setBuffer:g_v41_causal_radix_fallback_buffer offset:0 atIndex:3];
+            [radix_enc dispatchThreadgroups:MTLSizeMake(n_tokens,1,1)
+                         threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            ds4_gpu_end_compute_encoder(cb,radix_enc);
+        }
+
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:sort_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
@@ -20802,6 +20815,8 @@ static int ds4_gpu_indexer_topk_tensor_impl(
         [enc setBuffer:one_pass ? selbuf : g_indexer_topk_buffer
               offset:one_pass ? ds4_gpu_tensor_offset(selected) : cur_off
              atIndex:2];
+        if (radix_trial)
+            [enc setBuffer:g_v41_causal_radix_fallback_buffer offset:0 atIndex:3];
         [enc setThreadgroupMemoryLength:smem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
@@ -20845,6 +20860,8 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             [enc setBuffer:final_merge ? selbuf : g_indexer_topk_buffer
                   offset:final_merge ? ds4_gpu_tensor_offset(selected) : next_off
                  atIndex:3];
+            if (radix_trial)
+                [enc setBuffer:g_v41_causal_radix_fallback_buffer offset:0 atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(merge_threads, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
