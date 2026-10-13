@@ -451,7 +451,21 @@ int ds4_session_sync_multimodal(ds4_session *s,
 bool ds4_session_vision_prefix_matches(const ds4_session *s,
                                        const ds4_vision_span *images,
                                        size_t image_count);
+/* Export/import the completed image identity of a staged GPU KV snapshot.
+ * These are metadata only: no image pixels or GPU tensors are copied.
+ * Import must follow a successful payload restore, and rejects partial spans. */
+bool ds4_session_export_vision_checkpoint(const ds4_session *session,
+                                          ds4_vision_span *images,
+                                          size_t capacity, size_t *count);
+bool ds4_session_restore_vision_checkpoint(ds4_session *session,
+                                           const ds4_vision_span *images,
+                                           size_t image_count);
 /* Like the prefix check, but also require exactly the same image count. */
+/* Record only image spans entirely processed by the live checkpoint.
+ * Returns false if an image crosses the checkpoint frontier. */
+bool ds4_session_retain_vision_checkpoint(ds4_session *s,
+                                          const ds4_vision_span *images,
+                                          size_t image_count);
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);

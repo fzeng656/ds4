@@ -4,6 +4,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_vision_kvdisk.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -10371,6 +10372,9 @@ struct server_slot {
     visible_live_state thinking_live;
     responses_previous_state responses_previous;
     int continued_last_store_tokens;
+    /* Full vision snapshots are expensive; checkpoint an authenticated
+     * Responses image history at most once per ~4K new tokens per slot. */
+    int vision_last_store_tokens;
     /* True only while a recognized OpenClaw auxiliary request is using this
      * slot ephemerally. Such requests must not read or write the durable KV
      * cache; the authoritative resident session is restored afterwards. */
@@ -10975,6 +10979,23 @@ static bool request_is_openclaw_aux(const request *r) {
                   "You judge the trajectory of a running AI agent session") != NULL;
 }
 
+/* Keep a verified, long Responses frontier resident when a separate
+ * tool-less Chat Completions side request is interleaved into a one-slot
+ * server. Without a pin, even a 408-token status task discards a 246K
+ * image/reasoning KV checkpoint. Explicit opt-in; it does not bind or
+ * expose the main session to the short request. */
+static bool request_is_short_sidecar(const request *r, int live_tokens,
+                                     bool responses_frontier_valid) {
+    const char *enable = getenv("DS4_PIN_SHORT_SIDE_REQUESTS");
+    if (!enable || strcmp(enable, "1") || !r ||
+        !responses_frontier_valid || live_tokens < 32768 ||
+        r->api == API_RESPONSES || r->api == API_ANTHROPIC ||
+        r->has_tools || r->prompt.len <= 0 || r->prompt.len > 4096 ||
+        r->max_tokens <= 0 || r->max_tokens > 32768)
+        return false;
+    return true;
+}
+
 typedef struct {
     bool recognized;
     bool active;
@@ -10985,6 +11006,7 @@ typedef struct {
     visible_live_state thinking_live;
     responses_previous_state responses_previous;
     int continued_last_store_tokens;
+    int vision_last_store_tokens;
 } openclaw_aux_resident_pin;
 
 static void live_tool_state_clone(live_tool_state *dst,
@@ -11026,10 +11048,24 @@ static void openclaw_aux_resident_pin_begin(server *s, server_slot *slot,
                                             const request *r,
                                             openclaw_aux_resident_pin *pin) {
     memset(pin, 0, sizeof(*pin));
-    if (!s || !slot || !request_is_openclaw_aux(r)) return;
-    pin->recognized = true;
-
+    if (!s || !slot || !r) return;
     const int live_tokens = ds4_session_pos(slot->session);
+    bool responses_frontier_valid = false;
+    pthread_mutex_lock(&s->tool_mu);
+    responses_frontier_valid =
+        slot->responses_live.valid &&
+        slot->responses_live.live_tokens == live_tokens;
+    pthread_mutex_unlock(&s->tool_mu);
+    const bool known_aux = request_is_openclaw_aux(r);
+    const bool short_sidecar = request_is_short_sidecar(
+        r, live_tokens, responses_frontier_valid);
+    if (!known_aux && !short_sidecar) return;
+    pin->recognized = true;
+    if (short_sidecar)
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: short Chat request pinning Responses KV live=%d short=%d",
+                   live_tokens, r->prompt.len);
+
     /* With no substantial resident main session there is nothing worth
      * snapshotting. Still mark the utility request ephemeral so its KV will be
      * invalidated when it finishes instead of becoming the next live session. */
@@ -11061,6 +11097,7 @@ static void openclaw_aux_resident_pin_begin(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->tool_mu);
 
     pin->continued_last_store_tokens = slot->continued_last_store_tokens;
+    pin->vision_last_store_tokens = slot->vision_last_store_tokens;
     pin->live_tokens = live_tokens;
     pin->active = true;
     slot->openclaw_aux_ephemeral = true;
@@ -11099,6 +11136,8 @@ static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
             pthread_mutex_unlock(&s->tool_mu);
             slot->continued_last_store_tokens =
                 pin->continued_last_store_tokens;
+            slot->vision_last_store_tokens =
+                pin->vision_last_store_tokens;
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: OpenClaw aux resident pin restored live=%d snapshot=%.2f MiB",
                        pin->live_tokens,
@@ -11117,6 +11156,7 @@ static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
         pthread_mutex_unlock(&s->inference_mu);
         request_live_state_clear(s, slot);
         slot->continued_last_store_tokens = 0;
+        slot->vision_last_store_tokens = 0;
     }
 
     slot->openclaw_aux_ephemeral = false;
@@ -11170,6 +11210,40 @@ static void responses_live_remember(server *s, server_slot *slot,
     slot->responses_live.live_tokens = ds4_session_pos(slot->session);
     slot->responses_live.valid = key != NULL;
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+/* A previous_response_id or call-id-bound delta may contain no *new*
+ * images but still continue an image-conditioned KV frontier. Borrow only
+ * a normalized visible key that is authenticated against the old frontier.
+ * The saved marker offsets must point to real normalized image placeholders,
+ * never to arbitrary literal content from the client. */
+static char *responses_live_inherit_vision_prefix(server *s, server_slot *slot,
+        int previous_tokens, const char *delta, visible_image_key *saved) {
+    if (saved) memset(saved, 0, sizeof(*saved));
+    if (!s || !slot || !saved || !delta || !delta[0]) return NULL;
+    char *key = NULL;
+    pthread_mutex_lock(&s->tool_mu);
+    const live_tool_state *live = &slot->responses_live;
+    if (live->valid && live->live_tokens == previous_tokens &&
+        live->visible_text && live->images.count > 0 &&
+        live->images.count <= 16) {
+        bool verified = true;
+        size_t n = strlen(live->visible_text);
+        for (size_t i = 0; i < live->images.count; i++) {
+            size_t at = live->images.offsets[i];
+            if (at >= n || (unsigned char)live->visible_text[at] != 036 ||
+                (i && at <= live->images.offsets[i - 1])) {
+                verified = false;
+                break;
+            }
+        }
+        if (verified) {
+            key = xstrdup(live->visible_text);
+            *saved = live->images;
+        }
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return key;
 }
 
 static void anthropic_live_remember(server *s, server_slot *slot,
@@ -12277,7 +12351,17 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
         if (old_count == req->image_count &&
             strstr(suffix, req->image_markers[i])) old_count = i;
     }
-    if (!ds4_session_rebase_vision_state(slot->session, spans, old_count)) return false;
+    /* Only an authenticated previous_response_id may omit historical image
+     * spans: its suffix is append-only and has no new image payload. Keep the
+     * image-conditioned live checkpoint intact while appending plain tokens.
+     * The dispatcher has already verified the exact response id + KV frontier. */
+    const bool previous_id_text_delta =
+        req->api == API_RESPONSES &&
+        req->responses_previous_response_id &&
+        req->image_count == 0;
+    if (!previous_id_text_delta &&
+        !ds4_session_rebase_vision_state(slot->session, spans, old_count))
+        return false;
     ds4_tokens prompt = {0};
     ds4_tokens_copy(&prompt, live);
     const char *cursor = suffix;
@@ -12300,7 +12384,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
         cursor = marker + strlen(req->image_markers[i]);
     }
     ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);
-    if (!ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
+    if (!previous_id_text_delta &&
+        !ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
         ds4_tokens_free(&prompt);
         return false;
     }
@@ -12308,6 +12393,185 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
         req->images[i].token_start = spans[i].token_start;
     ds4_tokens_free(out);
     *out = prompt;
+    return true;
+}
+
+
+/* Opt-in filesystem isolation: experimental vision files are not mixed into
+ * legacy text-only .kv indexes. Current budget is 4 GiB in a sibling folder. */
+#define DS4_VISION_DISK_DEFAULT_GIB 4u
+/* Keep memory/disk separate: the conventional text KV pool has its own
+ * budget. This caps ONLY .vkd image snapshots, and is independently tunable
+ * since they currently store full checkpoints rather than MLX-style chunks. */
+static uint64_t kv_vision_disk_budget(void) {
+    const char *env = getenv("DS4_VISION_DISK_BUDGET_GIB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long gib = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && gib >= 1 && gib <= 32)
+            return (uint64_t)gib * 1024ull * 1024ull * 1024ull;
+    }
+    return (uint64_t)DS4_VISION_DISK_DEFAULT_GIB *
+           1024ull * 1024ull * 1024ull;
+}
+/* Disabled unless explicitly opted in with DS4_VISION_DISK_EXPERIMENTAL=1. */
+static bool kv_vision_enabled(void) {
+    const char *v = getenv("DS4_VISION_DISK_EXPERIMENTAL");
+    return v && !strcmp(v, "1");
+}
+static char *kv_vision_dir(const server *s) {
+    if (!s || !s->kv.dir) return NULL;
+    size_t n = strlen(s->kv.dir);
+    char *p = malloc(n + sizeof(".vision"));
+    if (!p) return NULL;
+    memcpy(p, s->kv.dir, n);
+    memcpy(p + n, ".vision", sizeof(".vision"));
+    return p;
+}
+
+static bool kv_vision_store_completed(server *s, server_slot *slot,
+                                       const request *req) {
+    if (!kv_vision_enabled() || !s || !slot || !req || !s->kv.enabled ||
+        req->image_count > 16 || slot->openclaw_aux_ephemeral ||
+        !ds4_engine_is_deepseek41(s->engine)) return false;
+    char *key = NULL;
+    visible_image_key saved_offsets = {0};
+    pthread_mutex_lock(&s->tool_mu);
+    if (slot->responses_live.valid && slot->responses_live.visible_text &&
+        slot->responses_live.live_tokens == ds4_session_pos(slot->session)) {
+        key = xstrdup(slot->responses_live.visible_text);
+        saved_offsets = slot->responses_live.images;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    /* A previous_response_id/tool-output delta has no images in the request,
+     * but an authenticated live continuation can carry the older image-bearing
+     * normalized visible prefix. Never accept a naked no-image key. */
+    if (!key || !saved_offsets.count ||
+        (req->image_count && saved_offsets.count != req->image_count)) {
+        free(key);return false;
+    }
+    const size_t text_len = strlen(key);
+    if (text_len > UINT32_MAX) {free(key);return false;}
+    ds4_vision_span spans[16] = {0};
+    size_t count = 0;
+    ds4_vision_kvmeta meta = {0};
+    bool ok = false;
+    char *dir = kv_vision_dir(s);
+    if (!dir) {free(key);return false;}
+    meta.visible_bytes = (uint32_t)text_len;
+    ds4_kvstore_sha1_bytes_hex(key, text_len, meta.visible_sha1);
+    pthread_mutex_lock(&s->inference_mu);
+    if (ds4_session_export_vision_checkpoint(
+            slot->session, spans, 16, &count) &&
+        count > 0 && count == saved_offsets.count) {
+        meta.checkpoint_tokens = (uint32_t)ds4_session_pos(slot->session);
+        meta.image_count = (uint32_t)count;
+        bool safe = true;
+        for (size_t i = 0; i < count; i++) {
+            if (saved_offsets.offsets[i] > UINT32_MAX ||
+                saved_offsets.offsets[i] >= text_len ||
+                (unsigned char)key[saved_offsets.offsets[i]] != 036 ||
+                (req->image_count &&
+                 (spans[i].embedding.token_count != req->images[i].embedding.token_count ||
+                  memcmp(spans[i].embedding.fingerprint,
+                         req->images[i].embedding.fingerprint, 32)))) {
+                safe = false;break;
+            }
+            meta.images[i].token_start = spans[i].token_start;
+            meta.images[i].token_count = spans[i].embedding.token_count;
+            meta.images[i].visible_marker_offset =
+                (uint32_t)saved_offsets.offsets[i];
+            memcpy(meta.images[i].fingerprint,
+                   spans[i].embedding.fingerprint, 32);
+        }
+        if (safe) {
+            char error[160] = {0};
+            ok = ds4_vision_kvdisk_store(dir,key,&meta,s->engine,slot->session,
+                           kv_vision_disk_budget(),error,sizeof(error));
+            if (!ok) server_log(DS4_LOG_WARNING,
+                        "ds4-server: vision disk checkpoint skipped tokens=%u reason=%s",
+                        meta.checkpoint_tokens,error[0]?error:"budget-or-validation");
+        }
+    }
+    pthread_mutex_unlock(&s->inference_mu);
+    if (ok) {
+        slot->vision_last_store_tokens = (int)meta.checkpoint_tokens;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: vision disk checkpoint saved tokens=%u images=%u visible_bytes=%u",
+                   meta.checkpoint_tokens,meta.image_count,meta.visible_bytes);
+    }
+    free(dir);free(key);
+    return ok;
+}
+
+static int kv_vision_try_restore(server *s,server_slot *slot,request *req,
+                                 ds4_tokens *out) {
+    if (!kv_vision_enabled() || !s || !slot || !req || !out || !s->kv.enabled ||
+        req->api != API_RESPONSES || !req->image_count ||
+        req->image_count > 16 || slot->openclaw_aux_ephemeral ||
+        !ds4_engine_is_deepseek41(s->engine))return 0;
+    visible_image_key offsets={0};
+    char *key=visible_prompt_key(req,req->prompt_text,&offsets);
+    char *dir=kv_vision_dir(s);
+    if (!key || !dir || offsets.count!=req->image_count) {
+        free(key);free(dir);return 0;
+    }
+    ds4_vision_kvmeta_image images[16] = {0};
+    bool eligible=true;
+    for (size_t i=0;i<req->image_count;i++) {
+        if (offsets.offsets[i]>UINT32_MAX) {eligible=false;break;}
+        images[i].token_start=req->images[i].token_start;
+        images[i].token_count=req->images[i].embedding.token_count;
+        images[i].visible_marker_offset=(uint32_t)offsets.offsets[i];
+        memcpy(images[i].fingerprint,req->images[i].embedding.fingerprint,32);
+    }
+    ds4_vision_kvdisk_hit hit={0};
+    char error[160]={0};
+    bool found=false,rebuilt=false;
+    if (eligible) {
+        pthread_mutex_lock(&s->inference_mu);
+        found=ds4_vision_kvdisk_restore(dir,key,images,req->image_count,
+                          s->engine,slot->session,&hit,error,sizeof(error));
+        pthread_mutex_unlock(&s->inference_mu);
+        if (found) {
+            rebuilt=build_live_prompt_suffix(s,slot,req,
+                       req->prompt_text+hit.visible_bytes,out);
+            if (!rebuilt) {
+                pthread_mutex_lock(&s->inference_mu);
+                ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                ds4_tokens_free(out);
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: vision disk checkpoint refused after suffix rebase");
+            }
+        }
+    }
+    free(key);free(dir);
+    if (rebuilt) {
+        server_log(DS4_LOG_KVCACHE,
+            "ds4-server: vision disk cache hit tokens=%d prompt=%d images=%zu",
+            hit.checkpoint_tokens,out->len,req->image_count);
+    }
+    return rebuilt ? hit.checkpoint_tokens : 0;
+}
+
+/* A text-only KV snapshot is safe to restore for a multimodal request
+ * only if it ends before *every* image marker. It contains no image
+ * conditioning, so we must never restore a checkpoint at or beyond an image
+ * payload. Exact checkpoint text matching is still enforced by kvstore. */
+static bool multimodal_disk_text_prefix_safe(const request *req,
+                                             uint32_t prefix_bytes) {
+    if (!req || !req->prompt_text || !req->image_count ||
+        !req->image_markers || prefix_bytes == 0) return false;
+    const size_t n = strlen(req->prompt_text);
+    if (prefix_bytes > n) return false;
+    for (size_t i = 0; i < req->image_count; i++) {
+        const char *marker = req->image_markers[i];
+        if (!marker || !marker[0]) return false;
+        const char *position = strstr(req->prompt_text, marker);
+        if (!position || (size_t)(position - req->prompt_text) < prefix_bytes)
+            return false;
+    }
     return true;
 }
 
@@ -12468,10 +12732,11 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * miss. Baking the check into the probe keeps routing and execution in
      * agreement and stops image-mismatched requests from evicting good
      * checkpoints. */
-    if (!ds4_session_vision_fingerprint_prefix_matches(slot->session,
-                                                       req->images,
-                                                       req->image_count))
-        return pr;
+    /* A previous_response_id is an exact live-state binding, including any
+     * previously encoded images. An append-only text/tool delta carries zero
+     * images by design. Authenticate the id and frontier BEFORE the
+     * image-replay gate; otherwise every image-bearing conversation returns
+     * 409 although its live KV is still present. */
     if (req->api == API_RESPONSES && req->responses_previous_response_id &&
         req->image_count == 0 &&
         req->responses_previous_suffix_text &&
@@ -12482,6 +12747,10 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         return pr;
     }
+    if (!ds4_session_vision_fingerprint_prefix_matches(slot->session,
+                                                       req->images,
+                                                       req->image_count))
+        return pr;
 
     const char *ptext = req->prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
@@ -14361,6 +14630,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const bool live_vision_match =
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
+    const bool live_vision_fingerprint_match =
+        ds4_session_vision_fingerprint_prefix_matches(
+            slot->session, j->req.images, j->req.image_count);
+    const ds4_tokens *live_before = ds4_session_tokens(slot->session);
+    const int live_token0 = live_before && live_before->len > 0
+                            ? live_before->v[0] : -1;
+    const int request_token0 = j->req.prompt.len > 0
+                               ? j->req.prompt.v[0] : -1;
     pthread_mutex_unlock(&s->inference_mu);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
@@ -14572,31 +14849,88 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    old_pos, j->req.prompt.len, common,
                    live_vision_match ? "match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
+        if (multimodal) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: multimodal reuse diagnostic images=%zu "
+                       "image_fingerprint=%s image_positions=%s "
+                       "first_image_token=%u live_token0=%d request_token0=%d "
+                       "first_token_equal=%s",
+                       j->req.image_count,
+                       live_vision_fingerprint_match ? "match" : "mismatch",
+                       live_vision_match ? "match" : "mismatch",
+                       j->req.image_count ? j->req.images[0].token_start : 0,
+                       live_token0, request_token0,
+                       live_token0 >= 0 && live_token0 == request_token0
+                           ? "yes" : "no");
+        }
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
                    j->req.image_count, cached, prompt_for_sync->len);
     }
-    if (cached == 0) slot->continued_last_store_tokens = 0;
+    if (cached == 0) {
+        slot->continued_last_store_tokens = 0;
+        slot->vision_last_store_tokens = 0;
+    }
     if (!slot->openclaw_aux_ephemeral &&
-        !multimodal && s->kv.enabled && cached == 0 &&
+        s->kv.enabled && cached == 0 &&
+        !ds4_session_has_vision_state(slot->session) &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict", j->req.prompt_text);
     }
-    if (!slot->openclaw_aux_ephemeral &&
-        !multimodal && cached == 0) {
+    if (!slot->openclaw_aux_ephemeral && cached == 0 && multimodal &&
+        responses_protocol) {
+        disk_cached = kv_vision_try_restore(
+            s, slot, &j->req, &effective_prompt);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk-vision";
+            prompt_for_sync = &effective_prompt;
+            slot->vision_last_store_tokens = disk_cached;
+        }
+    }
+    if (!slot->openclaw_aux_ephemeral && cached == 0) {
         kv_cache_seed_openclaw_stable_prefix(s, slot, &j->req);
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags,
                                         &disk_cache_text_bytes);
+        if (disk_cached > 0 && multimodal) {
+            /* kvstore's suffix builder is text-only. Rebuild the suffix from
+             * the restored exact token checkpoint and splice the real image
+             * embeddings at their new token positions, but only when the
+             * restored prefix contains no image. */
+            const bool safe = multimodal_disk_text_prefix_safe(
+                &j->req, disk_cache_text_bytes) &&
+                !ds4_session_has_vision_state(slot->session);
+            ds4_tokens vision_prompt = {0};
+            const bool rebuilt = safe && build_live_prompt_suffix(
+                s, slot, &j->req,
+                j->req.prompt_text + disk_cache_text_bytes, &vision_prompt);
+            if (rebuilt) {
+                ds4_tokens_free(&effective_prompt);
+                effective_prompt = vision_prompt;
+                cache_source = "disk-text-vision";
+            } else {
+                ds4_tokens_free(&vision_prompt);
+                ds4_tokens_free(&effective_prompt);
+                ds4_session_invalidate(slot->session);
+                disk_cached = 0;
+                disk_cache_ext_flags = 0;
+                disk_cache_text_bytes = 0;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: multimodal disk snapshot rejected "
+                           "(checkpoint crosses image or cannot rebuild suffix)");
+            }
+        } else if (disk_cached > 0) {
+            cache_source = "disk-text";
+        }
         if (disk_cached > 0) {
             cached = disk_cached;
-            cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -14604,8 +14938,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cached > 0 &&
         ((!strcmp(cache_source, "responses-previous-id") ||
           !strcmp(cache_source, "responses-visible") ||
+          !strcmp(cache_source, "disk-vision") ||
           !strcmp(cache_source, "responses-tool-output")) ||
-         (!strcmp(cache_source, "disk-text") &&
+         ((!strcmp(cache_source, "disk-text") ||
+           !strcmp(cache_source, "disk-text-vision")) &&
           (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
     const bool responses_visible_replay_without_reasoning =
         responses_protocol &&
@@ -15678,17 +16014,71 @@ decode_again:
                     parsed_content ? parsed_content : "",
                     parsed_reasoning,
                     &parsed_calls);
+            /* previous_response_id and authenticated tool-output tails can
+             * carry zero image payloads while extending an image-bearing
+             * live frontier. Inherit its normalized full-history key and
+             * checked marker offsets BEFORE replacing the live binding.
+             * Never guess ancestry from an unbound delta request. */
+            const char *delta = NULL;
+            if (responses_live_continuation && !j->req.image_count) {
+                if (reuse.kind == REUSE_RESPONSES_PREVIOUS_ID)
+                    delta = j->req.responses_previous_suffix_text;
+                else if (reuse.kind == REUSE_RESPONSES_TOOL_OUTPUT)
+                    delta = j->req.responses_live_suffix_text;
+            }
+            char *vision_parent = NULL;
+            visible_image_key vision_parent_images = {0};
+            if (delta && delta[0])
+                vision_parent = responses_live_inherit_vision_prefix(
+                    s, slot, cached, delta, &vision_parent_images);
             buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+            if (vision_parent) {
+                buf_puts(&visible, vision_parent);
+                buf_puts(&visible, delta);
+            } else {
+                buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
+            }
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL, &j->req);
+            if (vision_parent) {
+                /* visible_prompt_key(req) sees zero *new* images in a delta.
+                 * The old normalized marker offsets stay valid because
+                 * the saved key is an exact prefix of this new key. */
+                pthread_mutex_lock(&s->tool_mu);
+                if (slot->responses_live.valid &&
+                    slot->responses_live.visible_text &&
+                    slot->responses_live.visible_len >= strlen(vision_parent) &&
+                    !memcmp(slot->responses_live.visible_text, vision_parent,
+                            strlen(vision_parent))) {
+                    slot->responses_live.images = vision_parent_images;
+                }
+                pthread_mutex_unlock(&s->tool_mu);
+            }
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: responses live remembered tokens=%d call_ids=%d visible_bytes=%zu frontier_ready=1",
                        slot->responses_live.live_tokens,
                        slot->responses_live.call_ids.len,
                        slot->responses_live.visible_len);
             responses_previous_remember(s, slot, id);
+            /* One full image snapshot per 4K token growth. First completed
+             * image turn is always saved, including a tool-call frontier.
+             * A zero-image delta is eligible only with authenticated
+             * inherited vision history; the disk metadata still checks the
+             * saved markers and session image fingerprints. */
+            const int pos = ds4_session_pos(slot->session);
+            const bool image_history = j->req.image_count != 0 ||
+                                       vision_parent != NULL;
+            const bool vision_store_due =
+                slot->vision_last_store_tokens == 0 ||
+                pos < slot->vision_last_store_tokens ||
+                pos - slot->vision_last_store_tokens >= 4096;
+            if (image_history && vision_store_due &&
+                (!strcmp(final_finish, "stop") ||
+                 !strcmp(final_finish, "tool_calls")) &&
+                !slot->openclaw_aux_ephemeral)
+                kv_vision_store_completed(s, slot, &j->req);
+            free(vision_parent);
             buf_free(&visible);
             free(visible_suffix);
         } else {
@@ -18221,11 +18611,181 @@ static void test_slot_probe_live_state_tiers(void) {
  * coverage for the 81a7658 merge (live first-image / thinking-new-image
  * misses): the probe gate is fingerprint-prefix, and visible tiers compare
  * in visible_prompt_key space. */
+static void test_short_sidecar_pins_only_unrelated_small_chat(void) {
+    request r = {0};
+    const char *prior = getenv("DS4_PIN_SHORT_SIDE_REQUESTS");
+    char *saved = prior ? xstrdup(prior) : NULL;
+    setenv("DS4_PIN_SHORT_SIDE_REQUESTS", "1", 1);
+    r.api = API_OPENAI;
+    r.prompt.len = 408;
+    r.max_tokens = 32768;
+    TEST_ASSERT(request_is_short_sidecar(&r, 246152, true));
+    TEST_ASSERT(!request_is_short_sidecar(&r, 246152, false));
+    TEST_ASSERT(!request_is_short_sidecar(&r, 1000, true));
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!request_is_short_sidecar(&r, 246152, true));
+    r.api = API_OPENAI;
+    r.has_tools = true;
+    TEST_ASSERT(!request_is_short_sidecar(&r, 246152, true));
+    r.has_tools = false;
+    r.prompt.len = 5000;
+    TEST_ASSERT(!request_is_short_sidecar(&r, 246152, true));
+    r.prompt.len = 408;
+    setenv("DS4_PIN_SHORT_SIDE_REQUESTS", "0", 1);
+    TEST_ASSERT(!request_is_short_sidecar(&r, 246152, true));
+    if (saved) { setenv("DS4_PIN_SHORT_SIDE_REQUESTS", saved, 1); free(saved); }
+    else unsetenv("DS4_PIN_SHORT_SIDE_REQUESTS");
+}
+
+static void test_responses_delta_inherits_only_verified_vision_key(void) {
+    server s = {0};
+    server_slot slot = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    slot.responses_live.valid = true;
+    slot.responses_live.live_tokens = 100;
+    slot.responses_live.visible_text = xstrdup("before\036\036after");
+    slot.responses_live.visible_len = strlen(slot.responses_live.visible_text);
+    slot.responses_live.images.count = 1;
+    slot.responses_live.images.offsets[0] = 6;
+    visible_image_key offsets = {0};
+    char *key = responses_live_inherit_vision_prefix(
+        &s, &slot, 100, "<tool-output>", &offsets);
+    TEST_ASSERT(key != NULL && !strcmp(key, "before\036\036after"));
+    TEST_ASSERT(offsets.count == 1 && offsets.offsets[0] == 6);
+    free(key);
+    key = responses_live_inherit_vision_prefix(
+        &s, &slot, 99, "<tool-output>", &offsets);
+    TEST_ASSERT(key == NULL && offsets.count == 0);
+    slot.responses_live.images.offsets[0] = 0; /* no real marker at offset */
+    key = responses_live_inherit_vision_prefix(
+        &s, &slot, 100, "<tool-output>", &offsets);
+    TEST_ASSERT(key == NULL);
+    slot.responses_live.images.offsets[0] = 6;
+    key = responses_live_inherit_vision_prefix(
+        &s, &slot, 100, "", &offsets);
+    TEST_ASSERT(key == NULL);
+    live_tool_state_free(&slot.responses_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_vision_checkpoint_disk_identity_api(void) {
+    int tok[1000];
+    for (int i=0; i<1000; ++i) tok[i] = i + 1;
+    ds4_session *src = ds4_session_new_test_checkpoint(tok, 1000);
+    ds4_session *dst = ds4_session_new_test_checkpoint(tok, 1000);
+    ds4_vision_span image={0};
+    image.token_start=700;
+    image.embedding.token_count=32;
+    memset(image.embedding.fingerprint, 0x5a, 32);
+    ds4_session_set_test_images(src, &image, 1);
+    ds4_vision_span exported[16]={0};size_t count=0;
+    TEST_ASSERT(ds4_session_export_vision_checkpoint(src,exported,16,&count));
+    TEST_ASSERT(count==1 && exported[0].token_start==700 &&
+                exported[0].embedding.token_count==32);
+    TEST_ASSERT(ds4_session_restore_vision_checkpoint(dst,exported,count));
+    TEST_ASSERT(ds4_session_vision_state_matches(dst,exported,count));
+    ds4_vision_span bad=exported[0];bad.token_start=995;
+    TEST_ASSERT(!ds4_session_restore_vision_checkpoint(dst,&bad,1));
+    TEST_ASSERT(ds4_session_vision_state_matches(dst,exported,count));
+    bad=exported[0];memset(bad.embedding.fingerprint,0,32);
+    TEST_ASSERT(!ds4_session_restore_vision_checkpoint(dst,&bad,1));
+    TEST_ASSERT(ds4_session_vision_state_matches(dst,exported,count));
+    TEST_ASSERT(!ds4_session_export_vision_checkpoint(src,exported,0,&count));
+    ds4_session_free_test_checkpoint(src);
+    ds4_session_free_test_checkpoint(dst);
+}
+
+static void test_multimodal_disk_text_frontier(void) {
+    request req = {0};
+    req.prompt_text = xstrdup("stable text <IMG_ONE> more text <IMG_TWO>");
+    req.image_count = 2;
+    req.image_markers = calloc(2, sizeof(req.image_markers[0]));
+    snprintf(req.image_markers[0], sizeof(req.image_markers[0]), "%s", "<IMG_ONE>");
+    snprintf(req.image_markers[1], sizeof(req.image_markers[1]), "%s", "<IMG_TWO>");
+    const uint32_t before_image = (uint32_t)(strstr(req.prompt_text,
+                                                     "<IMG_ONE>") - req.prompt_text);
+    TEST_ASSERT(multimodal_disk_text_prefix_safe(&req, before_image));
+    TEST_ASSERT(!multimodal_disk_text_prefix_safe(&req, before_image + 1));
+    TEST_ASSERT(!multimodal_disk_text_prefix_safe(&req, 0));
+    snprintf(req.image_markers[1], sizeof(req.image_markers[1]), "%s", "<IMG_MISSING>");
+    TEST_ASSERT(!multimodal_disk_text_prefix_safe(&req, before_image));
+    snprintf(req.image_markers[1], sizeof(req.image_markers[1]), "%s", "<IMG_TWO>");
+    free(req.image_markers);
+    free(req.prompt_text);
+}
+
+static void test_interrupted_vision_checkpoint(void) {
+    /* A 10-token interrupted frontier contains the first image, not the
+     * second. Its identical image history must still pass the reuse gate. */
+    int tok[20];
+    for (int i = 0; i < 20; i++) tok[i] = i + 1;
+    ds4_vision_span images[2] = {
+        {.token_start = 2, .embedding = {.token_count = 3, .fingerprint = {7}}},
+        {.token_start = 15, .embedding = {.token_count = 4, .fingerprint = {9}}},
+    };
+    ds4_session *s = ds4_session_new_test_checkpoint(tok, 10);
+    TEST_ASSERT(ds4_session_retain_vision_checkpoint(s, images, 2));
+    TEST_ASSERT(ds4_session_vision_prefix_matches(s, images, 2));
+    TEST_ASSERT(ds4_session_vision_fingerprint_prefix_matches(s, images, 2));
+    ds4_vision_span changed[2] = {images[0], images[1]};
+    changed[0].embedding.fingerprint[0]++;
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(s, changed, 2));
+    ds4_session_free_test_checkpoint(s);
+
+    /* An interrupted frontier midway through an image is unsafe. */
+    s = ds4_session_new_test_checkpoint(tok, 17);
+    TEST_ASSERT(!ds4_session_retain_vision_checkpoint(s, images, 2));
+    ds4_session_free_test_checkpoint(s);
+
+    /* A fully processed frontier retains both image identities. */
+    s = ds4_session_new_test_checkpoint(tok, 20);
+    TEST_ASSERT(ds4_session_retain_vision_checkpoint(s, images, 2));
+    TEST_ASSERT(ds4_session_vision_state_matches(s, images, 2));
+    ds4_session_free_test_checkpoint(s);
+
+    /* Text-only checkpoints accept appended images, never earlier inserts. */
+    s = ds4_session_new_test_checkpoint(tok, 10);
+    TEST_ASSERT(ds4_session_retain_vision_checkpoint(s, NULL, 0));
+    TEST_ASSERT(ds4_session_vision_prefix_matches(s, images + 1, 1));
+    TEST_ASSERT(!ds4_session_vision_prefix_matches(s, images, 2));
+    ds4_session_free_test_checkpoint(s);
+}
+
 static void test_slot_probe_vision_tiers(void) {
     server s = {0};
     const time_t now = 1000000;
     int ckpt_tok[10];
     for (int i = 0; i < 10; i++) ckpt_tok[i] = i + 1;
+
+    /* Regression 2026-10-11: prev_response_id supplies only a new text/tool
+     * delta, with NO historical images. The response ID and exact frontier
+     * authenticate the five prior images; a vision-first gate caused HTTP 409
+     * on every iteration and an expensive 60K-token stateless replay. */
+    {
+        server_slot slot = {0};
+        slot.session = ds4_session_new_test_checkpoint(ckpt_tok, 10);
+        ds4_vision_span image = {0};
+        image.token_start = 2;
+        image.embedding.token_count = 2;
+        image.embedding.fingerprint[0] = 7;
+        ds4_session_set_test_images(slot.session, &image, 1);
+        slot.responses_previous.valid = true;
+        slot.responses_previous.live_tokens = 10;
+        slot.responses_previous.response_id = xstrdup("resp_image_frontier");
+        request req = {0};
+        req.api = API_RESPONSES;
+        req.responses_previous_response_id = xstrdup("resp_image_frontier");
+        req.responses_previous_suffix_text = xstrdup("<｜User｜>continue<｜Assistant｜>");
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind ==
+                    REUSE_RESPONSES_PREVIOUS_ID);
+        req.responses_previous_response_id[0] = 'X';
+        TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &req).kind ==
+                    REUSE_NONE);
+        ds4_session_free_test_checkpoint(slot.session);
+        responses_previous_state_free(&slot.responses_previous);
+        request_free(&req);
+    }
+
 
     /* Token equality cannot authenticate a moved image. Unlike a visible
      * continuation, this tier does not rebuild or rebase the image spans. */
@@ -25707,6 +26267,11 @@ static void ds4_server_unit_tests_run(void) {
     test_live_kv_keeps_replayed_turn_end_token();
     test_slot_probe_and_routing_scores();
     test_slot_probe_live_state_tiers();
+    test_short_sidecar_pins_only_unrelated_small_chat();
+    test_responses_delta_inherits_only_verified_vision_key();
+    test_vision_checkpoint_disk_identity_api();
+    test_multimodal_disk_text_frontier();
+    test_interrupted_vision_checkpoint();
     test_slot_probe_vision_tiers();
     test_slot_routing_staleness_tiers();
     test_dispatch_routes_alien_request_to_empty_slot();
