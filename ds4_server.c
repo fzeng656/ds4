@@ -5,6 +5,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_vision_kvdisk.h"
 #include "ds4_tp.h"
 #include "rax.h"
 
@@ -10202,6 +10203,7 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    int vision_last_store_tokens;
     /* Recognized OpenClaw utility requests run ephemerally and must not
      * replace the authoritative resident main-session frontier. */
     bool openclaw_aux_ephemeral;
@@ -10732,6 +10734,7 @@ typedef struct {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    int vision_last_store_tokens;
 } openclaw_aux_resident_pin;
 
 static void live_tool_state_clone(live_tool_state *dst,
@@ -10805,6 +10808,7 @@ static void openclaw_aux_resident_pin_begin(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->tool_mu);
 
     pin->continued_last_store_tokens = slot->continued_last_store_tokens;
+    pin->vision_last_store_tokens = slot->vision_last_store_tokens;
     pin->live_tokens = live_tokens;
     pin->active = true;
     slot->openclaw_aux_ephemeral = true;
@@ -10840,6 +10844,7 @@ static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
             pthread_mutex_unlock(&s->tool_mu);
             slot->continued_last_store_tokens =
                 pin->continued_last_store_tokens;
+            slot->vision_last_store_tokens = pin->vision_last_store_tokens;
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: OpenClaw aux resident pin restored live=%d snapshot=%.2f MiB",
                        pin->live_tokens,
@@ -10858,6 +10863,7 @@ static void openclaw_aux_resident_pin_restore(server *s, server_slot *slot,
         pthread_mutex_unlock(&s->inference_mu);
         request_live_state_clear(s, slot);
         slot->continued_last_store_tokens = 0;
+        slot->vision_last_store_tokens = 0;
     }
 
     slot->openclaw_aux_ephemeral = false;
@@ -12025,6 +12031,171 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     ds4_tokens_free(out);
     *out = prompt;
     return true;
+}
+
+
+
+/* Opt-in filesystem isolation: experimental GLM vision files are kept
+ * outside legacy text-only .kv indexes in a model-namespaced sibling folder. */
+#define DS4_VISION_DISK_DEFAULT_GIB 8u
+/* The 8 GiB default caps only .vkd snapshots, independently of the text
+ * cache, because images currently require full GPU checkpoints. */
+static uint64_t kv_vision_disk_budget(void) {
+    const char *env = getenv("DS4_VISION_DISK_BUDGET_GIB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long gib = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && gib >= 1 && gib <= 32)
+            return (uint64_t)gib * 1024ull * 1024ull * 1024ull;
+    }
+    return (uint64_t)DS4_VISION_DISK_DEFAULT_GIB *
+           1024ull * 1024ull * 1024ull;
+}
+/* Disabled unless explicitly opted in with DS4_VISION_DISK_EXPERIMENTAL=1. */
+static bool kv_vision_enabled(void) {
+    const char *v = getenv("DS4_VISION_DISK_EXPERIMENTAL");
+    return v && !strcmp(v, "1");
+}
+/* Namespace is mandatory to prevent snapshots from different GLM weights
+ * or vision encoders colliding, even when model family/quant/context match. */
+static char *kv_vision_dir(const server *s) {
+    if (!s || !s->kv.dir) return NULL;
+    const char *ns = getenv("DS4_VISION_DISK_NAMESPACE");
+    if (!ns || !ns[0] || strlen(ns) > 64) return NULL;
+    for (const char *p = ns; *p; ++p)
+        if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_'))
+            return NULL;
+    size_t n = strlen(s->kv.dir), m = strlen(ns);
+    char *p = malloc(n + sizeof(".vision-") + m);
+    if (!p) return NULL;
+    snprintf(p, n + sizeof(".vision-") + m, "%s.vision-%s", s->kv.dir, ns);
+    return p;
+}
+
+static bool kv_vision_store_completed(server *s, server_slot *slot,
+                                       const request *req) {
+    if (!kv_vision_enabled() || !s || !slot || !req || !s->kv.enabled ||
+        req->image_count > 16 || slot->openclaw_aux_ephemeral ||
+        !ds4_engine_is_glm_dsa(s->engine)) return false;
+    char *key = NULL;
+    visible_image_key saved_offsets = {0};
+    pthread_mutex_lock(&s->tool_mu);
+    if (slot->responses_live.valid && slot->responses_live.visible_text &&
+        slot->responses_live.live_tokens == ds4_session_pos(slot->session)) {
+        key = xstrdup(slot->responses_live.visible_text);
+        saved_offsets = slot->responses_live.images;
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    /* A previous_response_id/tool-output delta has no images in the request,
+     * but an authenticated live continuation can carry the older image-bearing
+     * normalized visible prefix. Never accept a naked no-image key. */
+    if (!key || !saved_offsets.count ||
+        (req->image_count && saved_offsets.count != req->image_count)) {
+        free(key);return false;
+    }
+    const size_t text_len = strlen(key);
+    if (text_len > UINT32_MAX) {free(key);return false;}
+    ds4_vision_span spans[16] = {0};
+    size_t count = 0;
+    ds4_vision_kvmeta meta = {0};
+    bool ok = false;
+    char *dir = kv_vision_dir(s);
+    if (!dir) {free(key);return false;}
+    meta.visible_bytes = (uint32_t)text_len;
+    ds4_kvstore_sha1_bytes_hex(key, text_len, meta.visible_sha1);
+    pthread_mutex_lock(&s->inference_mu);
+    if (ds4_session_export_vision_checkpoint(
+            slot->session, spans, 16, &count) &&
+        count > 0 && count == saved_offsets.count) {
+        meta.checkpoint_tokens = (uint32_t)ds4_session_pos(slot->session);
+        meta.image_count = (uint32_t)count;
+        bool safe = true;
+        for (size_t i = 0; i < count; i++) {
+            if (saved_offsets.offsets[i] > UINT32_MAX ||
+                saved_offsets.offsets[i] >= text_len ||
+                (unsigned char)key[saved_offsets.offsets[i]] != 036 ||
+                (req->image_count &&
+                 (spans[i].embedding.token_count != req->images[i].embedding.token_count ||
+                  memcmp(spans[i].embedding.fingerprint,
+                         req->images[i].embedding.fingerprint, 32)))) {
+                safe = false;break;
+            }
+            meta.images[i].token_start = spans[i].token_start;
+            meta.images[i].token_count = spans[i].embedding.token_count;
+            meta.images[i].visible_marker_offset =
+                (uint32_t)saved_offsets.offsets[i];
+            memcpy(meta.images[i].fingerprint,
+                   spans[i].embedding.fingerprint, 32);
+        }
+        if (safe) {
+            char error[160] = {0};
+            ok = ds4_vision_kvdisk_store(dir,key,&meta,s->engine,slot->session,
+                           kv_vision_disk_budget(),error,sizeof(error));
+            if (!ok) server_log(DS4_LOG_WARNING,
+                        "ds4-server: vision disk checkpoint skipped tokens=%u reason=%s",
+                        meta.checkpoint_tokens,error[0]?error:"budget-or-validation");
+        }
+    }
+    pthread_mutex_unlock(&s->inference_mu);
+    if (ok) {
+        slot->vision_last_store_tokens = (int)meta.checkpoint_tokens;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: vision disk checkpoint saved tokens=%u images=%u visible_bytes=%u",
+                   meta.checkpoint_tokens,meta.image_count,meta.visible_bytes);
+    }
+    free(dir);free(key);
+    return ok;
+}
+
+static int kv_vision_try_restore(server *s,server_slot *slot,request *req,
+                                 ds4_tokens *out) {
+    if (!kv_vision_enabled() || !s || !slot || !req || !out || !s->kv.enabled ||
+        req->api != API_RESPONSES || !req->image_count ||
+        req->image_count > 16 || slot->openclaw_aux_ephemeral ||
+        !ds4_engine_is_glm_dsa(s->engine))return 0;
+    visible_image_key offsets={0};
+    char *key=visible_prompt_key(req,req->prompt_text,&offsets);
+    char *dir=kv_vision_dir(s);
+    if (!key || !dir || offsets.count!=req->image_count) {
+        free(key);free(dir);return 0;
+    }
+    ds4_vision_kvmeta_image images[16] = {0};
+    bool eligible=true;
+    for (size_t i=0;i<req->image_count;i++) {
+        if (offsets.offsets[i]>UINT32_MAX) {eligible=false;break;}
+        images[i].token_start=req->images[i].token_start;
+        images[i].token_count=req->images[i].embedding.token_count;
+        images[i].visible_marker_offset=(uint32_t)offsets.offsets[i];
+        memcpy(images[i].fingerprint,req->images[i].embedding.fingerprint,32);
+    }
+    ds4_vision_kvdisk_hit hit={0};
+    char error[160]={0};
+    bool found=false,rebuilt=false;
+    if (eligible) {
+        pthread_mutex_lock(&s->inference_mu);
+        found=ds4_vision_kvdisk_restore(dir,key,images,req->image_count,
+                          s->engine,slot->session,&hit,error,sizeof(error));
+        pthread_mutex_unlock(&s->inference_mu);
+        if (found) {
+            rebuilt=build_live_prompt_suffix(s,slot,req,
+                       req->prompt_text+hit.visible_bytes,out);
+            if (!rebuilt) {
+                pthread_mutex_lock(&s->inference_mu);
+                ds4_session_invalidate(slot->session);
+                pthread_mutex_unlock(&s->inference_mu);
+                ds4_tokens_free(out);
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: vision disk checkpoint refused after suffix rebase");
+            }
+        }
+    }
+    free(key);free(dir);
+    if (rebuilt) {
+        server_log(DS4_LOG_KVCACHE,
+            "ds4-server: vision disk cache hit tokens=%d prompt=%d images=%zu",
+            hit.checkpoint_tokens,out->len,req->image_count);
+    }
+    return rebuilt ? hit.checkpoint_tokens : 0;
 }
 
 
@@ -14188,6 +14359,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
+    if (cached == 0) slot->vision_last_store_tokens = 0;
 
     const bool defer_live_store_for_common_rebuild =
         !multimodal && s->kv.enabled && cached == 0 &&
@@ -14225,10 +14397,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             kv_cache_store_current(s, slot, "evict-after-disk-miss");
         }
     }
+    /* Isolated image KV snapshots are the only permitted disk source for a
+     * multimodal prefix. Do not apply text-only .kv beyond an image marker. */
+    if (cached == 0 && multimodal && responses_protocol &&
+        !slot->openclaw_aux_ephemeral) {
+        disk_cached = kv_vision_try_restore(s, slot, &j->req,
+                                            &effective_prompt);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk-vision";
+            prompt_for_sync = &effective_prompt;
+            slot->vision_last_store_tokens = disk_cached;
+        }
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
-          !strcmp(cache_source, "responses-tool-output")) ||
+          !strcmp(cache_source, "responses-tool-output") ||
+          !strcmp(cache_source, "disk-vision")) ||
          (!strcmp(cache_source, "disk-text") &&
           (disk_cache_ext_flags & KV_EXT_RESPONSES_VISIBLE)));
     const bool responses_visible_replay_without_reasoning =
@@ -15277,6 +15463,21 @@ decode_again:
                        slot->responses_live.live_tokens,
                        slot->responses_live.call_ids.len,
                        slot->responses_live.visible_len);
+            /* Persist only a verified image-conditioned, fully completed
+             * Responses frontier; no-image/delta requests are not trusted as
+             * standalone disk-restoration roots. */
+            if (j->req.image_count > 0 &&
+                !slot->openclaw_aux_ephemeral &&
+                ds4_session_checkpoint_valid(slot->session) &&
+                (!slot->vision_last_store_tokens ||
+                 ds4_session_pos(slot->session) <
+                     slot->vision_last_store_tokens ||
+                 ds4_session_pos(slot->session) -
+                     slot->vision_last_store_tokens >= 4096) &&
+                (!strcmp(final_finish, "stop") ||
+                 !strcmp(final_finish, "tool_calls"))) {
+                kv_vision_store_completed(s, slot, &j->req);
+            }
             buf_free(&visible);
             free(visible_suffix);
         } else {
@@ -24085,7 +24286,34 @@ static void test_server_memory_pressure(void) {
     close(sv[0]);close(sv[1]);
 }
 
+static void test_glm_vision_disk_opt_in_namespace(void) {
+    server s = {0};
+    s.kv.dir = "/tmp/glm53-vision-test";
+    const char *prev_on = getenv("DS4_VISION_DISK_EXPERIMENTAL");
+    const char *prev_ns = getenv("DS4_VISION_DISK_NAMESPACE");
+    char *restore_on = prev_on ? xstrdup(prev_on) : NULL;
+    char *restore_ns = prev_ns ? xstrdup(prev_ns) : NULL;
+    unsetenv("DS4_VISION_DISK_EXPERIMENTAL");
+    unsetenv("DS4_VISION_DISK_NAMESPACE");
+    TEST_ASSERT(!kv_vision_enabled());
+    TEST_ASSERT(kv_vision_dir(&s) == NULL);
+    setenv("DS4_VISION_DISK_EXPERIMENTAL", "1", 1);
+    setenv("DS4_VISION_DISK_NAMESPACE", "../other-model", 1);
+    TEST_ASSERT(kv_vision_enabled() && kv_vision_dir(&s) == NULL);
+    setenv("DS4_VISION_DISK_NAMESPACE", "glm53-dogcontext-q2-v1", 1);
+    char *valid = kv_vision_dir(&s);
+    TEST_ASSERT(valid &&
+        !strcmp(valid, "/tmp/glm53-vision-test.vision-glm53-dogcontext-q2-v1"));
+    free(valid);
+    if (restore_on) setenv("DS4_VISION_DISK_EXPERIMENTAL", restore_on, 1);
+    else unsetenv("DS4_VISION_DISK_EXPERIMENTAL");
+    if (restore_ns) setenv("DS4_VISION_DISK_NAMESPACE", restore_ns, 1);
+    else unsetenv("DS4_VISION_DISK_NAMESPACE");
+    free(restore_on); free(restore_ns);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_glm_vision_disk_opt_in_namespace();
     test_server_memory_pressure();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
