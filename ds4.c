@@ -75007,6 +75007,53 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  */
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 
+bool ds4_session_export_vision_checkpoint(const ds4_session *session,
+                                          ds4_vision_span *images,
+                                          size_t capacity, size_t *count) {
+    if (count) *count = 0;
+    if (!session || !session->checkpoint_valid ||
+        session->checkpoint_image_count > capacity ||
+        (session->checkpoint_image_count && !images)) return false;
+    uint64_t prev_end = 0;
+    for (size_t i = 0; i < session->checkpoint_image_count; i++) {
+        const ds4_vision_identity *id = &session->checkpoint_images[i];
+        uint64_t end = (uint64_t)id->token_start + id->token_count;
+        if (!id->token_count || id->token_start < prev_end ||
+            end > (uint64_t)session->checkpoint.len) return false;
+        prev_end = end;
+    }
+    for (size_t i = 0; i < session->checkpoint_image_count; i++) {
+        const ds4_vision_identity *id = &session->checkpoint_images[i];
+        memset(&images[i], 0, sizeof(images[i]));
+        images[i].token_start = id->token_start;
+        images[i].embedding.token_count = id->token_count;
+        memcpy(images[i].embedding.fingerprint, id->fingerprint,
+               sizeof(images[i].embedding.fingerprint));
+    }
+    if (count) *count = session->checkpoint_image_count;
+    return true;
+}
+
+bool ds4_session_restore_vision_checkpoint(ds4_session *session,
+                                           const ds4_vision_span *images,
+                                           size_t image_count) {
+    if (!session || !session->checkpoint_valid ||
+        (image_count && !images) || image_count > 16) return false;
+    uint64_t prev_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        uint64_t begin = images[i].token_start;
+        uint64_t end = begin + images[i].embedding.token_count;
+        unsigned nonzero = 0;
+        for (size_t j = 0; j < sizeof(images[i].embedding.fingerprint); j++)
+            nonzero |= images[i].embedding.fingerprint[j];
+        if (!images[i].embedding.token_count || begin < prev_end ||
+            end > (uint64_t)session->checkpoint.len || !nonzero) return false;
+        prev_end = end;
+    }
+    return ds4_session_retain_vision_checkpoint(session, images, image_count) &&
+           ds4_session_vision_state_matches(session, images, image_count);
+}
+
 bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
@@ -75088,23 +75135,40 @@ static bool ds4_session_vision_range_overlaps(
     return false;
 }
 
-static bool ds4_session_store_vision_identities(ds4_session *s) {
+/* Preserve image conditioning at the *actually completed* token frontier.
+ * Interrupted chunked prefill may have committed a token checkpoint without
+ * reaching later images in the request. Those must not be recorded as part of
+ * that checkpoint. If a boundary cuts through an image block, the checkpoint
+ * cannot safely be resumed: the next request must rebuild instead. */
+bool ds4_session_retain_vision_checkpoint(
+        ds4_session *s, const ds4_vision_span *images, size_t image_count) {
+    if (!s || !s->checkpoint_valid || (image_count && !images)) return false;
+    const uint64_t frontier = (uint64_t)s->checkpoint.len;
+    size_t completed = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const uint64_t begin = images[i].token_start;
+        const uint64_t end = begin + images[i].embedding.token_count;
+        if (!images[i].embedding.token_count) return false;
+        if (begin < frontier && end > frontier) return false; /* partial image */
+        if (end <= frontier) completed++;
+        else if (begin >= frontier) break; /* unprocessed suffix */
+        else return false;
+    }
     ds4_vision_identity *copy = NULL;
-    if (s->sync_image_count != 0) {
-        if (s->sync_image_count > SIZE_MAX / sizeof(copy[0])) return false;
-        copy = calloc(s->sync_image_count, sizeof(copy[0]));
+    if (completed) {
+        if (completed > SIZE_MAX / sizeof(copy[0])) return false;
+        copy = calloc(completed, sizeof(copy[0]));
         if (!copy) return false;
-        for (size_t i = 0; i < s->sync_image_count; i++) {
-            copy[i].token_start = s->sync_images[i].token_start;
-            copy[i].token_count = s->sync_images[i].embedding.token_count;
-            memcpy(copy[i].fingerprint,
-                   s->sync_images[i].embedding.fingerprint,
+        for (size_t i = 0; i < completed; i++) {
+            copy[i].token_start = images[i].token_start;
+            copy[i].token_count = images[i].embedding.token_count;
+            memcpy(copy[i].fingerprint, images[i].embedding.fingerprint,
                    sizeof(copy[i].fingerprint));
         }
     }
     free(s->checkpoint_images);
     s->checkpoint_images = copy;
-    s->checkpoint_image_count = s->sync_image_count;
+    s->checkpoint_image_count = completed;
     return true;
 }
 
@@ -75183,7 +75247,16 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
+    /* A strictly append-only text suffix after an authenticated image-bearing
+     * live frontier needs no image embeddings: all historical image KV is
+     * resident. Do not discard its image identities just because the delta
+     * does not re-send them. Any prefix mismatch still invalidates normally. */
+    const bool preserve_image_frontier =
+        s && s->checkpoint_valid && s->checkpoint_image_count != 0 &&
+        s->sync_image_count == 0 && prompt &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint);
+    if (s && s->checkpoint_valid && !preserve_image_frontier &&
+        !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
     }
@@ -75262,10 +75335,19 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             return rc != 0 ? rc : 1;
         }
     }
-    if (rc == 0 && !ds4_session_store_vision_identities(s)) {
+    /* Also retain complete image identities on an interrupted prefill.
+     * The backend checkpoint already represents the completed tokens, but
+     * without this step a resumed multimodal request looked like a different
+     * image history. Never advertise a checkpoint split inside an image. */
+    if ((rc == 0 || rc == DS4_SESSION_SYNC_INTERRUPTED) &&
+        s->checkpoint_valid && !preserve_image_frontier &&
+        !ds4_session_retain_vision_checkpoint(s, s->sync_images,
+                                              s->sync_image_count)) {
         ds4_session_invalidate(s);
-        snprintf(err, errlen, "unable to retain image prompt identity");
-        return 1;
+        if (rc == 0) {
+            snprintf(err, errlen, "unable to retain image prompt identity");
+            return 1;
+        }
     }
     return rc;
 }
