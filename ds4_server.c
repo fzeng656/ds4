@@ -13407,18 +13407,23 @@ static char *build_responses_visible_assistant_suffix(const request *r,
                                            r && r->reasoning_summary_emit && calls && calls->len > 0, calls);
     }
     buf suffix = {0};
-    /* This suffix mirrors what a Responses client can replay, not necessarily
-     * every token in KV.  Hidden reasoning stays live in the session unless the
-     * next client replay is expected to include it.  In practice, pi replays
-     * reasoning summaries for tool-call turns, but not for final assistant
-     * answers; Codex currently requests no summaries at all.  So only include
-     * reasoning in the remembered visible prefix when this assistant turn ended
-     * in tool calls.  A client that does replay final-answer reasoning will not
-     * match this visible shortcut and can still use exact token-prefix replay. */
+    /* This suffix mirrors the replayable Responses surface, not every token in
+     * KV. Hidden reasoning remains authoritative in the live session. Provider
+     * clients may retain reasoning as opaque identity/signature items rather
+     * than replaying DS4's sampled reasoning bytes; therefore the visible key
+     * deliberately omits raw reasoning for both tool and final-answer turns. */
     if (r && ds4_think_mode_enabled(r->think_mode)) {
-        if (r->reasoning_summary_emit && calls && calls->len > 0) {
-            buf_puts(&suffix, reasoning ? reasoning : "");
-        }
+        /*
+         * The Responses visible key must describe bytes a stateless client can
+         * reliably replay. OpenClaw stores provider reasoning identity in an
+         * opaque reasoning item/signature; it does not replay DS4's raw sampled
+         * reasoning text byte-for-byte on the next full-history request.
+         *
+         * Keeping raw reasoning here made the visible key diverge exactly at
+         * the first assistant turn after a replay, forcing a disk fallback and
+         * tens of thousands of tokens of avoidable prefill. The live KV still
+         * retains the hidden reasoning; only the *key* omits it.
+         */
         buf_puts(&suffix, "</think>");
     }
     buf_puts(&suffix, content ? content : "");
@@ -15267,9 +15272,21 @@ decode_again:
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, slot, visible.ptr ? visible.ptr : "",
                                     parsed_calls.len ? &parsed_calls : NULL, &j->req);
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: responses live remembered tokens=%d call_ids=%d visible_bytes=%zu frontier_ready=1",
+                       slot->responses_live.live_tokens,
+                       slot->responses_live.call_ids.len,
+                       slot->responses_live.visible_len);
             buf_free(&visible);
             free(visible_suffix);
         } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: responses live not published frontier_ready=%d finish=%s checkpoint_valid=%d call_ids=%d tokens=%d",
+                       ds4_session_checkpoint_valid(slot->session) ? 1 : 0,
+                       final_finish ? final_finish : "unknown",
+                       ds4_session_checkpoint_valid(slot->session) ? 1 : 0,
+                       parsed_calls.len,
+                       ds4_session_pos(slot->session));
             responses_live_clear(s, slot);
         }
     }
@@ -15373,7 +15390,27 @@ decode_again:
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
-        request_live_state_clear(s, slot);
+        /*
+         * A Responses client can have already consumed a complete tool-call
+         * item before the HTTP/SSE tail reports a write failure. If the model
+         * frontier is valid and the call IDs were published, keep that live
+         * binding so a subsequent function_call_output can still continue.
+         * A later unrelated request will replace/clear the binding normally.
+         */
+        const bool preserve_responses_tool_frontier =
+            j->req.api == API_RESPONSES &&
+            ds4_session_checkpoint_valid(slot->session) &&
+            parsed_calls.len > 0 &&
+            slot->responses_live.valid &&
+            slot->responses_live.live_tokens == ds4_session_pos(slot->session);
+        if (preserve_responses_tool_frontier) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: responses live preserved after stream close call_ids=%d tokens=%d",
+                       slot->responses_live.call_ids.len,
+                       slot->responses_live.live_tokens);
+        } else {
+            request_live_state_clear(s, slot);
+        }
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -21124,7 +21161,8 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     suffix = build_responses_visible_assistant_suffix(&r, "",
                                                       "tool summary",
                                                       &calls);
-    TEST_ASSERT(strstr(suffix, "tool summary</think>") != NULL);
+    TEST_ASSERT(strstr(suffix, "tool summary") == NULL);
+    TEST_ASSERT(strstr(suffix, "</think>") != NULL);
     TEST_ASSERT(strstr(suffix, "<｜DSML｜tool_calls>") != NULL);
     free(suffix);
 
