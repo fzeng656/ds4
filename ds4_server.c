@@ -10694,6 +10694,22 @@ static bool request_is_openclaw_aux(const request *r) {
     if (skill_workshop_review)
         return true;
 
+    /*
+     * Activity recap is also OpenClaw-owned, tool-less, and capped to a small
+     * output budget, but its input grows with a long-running task.  Do not let
+     * the generic 4096-token utility gate turn a large recap into an ordinary
+     * request: that would let the recap replace the resident Responses
+     * continuation while the main tool loop is waiting.
+     */
+    const bool activity_recap =
+        !r->has_tools &&
+        r->prompt.len > 0 &&
+        r->max_tokens > 0 && r->max_tokens <= 512 &&
+        strstr(r->raw_body,
+               "Write an Activity recap for someone scanning their tasks") != NULL;
+    if (activity_recap)
+        return true;
+
     /* Keep the legacy utility classifier deliberately narrow. These are
      * OpenClaw-owned utility prompts, all tool-less and small; requiring the
      * request shape prevents a user who merely quotes one of the strings in a
@@ -10704,9 +10720,7 @@ static bool request_is_openclaw_aux(const request *r) {
     return strstr(r->raw_body,
                   "You write the live status line for an AI assistant") != NULL ||
            strstr(r->raw_body,
-                  "You judge the trajectory of a running AI agent session") != NULL ||
-           strstr(r->raw_body,
-                  "Write an Activity recap for someone scanning their tasks") != NULL;
+                  "You judge the trajectory of a running AI agent session") != NULL;
 }
 
 typedef struct {
@@ -23587,6 +23601,103 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+
+static void test_request_is_openclaw_aux(void) {
+    request r = {
+        .raw_body = "You write the live status line for an AI assistant",
+        .max_tokens = 512,
+        .has_tools = false,
+    };
+    r.prompt.len = 122;
+    TEST_ASSERT(request_is_openclaw_aux(&r));
+
+    r.raw_body = "You judge the trajectory of a running AI agent session";
+    r.prompt.len = 300;
+    TEST_ASSERT(request_is_openclaw_aux(&r));
+
+    r.raw_body = "Write an Activity recap for someone scanning their tasks";
+    r.prompt.len = 818;
+    r.max_tokens = 240;
+    TEST_ASSERT(request_is_openclaw_aux(&r));
+
+    /* Recap input can grow well past the legacy small-utility gate while the
+     * output remains small. It must still be ephemeral and preserve the main
+     * Responses continuation. */
+    r.prompt.len = 12000;
+    TEST_ASSERT(request_is_openclaw_aux(&r));
+
+    r.has_tools = true;
+    TEST_ASSERT(!request_is_openclaw_aux(&r));
+    r.has_tools = false;
+    r.prompt.len = 5000;
+    r.max_tokens = 8192;
+    TEST_ASSERT(!request_is_openclaw_aux(&r));
+
+    r.raw_body = "You write the live status line for an AI assistant";
+    r.prompt.len = 5000;
+    r.max_tokens = 240;
+    TEST_ASSERT(!request_is_openclaw_aux(&r));
+
+    /* Skill Workshop review is a large tool-enabled internal request.  Both
+     * internal identifiers are required; either one alone must not bypass the
+     * normal request-shape gate. */
+    r.raw_body =
+        "Runtime: agent=ds4 | "
+        "session=agent:ds4:internal-session-effects:skill-workshop-review_abc | "
+        "sessionId=internal-session-effects-skill-workshop-review_abc | host=openclaw";
+    r.prompt.len = 124252;
+    r.max_tokens = 8192;
+    r.has_tools = true;
+    TEST_ASSERT(request_is_openclaw_aux(&r));
+
+    r.raw_body =
+        "session=agent:ds4:internal-session-effects:skill-workshop-review_abc";
+    TEST_ASSERT(!request_is_openclaw_aux(&r));
+    r.raw_body =
+        "sessionId=internal-session-effects-skill-workshop-review_abc";
+    TEST_ASSERT(!request_is_openclaw_aux(&r));
+}
+
+static void test_openclaw_runtime_stable_prefix_bytes(void) {
+    const char *prompt =
+        "prefix user text\n\n"
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n"
+        "Conversation info: ⟦openclaw:ctx⟧\n"
+        "{}\n"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>"
+        "<｜Assistant｜>";
+    const size_t n = openclaw_runtime_stable_prefix_bytes(prompt);
+    TEST_ASSERT(n == strlen("prefix user text"));
+
+    const char *attempt =
+        "stable system text\n"
+        "<!-- /openclaw:attempt:STABLE -->\n"
+        "<!-- openclaw:attempt:DYNAMIC -->\n"
+        "## Temporal Context\n"
+        "Current date: 2026-09-28\n\n"
+        "tail\n\n"
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>openclaw:ctx"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const char *dynamic_at = strstr(attempt, "<!-- openclaw:attempt:DYNAMIC -->");
+    TEST_ASSERT(dynamic_at != NULL);
+    TEST_ASSERT(openclaw_runtime_stable_prefix_bytes(attempt) ==
+                (size_t)(dynamic_at - attempt));
+
+    TEST_ASSERT(openclaw_runtime_stable_prefix_bytes(
+        "hello\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>fake"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>") == 0);
+
+    const char *multi =
+        "a\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>openclaw:ctx"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>b\n\n"
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>openclaw:ctx"
+        "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+    const char *last = strstr(multi, "b\n\n<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>");
+    TEST_ASSERT(last != NULL);
+    TEST_ASSERT(openclaw_runtime_stable_prefix_bytes(multi) ==
+                (size_t)(last + 1 - multi));
+}
+
 static void test_visible_image_key(void) {
     char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
     request req = {.image_count = 1, .image_markers = markers};
@@ -23942,6 +24053,8 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
+    test_request_is_openclaw_aux();
+    test_openclaw_runtime_stable_prefix_bytes();
     test_visible_image_key();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
