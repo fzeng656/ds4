@@ -153,7 +153,7 @@ kernel void kernel_dsv41_quantize(
         const float scale = args.mode == 3u
             ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
             : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+        result = copysign(dsv4_e2m1fn_dequant(precise::divide(abs(value), scale)), value) * scale;
     }
     if (valid) x[index] = dsv41_bf16(result);
 }
@@ -197,7 +197,7 @@ static inline void dsv41_rope_quantize_body(
         const float scale = args.mode == 3u
             ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
             : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+        result = copysign(dsv4_e2m1fn_dequant(precise::divide(abs(value), scale)), value) * scale;
     }
     if (valid) dst[column] = dsv41_bf16(result);
 }
@@ -245,7 +245,7 @@ kernel void kernel_dsv41_rope_quantize_heads_tab(
         const float scale = args.mode == 3u
             ? dsv4_e4m3fn_dequant(max(amax, 0.01171875f) / 6.0f)
             : dsv41_pow2_ceil(max(amax, 7.052966104933725e-38f) * (1.0f / 6.0f));
-        result = copysign(dsv4_e2m1fn_dequant(abs(value) / scale), value) * scale;
+        result = copysign(dsv4_e2m1fn_dequant(precise::divide(abs(value), scale)), value) * scale;
     }
     if (valid) row[column] = dsv41_bf16(result);
 }
